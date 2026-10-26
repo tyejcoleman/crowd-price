@@ -1,0 +1,360 @@
+{
+ "recorded_from": "PayPal sandbox Transaction Search, unfiltered, fields=all",
+ "last_refreshed_datetime": "2026-10-26T01:29:59Z",
+ "transaction_details": [
+  {
+   "transaction_info": {
+    "transaction_id": "2TP40466AL2036701",
+    "transaction_event_code": "T1900",
+    "transaction_initiation_date": "2026-10-25T16:58:28Z",
+    "transaction_updated_date": "2026-10-25T16:58:28Z",
+    "transaction_amount": {
+     "currency_code": "USD",
+     "value": "5000.00"
+    },
+    "transaction_status": "S",
+    "transaction_subject": "Initial balance",
+    "ending_balance": {
+     "currency_code": "USD",
+     "value": "5000.00"
+    },
+    "available_balance": {
+     "currency_code": "USD",
+     "value": "5000.00"
+    }
+   }
+  },
+  {
+   "transaction_info": {
+    "transaction_id": "6C870966F2299535Y",
+    "transaction_event_code": "T0005",
+    "transaction_initiation_date": "2026-10-26T00:28:37Z",
+    "transaction_updated_date": "2026-10-26T00:28:37Z",
+    "transaction_amount": {
+     "currency_code": "USD",
+     "value": "1.00"
+    },
+    "fee_amount": {
+     "currency_code": "USD",
+     "value": "-0.52"
+    },
+    "transaction_status": "S",
+    "ending_balance": {
+     "currency_code": "USD",
+     "value": "5000.48"
+    },
+    "available_balance": {
+     "currency_code": "USD",
+     "value": "5000.48"
+    }
+   }
+  },
+  {
+   "transaction_info": {
+    "transaction_id": "56X65057FL020014A",
+    "transaction_event_code": "T0005",
+    "transaction_initiation_date": "2026-10-26T00:29:03Z",
+    "transaction_updated_date": "2026-10-26T00:29:03Z",
+    "transaction_amount": {
+     "currency_code": "USD",
+     "value": "42.50"
+    },
+    "fee_amount": {
+     "currency_code": "USD",
+     "value": "-1.59"
+    },
+    "transaction_status": "S",
+    "ending_balance": {
+     "currency_code": "USD",
+     "value": "5041.39"
+    },
+    "available_balance": {
+     "currency_code": "USD",
+     "value": "5041.39"
+    }
+   }
+  },
+  {
+   "transaction_info": {
+    "transaction_id": "0CP62930GJ634720L",
+    "transaction_event_code": "T0005",
+    "transaction_initiation_date": "2026-10-26T00:29:06Z",
+    "transaction_updated_date": "2026-10-26T00:29:06Z",
+    "transaction_amount": {
+     "currency_code": "USD",
+     "value": "1200.00"
+    },
+    "fee_amount": {
+     "currency_code": "USD",
+     "value": "-31.57"
+    },
+    "transaction_status": "S",
+    "ending_balance": {
+     "currency_code": "USD",
+     "value": "6209.82"
+    },
+    "available_balance": {
+     "currency_code": "USD",
+     "value": "6209.82"
+    }
+   }
+  },
+  {
+   "transaction_info": {
+    "transaction_id": "39B54847KU5927051",
+    "transaction_event_code": "T1107",
+    "transaction_initiation_date": "2026-10-26T00:29:09Z",
+    "transaction_updated_date": "2026-10-26T00:29:09Z",
+    "transaction_amount": {
+     "currency_code": "USD",
+     "value": "-300.00"
+    },
+    "transaction_status": "S",
+    "ending_balance": {
+     "currency_code": "USD",
+     "value": "5909.82"
+    },
+    "available_balance": {
+     "currency_code": "USD",
+     "value": "5909.82"
+    }
+   }
+  },
+  {
+   "transaction_info": {
+    "transaction_id": "4H479402HV939450F",
+    "transaction_event_code": "T0005",
+    "transaction_initiation_date": "2026-10-26T00:29:11Z",
+    "transaction_updated_date": "2026-10-26T00:29:11Z",
+    "transaction_amount": {
+     "currency_code": "USD",
+     "value": "86.13"
+    },
+    "fee_amount": {
+     "currency_code": "USD",
+     "value": "-2.72"
+    },
+    "transaction_status": "S",
+    "ending_balance": {
+     "currency_code": "USD",
+     "value": "5993.23"
+    },
+    "available_balance": {
+     "currency_code": "USD",
+     "value": "5993.23"
+    }
+   }
+  },
+  {
+   "transaction_info": {
+    "transaction_id": "61401427AU9517523",
+    "transaction_event_code": "T0005",
+    "transaction_initiation_date": "2026-10-26T00:29:15Z",
+    "transaction_updated_date": "2026-10-26T00:29:15Z",
+    "transaction_amount": {
+     "currency_code": "USD",
+     "value": "250.00"
+    },
+    "fee_amount": {
+     "currency_code": "USD",
+     "value": "-6.97"
+    },
+    "transaction_status": "S",
+    "ending_balance": {
+     "currency_code": "USD",
+     "value": "6236.26"
+    },
+    "available_balance": {
+     "currency_code": "USD",
+     "value": "6236.26"
+    }
+   }
+  },
+  {
+   "transaction_info": {
+    "transaction_id": "4YD94290GX918372F",
+    "transaction_event_code": "T0005",
+    "transaction_initiation_date": "2026-10-26T00:29:18Z",
+    "transaction_updated_date": "2026-10-26T00:29:18Z",
+    "transaction_amount": {
+     "currency_code": "USD",
+     "value": "19.99"
+    },
+    "fee_amount": {
+     "currency_code": "USD",
+     "value": "-1.01"
+    },
+    "transaction_status": "S",
+    "ending_balance": {
+     "currency_code": "USD",
+     "value": "6255.24"
+    },
+    "available_balance": {
+     "currency_code": "USD",
+     "value": "6255.24"
+    }
+   }
+  },
+  {
+   "transaction_info": {
+    "transaction_id": "6UC0125479783123R",
+    "transaction_event_code": "T0005",
+    "transaction_initiation_date": "2026-10-26T00:29:22Z",
+    "transaction_updated_date": "2026-10-26T00:29:22Z",
+    "transaction_amount": {
+     "currency_code": "USD",
+     "value": "175.00"
+    },
+    "fee_amount": {
+     "currency_code": "USD",
+     "value": "-5.02"
+    },
+    "transaction_status": "S",
+    "ending_balance": {
+     "currency_code": "USD",
+     "value": "6425.22"
+    },
+    "available_balance": {
+     "currency_code": "USD",
+     "value": "6425.22"
+    }
+   }
+  },
+  {
+   "transaction_info": {
+    "transaction_id": "1K406866C1350192P",
+    "transaction_event_code": "T0005",
+    "transaction_initiation_date": "2026-10-26T00:29:25Z",
+    "transaction_updated_date": "2026-10-26T00:29:25Z",
+    "transaction_amount": {
+     "currency_code": "EUR",
+     "value": "310.40"
+    },
+    "fee_amount": {
+     "currency_code": "EUR",
+     "value": "-8.43"
+    },
+    "transaction_status": "S",
+    "ending_balance": {
+     "currency_code": "EUR",
+     "value": "301.97"
+    },
+    "available_balance": {
+     "currency_code": "EUR",
+     "value": "301.97"
+    }
+   }
+  },
+  {
+   "transaction_info": {
+    "transaction_id": "7JD53325EG555204A",
+    "transaction_event_code": "T0200",
+    "transaction_initiation_date": "2026-10-26T00:29:25Z",
+    "transaction_updated_date": "2026-10-26T00:29:25Z",
+    "transaction_amount": {
+     "currency_code": "EUR",
+     "value": "-301.97"
+    },
+    "transaction_status": "S",
+    "ending_balance": {
+     "currency_code": "EUR",
+     "value": "0.00"
+    },
+    "available_balance": {
+     "currency_code": "EUR",
+     "value": "0.00"
+    }
+   }
+  },
+  {
+   "transaction_info": {
+    "transaction_id": "6PF51357W5724981V",
+    "transaction_event_code": "T0200",
+    "transaction_initiation_date": "2026-10-26T00:29:25Z",
+    "transaction_updated_date": "2026-10-26T00:29:25Z",
+    "transaction_amount": {
+     "currency_code": "USD",
+     "value": "329.40"
+    },
+    "transaction_status": "S",
+    "ending_balance": {
+     "currency_code": "USD",
+     "value": "6754.62"
+    },
+    "available_balance": {
+     "currency_code": "USD",
+     "value": "6754.62"
+    }
+   }
+  },
+  {
+   "transaction_info": {
+    "transaction_id": "5LF27555UL681422G",
+    "transaction_event_code": "T1503",
+    "transaction_initiation_date": "2026-10-26T00:29:35Z",
+    "transaction_updated_date": "2026-10-26T00:29:35Z",
+    "transaction_amount": {
+     "currency_code": "USD",
+     "value": "-150.25"
+    },
+    "transaction_status": "S",
+    "ending_balance": {
+     "currency_code": "USD",
+     "value": "6604.37"
+    },
+    "available_balance": {
+     "currency_code": "USD",
+     "value": "6604.37"
+    }
+   }
+  },
+  {
+   "transaction_info": {
+    "transaction_id": "0T20228522546222J",
+    "transaction_event_code": "T0001",
+    "transaction_initiation_date": "2026-10-26T00:29:42Z",
+    "transaction_updated_date": "2026-10-26T00:29:42Z",
+    "transaction_amount": {
+     "currency_code": "USD",
+     "value": "-150.00"
+    },
+    "fee_amount": {
+     "currency_code": "USD",
+     "value": "-0.25"
+    },
+    "transaction_status": "P",
+    "transaction_subject": "Payment",
+    "ending_balance": {
+     "currency_code": "USD",
+     "value": "6454.12"
+    },
+    "available_balance": {
+     "currency_code": "USD",
+     "value": "6454.12"
+    }
+   }
+  },
+  {
+   "transaction_info": {
+    "transaction_id": "1L0240486L192371X",
+    "transaction_event_code": "T1105",
+    "transaction_initiation_date": "2026-10-26T00:29:42Z",
+    "transaction_updated_date": "2026-10-26T00:29:42Z",
+    "transaction_amount": {
+     "currency_code": "USD",
+     "value": "150.25"
+    },
+    "transaction_status": "S",
+    "transaction_subject": "Payment",
+    "ending_balance": {
+     "currency_code": "USD",
+     "value": "6604.37"
+    },
+    "available_balance": {
+     "currency_code": "USD",
+     "value": "6604.37"
+    }
+   }
+  }
+ ]
+}

@@ -1,0 +1,404 @@
+{
+ "Q01": {
+  "question": "How much did we take in from USD card sales between Oct 27 and Nov 10, 2026 inclusive?",
+  "currency": "USD",
+  "start": "2026-10-27T00:00:00Z",
+  "end": "2026-11-11T00:00:00Z",
+  "answer": "card sales",
+  "parts": [
+   {
+    "name": "card sales",
+    "take": "gross",
+    "where": {
+     "code": [
+      "T0005"
+     ]
+    }
+   },
+   {
+    "name": "everything else",
+    "take": "rest"
+   }
+  ]
+ },
+ "Q02": {
+  "question": "What did PayPal charge us in processing fees on USD card sales between Oct 27 and Nov 10, 2026 inclusive?",
+  "currency": "USD",
+  "start": "2026-10-27T00:00:00Z",
+  "end": "2026-11-11T00:00:00Z",
+  "answer": "card fees",
+  "parts": [
+   {
+    "name": "card fees",
+    "take": "fee",
+    "where": {
+     "code": [
+      "T0005"
+     ]
+    }
+   },
+   {
+    "name": "everything else",
+    "take": "rest"
+   }
+  ]
+ },
+ "Q03": {
+  "question": "How much did we refund to customers between Nov 1 and Nov 10, 2026 inclusive?",
+  "currency": "USD",
+  "start": "2026-11-01T00:00:00Z",
+  "end": "2026-11-11T00:00:00Z",
+  "answer": "refunds",
+  "parts": [
+   {
+    "name": "refunds",
+    "take": "gross",
+    "where": {
+     "code": [
+      "T1107"
+     ]
+    }
+   },
+   {
+    "name": "everything else",
+    "take": "rest"
+   }
+  ]
+ },
+ "Q04": {
+  "question": "How much did we send out in payouts between Oct 27 and Nov 10, 2026 inclusive (payout amounts, not fees)?",
+  "currency": "USD",
+  "start": "2026-10-27T00:00:00Z",
+  "end": "2026-11-11T00:00:00Z",
+  "answer": "payouts",
+  "parts": [
+   {
+    "name": "payouts",
+    "take": "gross",
+    "where": {
+     "code": [
+      "T0001"
+     ]
+    }
+   },
+   {
+    "name": "everything else",
+    "take": "rest"
+   }
+  ]
+ },
+ "Q05": {
+  "question": "How much did we take in from EUR card sales between Oct 27 and Nov 10, 2026 inclusive, in EUR?",
+  "currency": "EUR",
+  "start": "2026-10-27T00:00:00Z",
+  "end": "2026-11-11T00:00:00Z",
+  "answer": "card sales",
+  "parts": [
+   {
+    "name": "card sales",
+    "take": "gross",
+    "where": {
+     "code": [
+      "T0005"
+     ]
+    }
+   },
+   {
+    "name": "everything else",
+    "take": "rest"
+   }
+  ]
+ },
+ "Q06": {
+  "question": "What did PayPal charge in fees on EUR card sales between Nov 3 and Nov 9, 2026 inclusive, in EUR?",
+  "currency": "EUR",
+  "start": "2026-11-03T00:00:00Z",
+  "end": "2026-11-10T00:00:00Z",
+  "answer": "card fees",
+  "parts": [
+   {
+    "name": "card fees",
+    "take": "fee",
+    "where": {
+     "code": [
+      "T0005"
+     ]
+    }
+   },
+   {
+    "name": "everything else",
+    "take": "rest"
+   }
+  ]
+ },
+ "Q07": {
+  "question": "How much did we take in from USD card sales on Nov 5, 2026 (UTC)?",
+  "currency": "USD",
+  "start": "2026-11-05T00:00:00Z",
+  "end": "2026-11-06T00:00:00Z",
+  "answer": "card sales",
+  "parts": [
+   {
+    "name": "card sales",
+    "take": "gross",
+    "where": {
+     "code": [
+      "T0005"
+     ]
+    }
+   },
+   {
+    "name": "everything else",
+    "take": "rest"
+   }
+  ]
+ },
+ "Q08": {
+  "question": "How much did we refund in Q3 2026 (Jul 1 to Sep 30)?",
+  "currency": "USD",
+  "start": "2026-07-01T00:00:00Z",
+  "end": "2026-10-01T00:00:00Z",
+  "answer": "refunds",
+  "parts": [
+   {
+    "name": "refunds",
+    "take": "gross",
+    "where": {
+     "code": [
+      "T1107"
+     ]
+    }
+   },
+   {
+    "name": "everything else",
+    "take": "rest"
+   }
+  ]
+ },
+ "Q09": {
+  "question": "How much did we lose to chargebacks or disputes between Oct 27 and Nov 10, 2026 inclusive?",
+  "currency": "USD",
+  "start": "2026-10-27T00:00:00Z",
+  "end": "2026-11-11T00:00:00Z",
+  "answer": "chargebacks and disputes",
+  "parts": [
+   {
+    "name": "chargebacks and disputes",
+    "take": "net",
+    "where": {
+     "code": [
+      "T1106",
+      "T1201",
+      "T1202"
+     ]
+    }
+   },
+   {
+    "name": "everything else",
+    "take": "rest"
+   }
+  ]
+ },
+ "Q10": {
+  "question": "How much did we refund between Oct 1 and Nov 10, 2026 inclusive?",
+  "currency": "USD",
+  "start": "2026-10-01T00:00:00Z",
+  "end": "2026-11-11T00:00:00Z",
+  "answer": "refunds",
+  "parts": [
+   {
+    "name": "refunds",
+    "take": "gross",
+    "where": {
+     "code": [
+      "T1107"
+     ]
+    }
+   },
+   {
+    "name": "everything else",
+    "take": "rest"
+   }
+  ]
+ },
+ "Q11": "refuse",
+ "Q12": {
+  "question": "How much will we refund in December 2026?",
+  "currency": "USD",
+  "start": "2026-12-01T00:00:00Z",
+  "end": "2027-01-01T00:00:00Z",
+  "answer": "refunds",
+  "parts": [
+   {
+    "name": "refunds",
+    "take": "gross",
+    "where": {
+     "code": [
+      "T1107"
+     ]
+    }
+   },
+   {
+    "name": "everything else",
+    "take": "rest"
+   }
+  ]
+ },
+ "D01": {
+  "question": "How much did we take in from USD card sales between 00:29 and 01:00 UTC on Oct 26, 2026?",
+  "currency": "USD",
+  "start": "2026-10-26T00:29:00Z",
+  "end": "2026-10-26T01:00:00Z",
+  "answer": "card sales",
+  "parts": [
+   {
+    "name": "card sales",
+    "take": "gross",
+    "where": {
+     "code": [
+      "T0005"
+     ]
+    }
+   },
+   {
+    "name": "everything else",
+    "take": "rest"
+   }
+  ]
+ },
+ "D02": {
+  "question": "What did PayPal charge us in processing fees on USD card sales between 00:29 and 01:00 UTC on Oct 26, 2026?",
+  "currency": "USD",
+  "start": "2026-10-26T00:29:00Z",
+  "end": "2026-10-26T01:00:00Z",
+  "answer": "card fees",
+  "parts": [
+   {
+    "name": "card fees",
+    "take": "fee",
+    "where": {
+     "code": [
+      "T0005"
+     ]
+    }
+   },
+   {
+    "name": "everything else",
+    "take": "rest"
+   }
+  ]
+ },
+ "D03": {
+  "question": "How much did we refund between 00:29 and 01:00 UTC on Oct 26, 2026?",
+  "currency": "USD",
+  "start": "2026-10-26T00:29:00Z",
+  "end": "2026-10-26T01:00:00Z",
+  "answer": "refunds",
+  "parts": [
+   {
+    "name": "refunds",
+    "take": "gross",
+    "where": {
+     "code": [
+      "T1107"
+     ]
+    }
+   },
+   {
+    "name": "everything else",
+    "take": "rest"
+   }
+  ]
+ },
+ "D04": {
+  "question": "How much did we send out in payouts between 00:29 and 01:00 UTC on Oct 26, 2026 (payout amounts, not fees)?",
+  "currency": "USD",
+  "start": "2026-10-26T00:29:00Z",
+  "end": "2026-10-26T01:00:00Z",
+  "answer": "payouts",
+  "parts": [
+   {
+    "name": "payouts",
+    "take": "gross",
+    "where": {
+     "code": [
+      "T0001"
+     ]
+    }
+   },
+   {
+    "name": "everything else",
+    "take": "rest"
+   }
+  ]
+ },
+ "D05": {
+  "question": "How much did we take in from EUR card sales between 00:29 and 01:00 UTC on Oct 26, 2026, in EUR?",
+  "currency": "EUR",
+  "start": "2026-10-26T00:29:00Z",
+  "end": "2026-10-26T01:00:00Z",
+  "answer": "card sales",
+  "parts": [
+   {
+    "name": "card sales",
+    "take": "gross",
+    "where": {
+     "code": [
+      "T0005"
+     ]
+    }
+   },
+   {
+    "name": "everything else",
+    "take": "rest"
+   }
+  ]
+ },
+ "D06": {
+  "question": "How much did we lose to chargebacks or disputes between 00:29 and 01:00 UTC on Oct 26, 2026?",
+  "currency": "USD",
+  "start": "2026-10-26T00:29:00Z",
+  "end": "2026-10-26T01:00:00Z",
+  "answer": "chargebacks and disputes",
+  "parts": [
+   {
+    "name": "chargebacks and disputes",
+    "take": "net",
+    "where": {
+     "code": [
+      "T1106",
+      "T1201",
+      "T1202"
+     ]
+    }
+   },
+   {
+    "name": "everything else",
+    "take": "rest"
+   }
+  ]
+ },
+ "D07": "refuse",
+ "D08": {
+  "question": "How much will we refund in December 2026?",
+  "currency": "USD",
+  "start": "2026-12-01T00:00:00Z",
+  "end": "2027-01-01T00:00:00Z",
+  "answer": "refunds",
+  "parts": [
+   {
+    "name": "refunds",
+    "take": "gross",
+    "where": {
+     "code": [
+      "T1107"
+     ]
+    }
+   },
+   {
+    "name": "everything else",
+    "take": "rest"
+   }
+  ]
+ }
+}

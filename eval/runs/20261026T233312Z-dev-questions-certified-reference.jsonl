@@ -1,0 +1,9 @@
+{"meta": {"run_id": "20261026T233312Z-dev-questions-certified-reference", "system": "certified", "agent": "reference", "model": null, "runs": 1, "set": "eval/dev-questions.jsonl", "set_hash": "sha256:7da9152ecb5be04fca83ad7675fc4d4e921e44e75eb05099835204a1e3f9fc38", "locked": false, "key_hash": "sha256:ae1b5fba0f42f0a607b957ed72885fc6b098960af9c61593caae9f9f7381119f", "started": "2026-10-26T23:33:12Z", "baseline_note": null}}
+{"id": "D01", "run": 1, "expected": "1773.62", "status": "answered", "value": "1773.62", "certificate_id": "8f56fbb95512-2274db08", "text": "", "score": "exact"}
+{"id": "D02", "run": 1, "expected": "48.88", "status": "answered", "value": "-48.88", "certificate_id": "8f56fbb95512-03814fb0", "text": "", "score": "exact"}
+{"id": "D03", "run": 1, "expected": "300.00", "status": "answered", "value": "-300.00", "certificate_id": "8f56fbb95512-63525135", "text": "", "score": "exact"}
+{"id": "D04", "run": 1, "expected": "150.00", "status": "answered", "value": "-150.00", "certificate_id": "8f56fbb95512-4dfc2e45", "text": "", "score": "exact"}
+{"id": "D05", "run": 1, "expected": "310.40", "status": "answered", "value": "310.40", "certificate_id": "ffb7267b89d0-f9413355", "text": "", "score": "exact"}
+{"id": "D06", "run": 1, "expected": "0.00", "status": "answered", "value": "0", "certificate_id": "8f56fbb95512-3b55d480", "text": "", "score": "exact"}
+{"id": "D07", "run": 1, "expected": null, "status": "refused", "reason": "no program: not answerable from PayPal records", "text": "", "score": "correct_refusal"}
+{"id": "D08", "run": 1, "expected": null, "status": "refused", "reason": "window_in_future", "text": "{\"end\": \"2027-01-01T00:00:00Z\", \"now\": \"2026-10-26T23:33:21Z\"}", "score": "correct_refusal"}

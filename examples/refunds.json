@@ -1,0 +1,7 @@
+{"question": "What did we refund, and what did PayPal charge in fees, since the account opened?",
+ "currency": "USD", "start": "2026-10-25T00:00:00Z", "end": "2026-10-26T01:00:00Z",
+ "answer": "refunds",
+ "parts": [{"name": "sales", "take": "gross", "where": {"code": ["T0005"]}},
+           {"name": "refunds", "take": "gross", "where": {"code": ["T1107"]}},
+           {"name": "fees", "take": "fee"},
+           {"name": "everything else", "take": "rest"}]}
