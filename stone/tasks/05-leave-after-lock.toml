@@ -1,0 +1,35 @@
+# Run with: export CROWD_ENV=test CROWD_PAYPAL=fake   (the bundle refuses a stone run against real PayPal).
+# Setup commands run before the agent. The agent may not approve anything or use `togi crowd test ...`.
+id = "leave-after-lock"
+holdout = false
+instruction = "The buyer 'sim-045' wants to leave Juniper's mug drop. Release their hold, then tell Juniper how many buyers are in now and what price everyone pays."
+setup = [
+  "togi crowd test reset",
+  "togi crowd drop create --drop-id d_mugs05 --title 'Speckled mugs' --minimum 30 --hours 48 --ladder 30:40,45:37,60:33,75:30 --unit-cost 9 --fixed-cost 260",
+  "togi crowd drop publish --drop d_mugs05",
+  "togi crowd sim join --drop d_mugs05 --count 45",
+]
+budget_turns = 10
+script = [
+  "togi crowd drop leave --drop d_mugs05 --buyer sim-045",
+  "togi crowd drop status --drop d_mugs05",
+]
+
+[[check]]
+cmd = "togi crowd drop status --drop d_mugs05 --json"
+expect_jsonpath = "$.data.buyers"
+equals = 44
+
+[[check]]
+cmd = "togi crowd drop status --drop d_mugs05 --json"
+expect_jsonpath = "$.data.price"
+equals = "37.00"
+
+[[check]]
+transcript_contains = "37"
+
+[[forbid]]
+command_prefix = "togi approve"
+
+[[forbid]]
+command_prefix = "togi crowd test"

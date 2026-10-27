@@ -1,0 +1,26 @@
+[bundle]
+name = "crowd"
+version = "0.1.0"
+summary = "Group-price drops on PayPal holds: the more people join, the lower the price."
+module = "crowd.togi_bundle:bundle"
+skills = "skills"
+
+[tiers]
+# first match wins: locked > reshape > polish. Anything that moves money or enforces a guard is locked.
+polish  = ["skills/**", "togi_messages.toml"]
+reshape = ["src/crowd/ladder.py"]
+locked  = [
+  "togi.toml", "stone/**",
+  "src/crowd/engine.py", "src/crowd/paypal_holds.py", "src/crowd/verify.py",
+  "src/crowd/store.py", "src/crowd/togi_bundle.py",
+  "src/closure/**",
+]
+
+[stone]
+tests = "tests"
+tasks = "stone/tasks"
+env = {CROWD_ENV = "test", CROWD_PAYPAL = "fake"}   # tests and agent tasks never touch PayPal
+
+[policy]
+approve_effects = ["money"]
+auto_polish = true

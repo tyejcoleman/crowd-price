@@ -1,0 +1,242 @@
+# Wording for Crowd's errors and plain-language outcomes. This file is in the polish tier: hone may
+# improve the words, but every {placeholder} must stay, and `status` and the commands in `next`
+# are part of the guard behaviour (the stone checks them). Numbers are never written here; they
+# are filled in from the engine.
+#
+# status: "error" = the request was wrong (exit 1); "refused" = a guard said no (exit 2).
+
+[errors.drop_not_found]
+message = "There is no drop {drop} in this store."
+next = "togi crowd drop list"
+status = "error"
+
+[errors.bad_title]
+message = "A drop needs a title of 1 to 120 characters."
+next = "togi crowd drop create --title \"Speckled mugs\" --minimum 30 --hours 48 --ladder 30:40,45:36,60:33"
+status = "error"
+
+[errors.bad_currency]
+message = "{currency} is not a 3-letter currency code."
+next = "togi crowd drop create --help"
+status = "error"
+
+[errors.bad_number]
+message = "{reason}"
+next = "togi crowd ladder propose --unit-cost 9 --fixed-cost 260 --minimum 30"
+status = "error"
+
+[errors.bad_price]
+message = "That price is not allowed: {reason}."
+next = "togi crowd ladder propose --unit-cost 9 --fixed-cost 260 --minimum 30"
+status = "error"
+
+[errors.bad_ladder]
+message = "That ladder is not valid: {reason}."
+next = "togi crowd ladder propose --unit-cost 9 --fixed-cost 260 --minimum 30"
+status = "error"
+
+[errors.ladder_required]
+message = "Give the ladder as --ladder 30:40,45:36,60:33 (buyers:price pairs), or use --from-proposal with --unit-cost and --fixed-cost."
+next = "togi crowd ladder propose --unit-cost 9 --fixed-cost 260 --minimum 30"
+status = "error"
+
+[errors.ladder_conflict]
+message = "Use either --ladder or --from-proposal, not both."
+next = "togi crowd drop create --help"
+status = "error"
+
+[errors.costs_incomplete]
+message = "Costs come as a pair: give both --unit-cost and --fixed-cost, or neither."
+next = "togi crowd drop create --help"
+status = "error"
+
+[errors.minimum_mismatch]
+message = "The minimum is {minimum} but the ladder's first step starts at {first_step} buyers. They must be the same number."
+next = "togi crowd ladder propose --unit-cost 9 --fixed-cost 260 --minimum {minimum}"
+status = "error"
+
+[errors.start_price_loses_money]
+message = "A start price of ${start_price} loses money at the minimum; the lowest price that does not is ${floor}."
+next = "togi crowd ladder propose --unit-cost 9 --fixed-cost 260 --minimum 30"
+status = "refused"
+
+[errors.ladder_loses_money]
+message = "Step {step} of the ladder ({min_buyers} buyers at ${price}) would make ${profit}, a loss."
+next = "togi crowd ladder propose --unit-cost 9 --fixed-cost 260 --minimum 30"
+status = "refused"
+
+[errors.duration_missing]
+message = "Say how long the drop runs: --hours 48, or --minutes 90."
+next = "togi crowd drop create --help"
+status = "error"
+
+[errors.duration_invalid]
+message = "The drop needs a positive length of time."
+next = "togi crowd drop create --help"
+status = "error"
+
+[errors.duration_too_long]
+message = "A drop can run at most {max_minutes} minutes (72 hours), because PayPal only promises a hold for 3 days; you asked for {minutes}."
+next = "togi crowd drop create --help"
+status = "refused"
+
+[errors.not_draft]
+message = "Drop {drop} is {state}, not a draft, so it cannot be published."
+next = "togi crowd drop status --drop {drop}"
+status = "refused"
+
+[errors.bad_drop_id]
+message = "A drop id is d_ followed by 2 to 16 lowercase letters or digits; {drop} is not."
+next = "togi crowd drop create --help"
+status = "error"
+
+[errors.drop_exists]
+message = "A drop with id {drop} already exists."
+next = "togi crowd drop status --drop {drop}"
+status = "refused"
+
+[errors.drop_not_published]
+message = "Drop {drop} is still a draft; buyers can join once it is published."
+next = "togi crowd drop publish --drop {drop}"
+status = "refused"
+
+[errors.drop_closed]
+message = "Drop {drop} is {state}; joining has stopped."
+next = "togi crowd drop status --drop {drop}"
+status = "refused"
+
+[errors.drop_ended]
+message = "Drop {drop} reached its end time ({ended_at}); joining and leaving have stopped."
+next = "togi crowd drop close --drop {drop}"
+status = "refused"
+
+[errors.drop_not_live]
+message = "Drop {drop} is {state}, not live."
+next = "togi crowd drop status --drop {drop}"
+status = "refused"
+
+[errors.already_joined]
+message = "{buyer} already holds a place in drop {drop}."
+next = "togi crowd drop status --drop {drop}"
+status = "refused"
+
+[errors.bad_buyer]
+message = "A buyer needs a name of 1 to 60 characters."
+next = "togi crowd drop join --drop {drop} --buyer \"Ada Lovelace\""
+status = "error"
+
+[errors.bad_card]
+message = "Card {card} is not a sandbox test card; use a number from 0 to 9."
+next = "togi crowd drop join --help"
+status = "error"
+
+[errors.join_declined]
+message = "{buyer}'s card was declined when placing the hold, so they are not in the drop."
+next = "togi crowd drop join --drop {drop} --buyer {buyer} --card 1"
+status = "error"
+
+[errors.buyer_not_found]
+message = "No buyer {buyer} in drop {drop}."
+next = "togi crowd buyers list --drop {drop}"
+status = "error"
+
+[errors.no_active_hold]
+message = "{buyer} has no active hold in drop {drop} (status: {status})."
+next = "togi crowd buyers list --drop {drop}"
+status = "refused"
+
+[errors.drop_not_closed]
+message = "Drop {drop} is {state}; it must be closed before it can be settled."
+next = "togi crowd drop close --drop {drop}"
+status = "refused"
+
+[errors.drop_not_settled]
+message = "Drop {drop} is {state}, not settled, so there is nothing to check yet."
+next = "togi crowd drop status --drop {drop}"
+status = "refused"
+
+[errors.nothing_captured]
+message = "Drop {drop} captured no money, so there is no balance change to tie out."
+next = "togi crowd drop verify --drop {drop}"
+status = "refused"
+
+[errors.plan_changed]
+message = "The drop would settle as {actual}, not as {expected}. Nothing was settled."
+next = "togi crowd drop settle --drop {drop} --expect {actual}"
+status = "refused"
+
+[errors.capture_exceeds_hold]
+message = "Refused to capture more than the hold for {buyer}."
+next = "togi crowd drop status --drop {drop}"
+status = "refused"
+
+[errors.void_conflict]
+message = "{buyer}'s hold was already captured elsewhere, so it cannot be released. Stop and ask the maker."
+next = "togi crowd drop verify --drop {drop}"
+status = "refused"
+
+[errors.drop_busy]
+message = "Drop {drop} is being changed by another process right now."
+next = "togi crowd drop status --drop {drop}"
+status = "refused"
+
+[errors.paypal_unavailable]
+message = "PayPal could not be reached. Nothing was lost: every call is safe to repeat."
+next = "togi crowd drop status --drop {drop}"
+status = "error"
+
+[errors.paypal_error]
+message = "PayPal refused the request ({issue})."
+next = "togi crowd drop status --drop {drop}"
+status = "error"
+
+[errors.paypal_not_configured]
+message = "PayPal sandbox is not set up here: {reason}"
+next = "export CROWD_PAYPAL=fake   # or put sandbox credentials in .env"
+status = "error"
+
+[errors.not_test_env]
+message = "Refusing to wipe the store: CROWD_ENV is not 'test'."
+next = "export CROWD_ENV=test"
+status = "refused"
+
+[errors.stone_requires_fake]
+message = "A stone run must use the fake PayPal; CROWD_PAYPAL is not 'fake'."
+next = "export CROWD_ENV=test CROWD_PAYPAL=fake"
+status = "refused"
+
+[errors.test_tools_not_for_agents]
+message = "`togi crowd {command}` is test tooling for a person setting up a test store; an agent session cannot use it. Money moves only through `drop settle`, and that waits for a person."
+next = "togi crowd drop list"
+status = "refused"
+
+[errors.store_has_real_holds]
+message = "Refusing: this store holds {count} PayPal hold(s) that did not come from the fake PayPal (first: drop {drop}, {mode}). Test commands never touch a store that may have real money on a card."
+next = "togi crowd drop list"
+status = "refused"
+
+[errors.too_many]
+message = "Simulate at most {max} buyers at a time; you asked for {count}."
+next = "togi crowd sim join --drop {drop} --count {max}"
+status = "error"
+
+[errors.unknown]
+message = "{reason}"
+next = "togi crowd drop list"
+status = "error"
+
+# Plain-language outcomes for `drop explain`. Only engine numbers are filled in; keep every placeholder.
+[explain]
+draft = "{title} is a draft: not published yet, nobody can join. Once it is published it runs for {duration}. The ladder is {ladder}; every buyer will hold ${start_price}, the most they can pay."
+live = "{title} is live with {buyers} joined and {time_left} left. The price is ${price} for everyone right now. {next_message}. Nobody is charged until the drop closes and the minimum of {minimum} is met."
+live_minimum_met = "{title} is live with {buyers} joined, over the minimum of {minimum}, and {time_left} left. The price is ${price} for everyone right now. {next_message}. Everyone is charged the lowest price reached when it closes."
+ended = "{title} has reached its end time with {buyers} joined and is waiting to be closed. The price for everyone would be ${price}."
+closed_funded = "{title} is closed with {buyers} joined, enough for the minimum of {minimum}. When settled, every hold will be charged ${price}, and the rest of each ${start_price} hold is released."
+closed_not_funded = "{title} is closed with {buyers} joined, short of the minimum of {minimum}. When settled, every hold will be released and nobody pays."
+settling = "{title} is part way through settling. Run settle again to carry on; nothing is ever charged twice."
+settled_funded = "{title} was funded. {buyers_at_close} people were in when it closed, over the minimum of {minimum}, so the price landed at ${final_price} for everyone. {captured} holds were charged ${final_price} each, and the rest of each ${start_price} hold (${released_each}) was released. PayPal's fees were ${fees}, so ${net} reaches the maker. Nobody paid more than ${final_price}."
+settled_not_funded = "{title} did not reach its minimum: {buyers_at_close} of the {minimum} needed joined (short by {short_by}). Nobody was charged. All {voided} holds were released and there are no refunds to chase."
+settled_not_funded_open = "{title} did not reach its minimum: {buyers_at_close} of the {minimum} needed joined (short by {short_by}). Nobody was charged. {voided} holds were released, but {unreleased} could not be released by PayPal and may still be held on a buyer's card."
+unreleased_holds = " {unreleased} hold(s) could not be released by PayPal and may still be held on a buyer's card: `drop verify` names each one and what to do next."
+failed_charges = " {failed} charge(s) failed at the end, so those buyers were not charged and the price stayed ${final_price} for everyone else."
+failed_shortfall = " That leaves the drop {shortfall} buyer(s) short of its minimum until it is fixed."

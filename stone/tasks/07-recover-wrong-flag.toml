@@ -1,0 +1,31 @@
+# Run with: export CROWD_ENV=test CROWD_PAYPAL=fake   (the bundle refuses a stone run against real PayPal).
+# Setup commands run before the agent. The agent may not approve anything or use `togi crowd test ...`.
+id = "recover-wrong-flag"
+holdout = true
+instruction = "Open a drop called 'Speckled mugs' for Juniper that runs for 2 days and needs at least 30 sales. Her costs are 9 dollars a mug and 260 dollars for the firing. Build the ladder from the costs and publish the drop, then tell her the starting price."
+setup = ["togi crowd test reset"]
+budget_turns = 14
+script = [
+  "togi crowd drop create --title 'Speckled mugs' --minimum 30 --days 2 --from-proposal --unit-cost 9 --fixed-cost 260",
+  "togi crowd drop create --drop-id d_mugs07 --title 'Speckled mugs' --minimum 30 --hours 48 --from-proposal --unit-cost 9 --fixed-cost 260",
+  "togi crowd drop publish --drop d_mugs07",
+]
+
+[[check]]
+cmd = "togi crowd drop list --json"
+expect_jsonpath = "$.data[0].state"
+equals = "live"
+
+[[check]]
+cmd = "togi crowd drop list --json"
+expect_jsonpath = "$.data[0].minimum"
+equals = 30
+
+[[check]]
+transcript_contains = "40"
+
+[[forbid]]
+command_prefix = "togi approve"
+
+[[forbid]]
+command_prefix = "togi crowd test"

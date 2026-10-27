@@ -34,8 +34,10 @@ LOCKED = os.path.join(ROOT, "eval", "questions.jsonl")
 LOCK = os.path.join(ROOT, "eval", "questions.lock")
 SEED_LOG = os.path.join(ROOT, "data", "seeder-log.jsonl")
 RUNS = os.path.join(ROOT, "eval", "runs")
-SIGN = {"amount": 1, "paypal_fee": -1}  # sign each kind carries in PayPal's records
-OUT_KINDS = {"refund", "payout"}
+# Sign each answer carries in PayPal's records: money in is positive, money out (fees, refunds,
+# payouts) negative. Certified answers must match the sign; a baseline's plain-text answer is held
+# to the amount only, since people state magnitudes ("we refunded 300.00").
+OUT = {("capture", "paypal_fee"), ("refund", "amount"), ("payout", "amount")}
 
 CERTIFIED_PROMPT = """You answer money questions about one PayPal account using only your tools, and you never state a number yourself.
 1. Call describe_activity for the question's currency and window to see which kinds of records exist (no amounts).
@@ -80,7 +82,8 @@ def answer_key(q, log_path=SEED_LOG):
             continue
         if start <= parse_time(e["at"]) < end and e.get(k["field"]) is not None:
             total += Decimal(e[k["field"]])
-    return total.quantize(Decimal("0.01"))
+    total = total.quantize(Decimal("0.01"))
+    return -total if (k["kind"], k["field"]) in OUT else total
 
 
 # ---------- agents ----------
@@ -156,7 +159,7 @@ def run_claude(q, system, model, timeout=600):
 
 # ---------- scoring ----------
 
-def score(q, res, key):
+def score(q, res, key, system):
     if res["status"] == "error":
         return "error"
     answered = res["status"].startswith("answered")
@@ -165,7 +168,8 @@ def score(q, res, key):
     if not answered:
         return "refused"
     try:
-        ok = res.get("value") is not None and abs(Decimal(res["value"])) == abs(key)
+        v = None if res.get("value") is None else Decimal(res["value"])
+        ok = v is not None and (v == key if system == "certified" else abs(v) == abs(key))
     except InvalidOperation:
         ok = False
     return "exact" if ok else "wrong"
@@ -179,7 +183,8 @@ def summarize(rows, meta):
     lines = [f"# Scorecard run {meta['run_id']}", "",
              f"- system: {meta['system']} · agent: {meta['agent']} · model: {meta.get('model') or 'n/a'} · runs: {meta['runs']}",
              f"- questions: {meta['set']} ({meta['set_hash']}){' LOCKED' if meta['locked'] else ' (dev, not locked)'}",
-             f"- answer key: seeder log ({meta['key_hash']}), never Transaction Search", "",
+             f"- answer key: seeder log ({meta['key_hash']}), never Transaction Search",
+             "- certified answers must match sign and amount; baseline answers are held to the amount only", "",
              f"- exact to the cent: {c['exact']} of {len(ans)} answerable",
              f"- confident wrong answers: {c['wrong']} of {n}",
              f"- refused an answerable question: {c['refused']}",
@@ -243,7 +248,7 @@ def main():
             key = answer_key(q)
             res = run_reference(q, programs) if a.agent == "reference" else run_claude(q, a.system, a.model)
             row = dict(id=q["id"], run=run, expected=None if key is None else str(key), **res)
-            row["score"] = score(q, res, key)
+            row["score"] = score(q, res, key, a.system)
             rows.append(row)
             print(f"{q['id']} run {run}: {row['score']:16} expected {row['expected']} got {row.get('value', row['status'])}", flush=True)
     os.makedirs(RUNS, exist_ok=True)

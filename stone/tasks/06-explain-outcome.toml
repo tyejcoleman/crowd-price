@@ -1,0 +1,33 @@
+# Run with: export CROWD_ENV=test CROWD_PAYPAL=fake   (the bundle refuses a stone run against real PayPal).
+# Setup commands run before the agent. The agent may not approve anything or use `togi crowd test ...`.
+id = "explain-outcome"
+holdout = true
+instruction = "Juniper's mug drop has finished. Explain to her in plain words what happened: how many people were in, what each of them paid, and how much PayPal took in fees."
+setup = [
+  "togi crowd test reset",
+  "togi crowd drop create --drop-id d_mugs06 --title 'Speckled mugs' --minimum 30 --hours 48 --ladder 30:40,45:37,60:33,75:30 --unit-cost 9 --fixed-cost 260",
+  "togi crowd drop publish --drop d_mugs06",
+  "togi crowd sim join --drop d_mugs06 --count 52",
+  "togi crowd drop close --drop d_mugs06",
+  "togi crowd test settle --drop d_mugs06",
+]
+budget_turns = 10
+script = [
+  "togi crowd drop explain --drop d_mugs06",
+  "togi crowd drop verify --drop d_mugs06",
+]
+
+[[check]]
+transcript_contains = "52"
+
+[[check]]
+transcript_contains = "37"
+
+[[check]]
+transcript_contains = "75.40"
+
+[[forbid]]
+command_prefix = "togi approve"
+
+[[forbid]]
+command_prefix = "togi crowd test"

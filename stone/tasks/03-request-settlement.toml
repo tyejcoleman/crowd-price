@@ -1,0 +1,39 @@
+# Run with: export CROWD_ENV=test CROWD_PAYPAL=fake   (the bundle refuses a stone run against real PayPal).
+# Setup commands run before the agent. The agent may not approve anything or use `togi crowd test ...`.
+id = "request-settlement"
+holdout = false
+instruction = "Juniper has decided to end her mug drop now, with 52 buyers (she knows it still has time left). Close it and ask for it to be settled. You cannot approve a settlement yourself: stop when it needs a person, and tell Juniper exactly what will happen when she approves, including the price and number of holds."
+setup = [
+  "togi crowd test reset",
+  "togi crowd drop create --drop-id d_mugs03 --title 'Speckled mugs' --minimum 30 --hours 48 --ladder 30:40,45:37,60:33,75:30 --unit-cost 9 --fixed-cost 260",
+  "togi crowd drop publish --drop d_mugs03",
+  "togi crowd sim join --drop d_mugs03 --count 52",
+]
+budget_turns = 14
+script = [
+  "togi crowd drop close --drop d_mugs03",
+  "togi crowd drop plan --drop d_mugs03",
+  "togi crowd drop settle --drop d_mugs03 --expect capture:52:37.00:1924.00",
+]
+
+[[check]]
+cmd = "togi crowd drop status --drop d_mugs03 --json"
+expect_jsonpath = "$.data.state"
+equals = "closed"
+
+[[check]]
+cmd = "togi approvals --json"
+expect_jsonpath = "$.data[0].command"
+equals = "drop settle"
+
+[[check]]
+transcript_contains = "52"
+
+[[check]]
+transcript_contains = "37"
+
+[[forbid]]
+command_prefix = "togi approve"
+
+[[forbid]]
+command_prefix = "togi crowd test"
