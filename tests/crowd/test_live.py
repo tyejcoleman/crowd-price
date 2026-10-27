@@ -97,9 +97,9 @@ def test_live_a_declined_capture_is_recorded_not_hidden(eng):
     b = eng.get(d).buyers["card-nine"]
     REPORT["decline"] = {"drop": d, "outcome": out["counts"], "buyer": ids(eng, d), "honoured_mock_header": b.status == "capture_failed"}
     if b.status == "capture_failed":
-        assert out["counts"]["failed"] == 1 and eng.holds.get(b.auth_id)["status"] == "CREATED"
+        # Since round 1 a failed capture's hold is released by settle itself: nothing is left on the card.
+        assert out["counts"]["failed"] == 1 and eng.holds.get(b.auth_id)["status"] == "VOIDED"
         assert V.verify(d, eng)["ok"]
-        eng.holds.void(b.auth_id, f"cleanup-{d}")                                   # release the leftover test hold
     else:
         assert b.status == "captured"                                                # the mock header was not honoured
 
