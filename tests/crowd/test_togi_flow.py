@@ -3,7 +3,7 @@ import json
 
 import pytest
 
-from togi_helpers import REPO, env_for, person_in_a_terminal, set_up_approver, togi, togi_available
+from togi_helpers import REPO, add_crowd, env_for, person_in_a_terminal, set_up_approver, togi, togi_available
 
 pytestmark = pytest.mark.skipif(not togi_available(), reason="togi is not installed (set TOGI_SRC or install it)")
 
@@ -13,8 +13,7 @@ LAD = "3:40,5:36,7:33"
 @pytest.fixture
 def env(tmp_path):
     e = env_for(tmp_path / "togi_home", tmp_path / "crowd.db")
-    code, out = togi(e, "add", str(REPO))
-    assert code == 0, out
+    add_crowd(e, tmp_path)
     set_up_approver(tmp_path / "togi_home")           # Togi refuses every approval until a person has set a passphrase
     return e
 

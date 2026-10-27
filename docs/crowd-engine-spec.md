@@ -35,7 +35,7 @@ A maker opens a **drop**:
   fee(32.00) must equal 1.32 and fee(250.00) must equal 6.97, both observed in sandbox).
 
 **`store.py`: SQLite, path `data/crowd.db` by default** (`data/` is git-ignored; override with env
-`CROWD_DB`).
+`CROWD_DB`; the fake PayPal's default is `data/crowd-fake.db`, see section 8).
 - An append-only `events` table: `id, ts, drop_id, type, payload_json`.
 - State is a projection rebuilt from events (`project(drop_id)`), never stored separately.
 - Event types:
@@ -213,3 +213,27 @@ and hand it to a person.
 - **`verify`** also checks capture currency and parent authorisation, released orphans, unconfirmed leaves and a blocked settle;
   every problem has a `next`.
 - **`drop settle`** refuses an approval of scope "test" unless the PayPal is the fake (`ctx.approval_scope`).
+
+## 8. Fix round 3 (2026-10-27): one store, one PayPal; ask again before money moves
+
+See `docs/crowd-fixes-r3.md` for the list and `docs/DECISIONS.md` D-11b and F-15 for the reasons and the sandbox probes. Principle:
+the engine trusts neither the PayPal this process happens to use nor its own records when PayPal can be asked right before money moves.
+
+- **Events added:** `buyer_excluded`. `drop_created` also records `paypal_mode` / `paypal_ref`; `hold_voided` may carry `capture_ids`
+  and `taken_outside_engine`; `orphan_hold_released` / `void_failed` may carry `superseded` (an earlier order of the same join intent).
+- **One store, one PayPal.** `Engine.require_paypal(drop)` runs first in join, leave, publish, close, reconcile, plan, settle, exclude and
+  `verify`: a mismatch of mode or ref with anything the drop recorded is `wrong_paypal`, with nothing written. A new drop is refused in a store
+  that holds another PayPal's drops. Default store path: `data/crowd.db` (sandbox), `data/crowd-fake.db` (`CROWD_PAYPAL=fake`),
+  `$TOGI_HOME/state/crowd/crowd-test.db` (`CROWD_ENV=test` under Togi). `drop settle` takes a "test"-scope approval only for the fake with
+  `CROWD_ENV=test` and a store whose `foreign_holds` is empty. `togi.toml`: `[policy] test_approvals = true`, `require_lock = true`.
+- **Asked again.** `plan` and `settle` read every held authorisation and the captures on its order (`order_captures`, new on both
+  clients). Not open, or captured: out of the crowd, recorded with PayPal's word; a stray capture is for a person to refund. `settle`
+  re-derives the plan from that crowd and refuses a different one with `plan_changed` and the new token. An unreadable hold (403) stops
+  `close`/`plan` (`hold_unreadable`) or blocks `settle`; `drop exclude --drop D --buyer B` [write] resolves it. `verify` also lists every
+  capture on every order of the drop.
+- **Classification and breaker.** `buyer_specific` reads the top-level `name` and each `details[]` entry (`HoldError.name`,
+  `.detail_names`). Two capture failures in a row of any buyer codes, or more than half failing once four were tried, stop settle; checked
+  from the whole history at the start of every settle. `AUTHORIZATION_EXPIRED` / `hold_expired` do not count.
+- **Recovery.** `_recover` raises `paypal_unavailable` on an outage and blocks on a refusal; only a 404 means none. A join retry that gets a
+  different order is a new hold: the earlier order's hold is released first (D-11).
+- **Leaves (D-11b).** An unresolved or refused leave stands; close and settle retry the void and the buyer is out either way.

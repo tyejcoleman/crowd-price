@@ -11,7 +11,7 @@ Every error has a `next` command: run it. Common ones:
 - `drop_not_closed`: close first. `drop close --drop D`.
 - `already_joined`: that buyer already holds a place. Use another name, or `drop leave` first.
 - `join_declined`: the test card was declined. Try `--card 1` (cards 0 to 8 are valid test cards).
-- `plan_changed`: the `--expect` token does not match what settle would do. Use the token the error shows.
+- `plan_changed`: the `--expect` token does not match what settle would do, now that PayPal was asked about every remaining hold again. Nothing was captured or released. Tell the person what changed; they approve the token the error shows.
 - `ladder_loses_money` / `start_price_loses_money`: a step would lose money. Run `ladder propose`.
 - `bad_price`: a price must be dollars with at most 2 decimals, above 0 and at most 10000. Use `ladder propose`.
 - `minimum_mismatch`: `--minimum` must equal the first number in the ladder.
@@ -22,6 +22,10 @@ Every error has a `next` command: run it. Common ones:
   Money moves only through `drop settle`, which waits for a person. Do not look for a way round it.
 - `settle_blocked`: PayPal refused something that may be about the account, not one buyer, or two charges in a row failed
   alike. Nothing more was captured or released. A person (the maker) must look; do not retry in a loop. See `settle`.
+- `wrong_paypal`: this drop belongs to a different PayPal (the real sandbox versus the fake, or another app) than this session uses. Nothing was changed. Use the PayPal it was made with (`CROWD_PAYPAL`); never copy its drop into another store.
+- `hold_unreadable`: PayPal will not describe one buyer's hold (an account or permission problem), so the drop was not closed or planned. Tell the maker the buyer, the hold id and the issue name; they either void the hold at PayPal or run `drop exclude`. Do not run `drop exclude` yourself.
+- `leave_pending`: PayPal would not release a leaving buyer's hold just now. The leave is on record and is completed when the drop closes; that buyer is not charged.
+- `buyer_excluded` / `already_excluded` / `cannot_exclude`: a person took that buyer out of the drop.
 - `hold_not_open`: that buyer's earlier hold had already been voided or had lapsed at PayPal, so it was not counted. Join again.
 - `earlier_attempt_unresolved`: a buyer's earlier try left a hold that could not be released, so no new hold was placed. Ask a person.
 - `test_approval_outside_test_mode`: the approval came from a throwaway test approver; real PayPal needs a person's own.

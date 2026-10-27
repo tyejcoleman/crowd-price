@@ -414,8 +414,7 @@ def test_a_refused_capture_is_recorded_and_settle_goes_on_with_the_next_buyer(en
     join_many(engine, drop, 4)
     engine.close(drop)
     victim = victim_of(engine, drop)
-    fake.refuse("capture", "AUTHORIZATION_EXPIRED", match=victim, times=None)
-    fake.expire(victim)
+    fake.refuse("capture", "AUTHORIZATION_EXPIRED", match=victim, times=None)     # still CREATED when read; the capture is refused
     out = engine.settle(drop)
     assert out["state"] == "settled" and out["counts"] == {"holds": 4, "captured": 3, "voided": 0, "failed": 1, "left": 0}
     b = engine.get(drop).buyers["buyer-02"]
@@ -606,11 +605,13 @@ def test_verify_treats_a_failed_capture_with_no_paypal_evidence_as_a_problem(eng
     assert not v["ok"] and any("no PayPal evidence" in p and "ghost" in p for p in v["problems"])
 
 
-def test_verify_notices_events_recorded_against_another_paypal(engine, drop, fake):
+def test_verify_refuses_a_drop_with_events_recorded_against_another_paypal(engine, drop, fake):
+    """Round 3 (A): a drop belongs to one PayPal. verify used to report this as a failed check; it now refuses outright, because
+    a hold read from the wrong PayPal says nothing about the drop (see test_fixes_r3 for every operation)."""
     settle_drop(engine, drop, 3)
     engine.store.append(drop, "capture_failed", {"buyer": "buyer-01", "auth_id": "x", "issue": "X", "paypal_mode": "sandbox"})
-    v = V.verify(drop, engine)
-    assert not v["ok"] and any("sandbox" in p for p in v["problems"])
+    e = pytest.raises(CrowdError, V.verify, drop, engine).value
+    assert e.code == "wrong_paypal" and e.ctx["recorded"].startswith("sandbox")
 
 
 # ---- R7: the approval covers the releases too ------------------------------------------------------------------------------
@@ -741,7 +742,7 @@ def test_every_hold_past_its_expiry_is_excluded_from_the_plan(engine, drop, fake
     for b in engine.get(drop).buyers.values():
         fake.expire(b.auth_id)                        # and PayPal agrees (round 2: the clock alone decides nothing)
     p = engine.plan(drop)
-    assert p["expired"] == 4 and p["holds"] == 0 and plan_token(p) == "capture:0:40.00:0.00"
+    assert p["expired"] == 4 and p["holds"] == 0 and plan_token(p) == "void:0"        # round 3: no crowd left, so not funded
 
 
 def test_expiry_is_judged_per_hold_and_only_the_expired_one_is_skipped(engine, drop, fake, store, clock):
@@ -761,12 +762,11 @@ def test_expiry_is_judged_per_hold_and_only_the_expired_one_is_skipped(engine, d
     assert p["holds"] == 3 and p["expired"] == 1 and "1 expired hold cannot be taken" in p["summary"]
     assert plan_token(p) == "capture:3:40.00:120.00"
     out = eng.settle(drop, expect="capture:3:40.00:120.00")
-    assert out["counts"] == {"holds": 4, "captured": 3, "voided": 0, "failed": 1, "left": 0} and out["shortfall"] == 0
+    assert out["counts"] == {"holds": 4, "captured": 3, "voided": 1, "failed": 0, "left": 0} and out["shortfall"] == 0
     assert victim not in [a for _, a in spy.calls]                        # nothing tried to capture, or void, the lapsed hold
-    cf = [e["payload"] for e in store.events(drop) if e["type"] == "capture_failed"][0]
-    assert cf["code"] == "hold_expired" and cf["auth_id"] == victim and cf["expires"] == short
-    rel = [e["payload"] for e in store.events(drop) if e["type"] == "failed_hold_released"][0]
-    assert rel["reason"] == "expired"
+    hv = [e["payload"] for e in store.events(drop) if e["type"] == "hold_voided"][0]      # round 3: PayPal's EXPIRED, recorded
+    assert hv["reason"] == "paypal_says_expired" and hv["paypal_status"] == "EXPIRED" and hv["auth_id"] == victim
+    assert not [e for e in store.events(drop) if e["type"] in ("capture_failed", "failed_hold_released")]
     assert V.verify(drop, eng)["ok"]
 
 
@@ -799,7 +799,7 @@ def test_verify_checks_that_a_hold_the_engine_called_expired_really_is(engine, d
     assert V.verify(drop, engine)["ok"]                                  # PayPal said EXPIRED when it was recorded, and still does
     edit_fake(fake, lambda st: st["auths"][victim].update(status="CREATED"))      # ... unless PayPal now says otherwise
     v = V.verify(drop, engine)
-    assert not v["ok"] and any("expired" in p and "CREATED" in p for p in v["problems"])
+    assert not v["ok"] and any("EXPIRED" in p and "CREATED" in p for p in v["problems"])
 
 
 def test_a_lapsed_hold_in_a_missed_drop_needs_no_void_and_nobody_is_charged(engine, drop, fake, store, clock):
@@ -820,7 +820,7 @@ def test_a_lapsed_hold_in_a_missed_drop_needs_no_void_and_nobody_is_charged(engi
 # ---- R3: the only road to money is `drop settle` through the host -------------------------------------------------------------
 
 def test_exactly_one_command_moves_money_and_it_waits_for_a_person():
-    assert [w for w, e in tb.EFFECTS.items() if e == "money"] == ["drop settle"]
+    assert sorted(w for w, e in tb.EFFECTS.items() if e == "money") == ["drop exclude", "drop settle"]  # both wait for a person
     assert tb.EFFECTS["test settle"] == "admin" and tb.EFFECTS["test reset"] == "admin"
 
 
@@ -846,7 +846,7 @@ def test_paypal_credentials_come_only_from_the_repo_env_or_the_environment(monke
     assert not re.search(r"(?<![a-z])open\(", client) and "os.environ" not in client and "getenv" not in client   # no file, no variable of its own
 
 
-from togi_helpers import env_for, togi, togi_available  # noqa: E402
+from togi_helpers import add_crowd, env_for, togi, togi_available  # noqa: E402
 
 
 @pytest.mark.skipif(not togi_available(), reason="togi is not installed")
@@ -854,7 +854,7 @@ def test_through_the_host_an_agent_cannot_settle_without_a_person(tmp_path):
     """The whole road, as an agent sees it: settle waits for approval, and the test back doors are shut."""
     db = tmp_path / "crowd.db"
     env = env_for(tmp_path / "home", db)
-    assert togi(env, "add", os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))[0] == 0
+    add_crowd(env, tmp_path)
     setup = [("crowd", "drop", "create", "--drop-id", "d_r3a", "--title", "Mugs", "--minimum", "3", "--hours", "1",
               "--ladder", "3:40,5:36"), ("crowd", "drop", "publish", "--drop", "d_r3a"),
              ("crowd", "sim", "join", "--drop", "d_r3a", "--count", "4"), ("crowd", "drop", "close", "--drop", "d_r3a")]
@@ -880,7 +880,7 @@ def test_a_togi_run_script_must_not_be_able_to_import_the_engine_and_settle(tmp_
     db = tmp_path / "crowd.db"
     env = env_for(tmp_path / "home", db)
     repo = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    assert togi(env, "add", repo)[0] == 0
+    add_crowd(env, tmp_path)
     eng = Engine(Store(str(db)), FakePayPal(str(db) + ".fakepaypal.json"))
     d = eng.create_drop("Mugs", "3:40,5:36", 3, 60, drop_id="d_r3b")
     eng.publish(d)

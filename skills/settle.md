@@ -6,7 +6,9 @@ summary: Closing, the approval step, the two outcomes, and checking the result.
 
 1. `drop close --drop D` stops joining. A drop also stops accepting joins (and leaves) when its clock runs out, but
    it still has to be closed before it can be settled. Closing first sorts out any join whose answer was lost.
-2. `drop plan --drop D` shows exactly what settle will do and an `expect` token:
+2. `drop plan --drop D` reads every remaining hold at PayPal just now (the authorisation and the captures on its order),
+   leaves out any that PayPal no longer shows as open (voided, lapsed, or already captured), and shows exactly what settle
+   will do with an `expect` token. The funded decision and the price follow the crowd that is left:
    - funded: `capture 52 holds at $33.00 = $1,716.00` (`capture:52:33.00:1716.00`). Each hold is charged the
      final price in one final capture and the rest of the hold is released.
    - not funded: `void 22 holds, nobody pays` (`void:22`). The minimum was not met at close.
@@ -16,7 +18,9 @@ summary: Closing, the approval step, the two outcomes, and checking the result.
    approval id and does nothing. Tell the person the plan summary and that they approve it with
    `togi approve <id>` in their own terminal (they type the drop id). You cannot and must not do this.
 4. After they approve, repeat the same command with `--approval <id>`. An approval works once, for these exact
-   arguments, and expires. If the plan changed, settle refuses and shows the new token.
+   arguments, and expires. Settle reads every hold at PayPal again before any money moves; if what PayPal shows no longer
+   gives the approved plan (a hold was voided or lapsed meanwhile, a capture appeared), settle refuses with `plan_changed`
+   and the NEW token, and has captured and released nothing. Tell the person what changed; they approve the new plan.
 5. Settle is safe to repeat: a second run changes nothing; after a crash it carries on where it stopped.
 
 ## Afterwards
@@ -35,8 +39,11 @@ clock is still tried, because PayPal decides.
 
 ## If settlement stops (`settle_blocked`)
 Some PayPal answers are not about one buyer (the account is restricted, the credentials are refused, a name nobody has
-seen, or two charges in a row fail the same way). Settle then stops at once: nothing more is captured and nothing is
-released or voided, and the drop stays "settling". This is a refusal that names a person: say plainly that settlement is
+seen), and failed charges that look like one shared cause also stop it: two in a row, whatever their buyer-level codes, or
+more than half of the charges once four were tried. Settle then stops at once: nothing more is captured and nothing is
+released or voided, and the drop stays "settling". The error's `next` names the exact hold and the two ways past it: void
+that hold at PayPal by hand, or `togi crowd drop exclude --drop D --buyer B` (releases it and leaves that buyer out). Taking
+a buyer out is the maker's decision: give them the buyer, the hold id and both options, and do not run `drop exclude` yourself. This is a refusal that names a person: say plainly that settlement is
 stopped, give the issue name and debug id from the error, and that the maker must look into it with PayPal. Do not run
 settle again in a loop. When the cause is fixed, `drop plan` gives a fresh token for a person to approve. `drop verify`
 reports the stop as a problem until then.

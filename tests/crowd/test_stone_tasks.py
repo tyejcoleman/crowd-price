@@ -7,7 +7,7 @@ import tomllib
 
 import pytest
 
-from togi_helpers import REPO, env_for, togi, togi_available
+from togi_helpers import REPO, add_crowd, env_for, togi, togi_available
 
 TASKS = sorted(glob.glob(str(REPO / "stone" / "tasks" / "*.toml")))
 
@@ -54,7 +54,7 @@ def jsonpath(doc, path):
 def test_each_task_is_solved_by_its_script_and_its_checks_pass(path, tmp_path):
     task = load(path)
     env = env_for(tmp_path / "home", tmp_path / "crowd.db")
-    assert togi(env, "add", str(REPO))[0] == 0
+    add_crowd(env, tmp_path)
 
     def sh(cmd):
         argv = shlex.split(cmd)

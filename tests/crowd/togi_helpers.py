@@ -4,6 +4,7 @@ import os
 import pty
 import pwd
 import select
+import shutil
 import subprocess
 import sys
 import time
@@ -145,3 +146,39 @@ def person_in_a_terminal(env: dict, argv, typed, passphrase: str = APPROVER_PASS
             status = 0
     os.close(fd)
     return os.waitstatus_to_exitcode(status), out.decode("utf-8", "replace")
+
+
+# ---- the bundle as Togi sees it: a locked COPY, in the test's own TOGI_HOME ------------------------------------------------
+
+# Only what the bundle needs. An allow-list, never a copy of the whole tree: .env (sandbox credentials), data/ and .git stay home.
+BUNDLE_FILES = ("togi.toml", "togi_messages.toml", "pyproject.toml", "src", "skills", "stone", "tests")
+
+
+def add_crowd(env: dict, tmp_path: Path) -> tuple:
+    """`togi add` this bundle for a test, the way it stands when a person has locked it.
+
+    Togi's money path requires a verified, anchored lock on a bundle with locked tiers (FIXES-r4 M3), and the lock is anchored in
+    the TOGI_HOME it was made in, so the repo's own lock (a person's, in the person's home) can never verify in a throwaway home.
+    This copies the bundle's files to a temporary directory, registers the COPY, and records its locked hashes in the test's own
+    TOGI_HOME the way a person's `togi lock` does (Togi's own tests do the same through `audit.lock_bundle`; here under the
+    throwaway approver home, so the audit entry carries the throwaway scope). The real repo, its
+    .togi/ and the person's approver are never touched, and the copy carries no secrets (`.env` is not on the allow-list).
+    Returns what `togi add` returned: (exit code, parsed output)."""
+    assert env.get("TOGI_HOME") and Path(env["TOGI_HOME"]).resolve() != (Path.home() / ".togi").resolve(), "a throwaway TOGI_HOME"
+    dest = Path(tmp_path) / "crowd-bundle"
+    if not dest.exists():
+        dest.mkdir(parents=True)
+        for name in BUNDLE_FILES:
+            src = REPO / name
+            if src.is_dir():
+                shutil.copytree(src, dest / name, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+            else:
+                shutil.copy2(src, dest / name)
+    code, out = togi(env, "add", str(dest))
+    assert code == 0, out
+    assert env.get("TOGI_APPROVER_HOME") and Path(env["TOGI_APPROVER_HOME"]).resolve() != real_approver_dir().resolve()
+    script = ("from togi import audit, registry\n"
+              "audit.lock_bundle(registry.manifest_for('crowd'), 'human:test')\n")
+    r = subprocess.run([sys.executable, "-c", script], env=env, capture_output=True, text=True, cwd=str(REPO.parent))
+    assert r.returncode == 0, r.stderr
+    return code, out

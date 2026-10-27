@@ -5,7 +5,9 @@ a projection rebuilt from the events (`project`). SQLite triggers reject UPDATE 
 the whole store is wiped only by deleting the database file (`reset`, used by `test reset`).
 
 Path: env CROWD_DB; else, when CROWD_ENV=test, $TOGI_HOME/state/crowd/crowd-test.db under Togi (isolated per run)
-or data/crowd-test.db; else data/crowd.db under the repo (data/ is git-ignored). Test runs never touch real drops.
+or data/crowd-test.db; else, with CROWD_PAYPAL=fake, data/crowd-fake.db; else data/crowd.db under the repo (data/ is
+git-ignored). A store belongs to one PayPal (every drop records which one it was created with, see engine.require_paypal),
+and the default path follows the PayPal mode so a fake can never be pointed at the real drops by accident.
 """
 from __future__ import annotations
 
@@ -34,6 +36,8 @@ EVENT_TYPES = {
     "join_started", "order_created", "orphan_hold_released",
     # a leave is written down BEFORE PayPal is asked to void, and closed by buyer_left / leave_failed
     "leave_started", "leave_failed",
+    # a person took one buyer out of the crowd (settle was stuck on them, or PayPal would not say what their hold is)
+    "buyer_excluded",
     # settlement stopped because PayPal refused something that is not about one buyer (or a streak of identical failures)
     "settle_blocked",
     "drop_settled",
@@ -71,6 +75,8 @@ def default_path() -> str:
         if home:
             return os.path.join(os.path.abspath(home), "state", "crowd", "crowd-test.db")
         return os.path.join(ROOT, "data", "crowd-test.db")
+    if os.environ.get("CROWD_PAYPAL", "").strip().lower() == "fake":
+        return os.path.join(ROOT, "data", "crowd-fake.db")      # never data/crowd.db: that one holds sandbox drops
     return os.path.join(ROOT, "data", "crowd.db")
 
 
@@ -218,7 +224,7 @@ def _json_default(o):
 
 # ---- the projection ----------------------------------------------------------------------------
 
-BUYER_STATES = ("held", "left", "captured", "voided", "capture_failed", "hold_failed", "void_failed")
+BUYER_STATES = ("held", "left", "captured", "voided", "capture_failed", "hold_failed", "void_failed", "excluded")
 
 
 @dataclass
@@ -226,7 +232,7 @@ class Buyer:
     id: str
     name: str
     card_index: int = 0
-    status: str = "hold_failed"        # held | left | captured | voided | capture_failed | hold_failed | void_failed
+    status: str = "hold_failed"        # held | left | captured | voided | capture_failed | hold_failed | void_failed | excluded
     attempts: int = 0                  # hold_placed + hold_failed events so far (request-id suffix)
     joined_at: str | None = None
     order_id: str | None = None
@@ -240,6 +246,7 @@ class Buyer:
     error: str | None = None           # last failure code (hold_failed / capture_failed)
     released: bool = False             # a failed capture's hold was voided afterwards (nothing left open)
     void_failed: bool = False          # PayPal refused to release this hold: it may still be open on the buyer's card
+    excluded: bool = False             # a person took this buyer out of the crowd (`drop exclude`): they cannot rejoin
 
     def to_dict(self) -> dict:
         d = {k: (str(v) if isinstance(v, Decimal) else v) for k, v in self.__dict__.items()}
@@ -270,6 +277,7 @@ class Drop:
     unresolved: dict[str, dict] = field(default_factory=dict)   # request id -> join_started payload, not yet closed
     leaving: dict[str, dict] = field(default_factory=dict)      # buyer -> leave_started payload (+ asked_at), not yet closed
     blocked: dict | None = None        # the settle_blocked payload while settlement is stopped for a person (cleared on settle)
+    lost_after_close: int = 0          # holds that left the crowd after the drop closed and before settlement started
     event_count: int = 0
 
     @property
@@ -279,13 +287,15 @@ class Drop:
 
     @property
     def count(self) -> int:
-        """The crowd: holds placed and not released. Once the drop is closed it is frozen at the crowd that closed it,
-        counted as of its deadline (holds then turn into captures, voids or failures, but the crowd the price was set
-        for does not change)."""
+        """The crowd: holds placed and not released. Once the drop is closed it is the crowd that closed it, counted as of its
+        deadline, MINUS every hold that has left the crowd since (`lost_after_close`: settle reads each hold at PayPal before any
+        money moves and records one that was voided, lapsed or captured meanwhile, so the funded decision and the price follow
+        the crowd that can actually be charged). Once settlement has started it is frozen at the crowd that settlement was
+        started for (holds then turn into captures, voids or failures, but the crowd the price was set for does not change)."""
         if self.settlement:
             return int(self.settlement["count"])
         if self.closed and self.closed.get("count") is not None:
-            return int(self.closed["count"])
+            return max(0, int(self.closed["count"]) - self.lost_after_close)
         return len(self.holding)
 
     def price(self) -> Decimal:
@@ -297,9 +307,11 @@ def reduce(events: list[dict]) -> Drop:
     d: Drop | None = None
     for e in events:
         t, p = e["type"], e["payload"]
-        if d is not None and d.blocked and d.state == "settling" and t in (
-                "hold_captured", "hold_voided", "capture_failed", "failed_hold_released", "void_failed"):
+        if d is not None and d.blocked and d.state in ("closed", "settling") and t in (
+                "hold_captured", "hold_voided", "capture_failed", "failed_hold_released", "void_failed", "buyer_excluded",
+                "settlement_started"):
             d.blocked = None       # settlement went on after a block: it is no longer stopped (a new block sets it again)
+        held_before = {b.id for b in d.holding} if d is not None and d.state == "closed" else None
         if t == "drop_created":
             d = Drop(id=e["drop_id"], title=p["title"], maker=p.get("maker", ""), currency=p.get("currency", "USD"),
                      minimum=int(p["minimum"]), duration_minutes=int(p["duration_minutes"]),
@@ -325,8 +337,8 @@ def reduce(events: list[dict]) -> Drop:
             d.buyers[b.id] = b
         elif t == "join_started":
             prior = d.unresolved.get(p["request_id"])      # the same request asked again: it is still the same order
-            d.unresolved[p["request_id"]] = {**({"order_id": prior["order_id"]} if prior and prior.get("order_id") else {}),
-                                             **p}
+            kept = {k: prior[k] for k in ("order_id", "order_ids", "released_orders") if prior and prior.get(k)}
+            d.unresolved[p["request_id"]] = {**kept, **p}
         elif t == "leave_started":
             d.leaving[p["buyer"]] = {**p, "asked_at": e["ts"]}
         elif t == "leave_failed":
@@ -334,8 +346,16 @@ def reduce(events: list[dict]) -> Drop:
         elif t == "settle_blocked":
             d.blocked = {**p, "at": e["ts"]}
         elif t == "order_created":
-            if p.get("request_id") in d.unresolved:
-                d.unresolved[p["request_id"]]["order_id"] = p.get("order_id")
+            j = d.unresolved.get(p.get("request_id"))
+            if j is not None:
+                j["order_id"] = p.get("order_id")
+                ids = j.setdefault("order_ids", [])        # every order this intent has made: PayPal may answer the same
+                if p.get("order_id") and p["order_id"] not in ids:    # request with a NEW order once it has forgotten the first
+                    ids.append(p["order_id"])
+        elif t == "orphan_hold_released" and p.get("superseded"):
+            j = d.unresolved.get(p.get("request_id"))      # an EARLIER order's hold, released: the intent itself stays open
+            if j is not None and p.get("order_id"):
+                j.setdefault("released_orders", []).append(p["order_id"])
         elif t == "orphan_hold_released":
             d.unresolved.pop(p.get("request_id"), None)
             if p.get("buyer"):      # that attempt's request id is spent (PayPal would replay the voided hold): move on
@@ -373,12 +393,22 @@ def reduce(events: list[dict]) -> Drop:
             b.status, b.error = "capture_failed", p.get("code")
         elif t == "failed_hold_released":
             d.buyers[p["buyer"]].released = True
+        elif t == "buyer_excluded":
+            b = d.buyers[p["buyer"]]
+            b.excluded, b.status = True, "excluded"        # out of the crowd for good; the events that follow say what became of the hold
+            d.leaving.pop(p["buyer"], None)
         elif t == "void_failed":
+            if p.get("orphan") and p.get("superseded"):     # an earlier order's hold that could not be released: resolved as stuck
+                j = d.unresolved.get(p.get("request_id"))
+                if j is not None and p.get("order_id"):
+                    j.setdefault("released_orders", []).append(p["order_id"])
             if not p.get("orphan"):  # an orphan hold was never a buyer's: the event only names the open hold
                 b = d.buyers[p["buyer"]]
                 b.void_failed, b.error = True, p.get("code") or b.error
                 if b.status == "held":
                     b.status = "void_failed"
+        if held_before is not None and d.state == "closed":      # between close and the start of settlement
+            d.lost_after_close += len(held_before - {b.id for b in d.holding})
     if d is None:
         raise StoreError("drop_not_found", "no events")
     return d

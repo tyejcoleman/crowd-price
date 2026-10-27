@@ -233,10 +233,11 @@ def test_f1_after_the_breaker_a_person_can_look_and_settle_resumes_with_a_fresh_
     assert V.verify(drop, engine)["ok"] and open_auths(fake) == {}
 
 
-def test_f1_failures_with_different_codes_do_not_trip_the_breaker(engine, drop, fake):
+def test_f1_failures_that_are_not_in_a_row_do_not_trip_the_breaker_whatever_their_codes(engine, drop, fake):
+    """(Round 3 C: two in a row of ANY buyer-specific codes now trip it, see test_fixes_r3; failures a capture apart do not.)"""
     tok = closed_drop(engine, drop)
     fake.refuse("capture", "TRANSACTION_REFUSED", match=auth_of(engine, drop, "buyer-01"), times=None)
-    fake.refuse("capture", "PAYER_ACTION_REQUIRED", match=auth_of(engine, drop, "buyer-02"), times=None)
+    fake.refuse("capture", "PAYER_ACTION_REQUIRED", match=auth_of(engine, drop, "buyer-03"), times=None)
     assert engine.settle(drop, expect=tok)["counts"]["failed"] == 2
 
 
@@ -324,24 +325,30 @@ def test_f2_the_leave_is_written_down_before_paypal_is_asked(engine, drop, fake)
     assert engine.get(drop).leaving == {}
 
 
-def test_f2_a_leave_that_never_reached_paypal_is_dropped_and_the_buyer_stays_in(engine, drop, fake):
+def test_f2_a_leave_that_never_reached_paypal_is_honoured_at_close_by_releasing_the_hold(engine, drop, fake):
+    """(Decision D-11b, round 3: this used to keep the buyer in and charge them. The buyer asked to leave before the deadline,
+    saw an error, and so is never charged: close retries the void and the buyer is out.)"""
     join_many(engine, drop, 3)
     cy = auth_of(engine, drop, "buyer-03")
     fake.unavailable("void", match=cy)
     assert code(engine.leave, drop, "buyer-03") == "paypal_unavailable"
     out = engine.close(drop)
-    assert out["reconciled"]["leaves_kept"] == ["buyer-03"]
-    assert engine.get(drop).buyers["buyer-03"].status == "held" and engine.get(drop).closed["count"] == 3
-    lf = evs(engine, drop, "leave_failed")[0]
-    assert lf["reason"] == "paypal_says_created" and lf["paypal_status"] == "CREATED"
+    assert out["reconciled"]["leaves_completed"] == ["buyer-03"] and out["reconciled"]["leaves_kept"] == []
+    assert engine.get(drop).buyers["buyer-03"].status == "left" and engine.get(drop).closed["count"] == 2
+    assert pp_status(fake, cy) == "VOIDED" and not evs(engine, drop, "leave_failed")
 
 
-def test_f2_a_leave_paypal_refused_is_closed_at_once_and_the_hold_stays_theirs(engine, drop, fake):
+def test_f2_a_leave_paypal_refused_stays_on_record_and_is_completed_at_close(engine, drop, fake):
+    """(D-11b, round 3: a refused leave used to be closed at once with the hold left theirs, and they were charged. The buyer
+    asked in time and saw an error, so the leave stands; close retries the void.)"""
     join_many(engine, drop, 3)
-    fake.refuse("void", "PAYER_ACTION_REQUIRED", match=auth_of(engine, drop, "buyer-03"))
-    assert code(engine.leave, drop, "buyer-03") == "paypal_error"
-    assert engine.get(drop).leaving == {} and engine.get(drop).buyers["buyer-03"].status == "held"
-    assert evs(engine, drop, "leave_failed")[0]["issue"] == "PAYER_ACTION_REQUIRED"
+    victim = auth_of(engine, drop, "buyer-03")
+    fake.refuse("void", "PAYER_ACTION_REQUIRED", match=victim)
+    assert code(engine.leave, drop, "buyer-03") == "leave_pending"
+    assert "buyer-03" in engine.get(drop).leaving and not evs(engine, drop, "leave_failed")
+    out = engine.close(drop)
+    assert out["reconciled"]["leaves_completed"] == ["buyer-03"] and engine.get(drop).buyers["buyer-03"].status == "left"
+    assert pp_status(fake, victim) == "VOIDED"
 
 
 def test_f2_a_leave_on_a_hold_captured_elsewhere_is_a_conflict_and_is_closed(engine, drop, fake):
@@ -717,13 +724,23 @@ def test_f6_a_capture_that_went_through_before_the_expiry_is_recovered_not_calle
     assert len(fake_state(fake)["captures"]) == 3 and V.verify(drop, engine)["ok"]
 
 
-def test_f6_a_hold_paypal_says_is_captured_but_whose_capture_cannot_be_found_stops_settle(engine, drop, fake, clock):
+class CannotListCaptures(Wrap):
+    """A PayPal client that cannot list the captures on an order (so only the authorisation's status is known)."""
+    order_captures = None
+
+
+def test_f6_a_hold_paypal_says_is_captured_but_whose_capture_cannot_be_found_stops_settle(engine, drop, fake, store, clock):
+    """Settlement is under way (so a capture may be the engine's own, lost with its reply) and PayPal says the hold is CAPTURED,
+    but the capture of the final price cannot be found: nothing is guessed, a person looks."""
     join_many(engine, drop, 3)
     engine.close(drop)
-    clock.advance(days=3650)
     victim = auth_of(engine, drop, "buyer-02")
+    fake.unavailable("capture", match=auth_of(engine, drop, "buyer-01"))
+    eng = Engine(store, CannotListCaptures(fake), clock)
+    assert code(eng.settle, drop) == "paypal_unavailable"             # settlement_started is written; nothing captured yet
+    clock.advance(days=3650)
     edit_fake(fake, lambda st: st["auths"][victim].update(status="CAPTURED"))      # captured, with no capture on the order
-    e = blocked(engine.settle, drop)
+    e = blocked(eng.settle, drop)
     assert e.ctx["phase"] == "capture" and not evs(engine, drop, "capture_failed")
     assert evs(engine, drop, "settle_blocked")[0]["code"] == "captured_not_as_approved"
 
@@ -765,10 +782,40 @@ def test_f6_a_hold_paypal_says_is_expired_is_not_captured_and_the_evidence_is_pa
     p = eng.plan(drop)
     assert p["holds"] == 3 and p["expired"] == 1 and plan_token(p) == "capture:3:40.00:120.00"
     out = eng.settle(drop, expect=plan_token(p))
-    assert out["counts"]["failed"] == 1 and victim not in [a for _, a in spy.calls]
+    assert out["counts"] == {"holds": 4, "captured": 3, "voided": 1, "failed": 0, "left": 0} and victim not in [a for _, a in spy.calls]
+    hv = evs(engine, drop, "hold_voided")[0]                       # round 3: recorded at the read, as PayPal's word
+    assert hv["reason"] == "paypal_says_expired" and hv["paypal_status"] == "EXPIRED" and hv["expired"] is True and hv["checked_at"]
+    assert V.verify(drop, eng)["ok"]
+
+
+class LapsesAfterTheFirstLook(Wrap):
+    """PayPal shows this hold as open the first time it is read, and EXPIRED every time after: it lapses mid-settlement."""
+
+    def __init__(self, inner, victim):
+        super().__init__(inner)
+        self.victim, self.looks = victim, 0
+
+    def get(self, auth_id):
+        out = self.inner.get(auth_id)
+        if auth_id == self.victim:
+            self.looks += 1
+            if self.looks == 1:
+                return {**out, "status": "CREATED"}
+        return out
+
+
+def test_f6_a_hold_that_lapses_between_the_check_and_its_capture_is_recorded_with_paypals_word(engine, drop, fake, store, clock):
+    join_many(engine, drop, 4)
+    engine.close(drop)
+    clock.advance(days=3650)
+    victim = auth_of(engine, drop, "buyer-02")
+    fake.expire(victim)
+    eng = Engine(store, LapsesAfterTheFirstLook(fake, victim), clock)
+    out = eng.settle(drop)
+    assert out["counts"]["failed"] == 1 and out["shortfall"] == 0
     cf = evs(engine, drop, "capture_failed")[0]
     assert cf["code"] == "hold_expired" and cf["paypal_status"] == "EXPIRED" and cf["checked_at"]
-    assert V.verify(drop, eng)["ok"]
+    assert V.verify(drop, engine)["ok"]
 
 
 def test_f6_a_capture_that_answers_authorization_expired_is_recorded_as_a_buyer_refusal(engine, drop, fake):
@@ -806,9 +853,10 @@ def _strip_key(store, drop, event_type, key):
 def test_f6_a_hold_called_expired_without_paypals_word_is_flagged_by_verify(engine, drop, fake, store):
     join_many(engine, drop, 4)
     engine.close(drop)
-    fake.expire(auth_of(engine, drop, "buyer-02"))
+    victim = auth_of(engine, drop, "buyer-02")
+    fake.expire(victim)
     engine._clock = lambda: datetime(2036, 1, 1, tzinfo=timezone.utc)
-    engine.settle(drop)
+    Engine(store, LapsesAfterTheFirstLook(fake, victim), engine._clock).settle(drop)
     assert V.verify(drop, engine)["ok"]                                      # PayPal said EXPIRED, and it is recorded
     _strip_key(store, drop, "capture_failed", "paypal_status")               # the same event as an engine that went by its clock alone
     v = V.verify(drop, engine)
@@ -1036,10 +1084,38 @@ def test_f10_a_test_scope_approval_is_refused_outside_fake_mode_and_nothing_move
 
 @pytest.mark.parametrize("scope", ["default", None])
 def test_f10_the_persons_own_approval_and_a_togi_that_reports_no_scope_still_settle(monkeypatch, tmp_path, scope):
-    d, tok = settled_ready(monkeypatch, tmp_path)
-    monkeypatch.setattr(tb, "_eng", sandbox_kind_engine(tmp_path, monkeypatch))
+    """Against a PayPal that calls itself the sandbox, with a drop that really belongs to it (round 3: a drop made with one
+    PayPal can no longer be settled through another)."""
+    factory = sandbox_kind_engine(tmp_path, monkeypatch)
+    eng = factory()
+    d = eng.create_drop("Mugs", "3:40,5:36", 3, 60, drop_id="d_sbx1")
+    eng.publish(d)
+    join_many(eng, d, 3)
+    eng.close(d)
+    monkeypatch.setattr(tb, "_eng", factory)
     ctx = SimpleNamespace(approval_scope=scope)
-    assert tb.drop_settle(d, tok, ctx=ctx)["outcome"] == "funded"
+    assert tb.drop_settle(d, tb.drop_plan(d)["expect"], ctx=ctx)["outcome"] == "funded"
+
+
+def test_f10_a_test_approval_is_refused_when_crowd_env_is_not_test_even_with_the_fake(monkeypatch, tmp_path):
+    d, tok = settled_ready(monkeypatch, tmp_path)
+    monkeypatch.delenv("CROWD_ENV")
+    with pytest.raises(tb.TogiError) as e:
+        tb.drop_settle(d, tok, ctx=SimpleNamespace(approval_scope="test"))
+    assert e.value.code == "test_approval_outside_test_mode" and "CROWD_ENV" in e.value.message and "{" not in e.value.message
+    assert tb._eng().get(d).state == "closed"
+
+
+def test_f10_a_test_approval_is_refused_when_the_store_holds_anything_that_is_not_this_fakes(monkeypatch, tmp_path):
+    d, tok = settled_ready(monkeypatch, tmp_path)
+    store = Store(str(tmp_path / "crowd.db"))
+    store.append("d_other", "drop_created", {"title": "Real", "maker": "m", "currency": "USD", "minimum": 3, "duration_minutes": 60,
+                                           "ladder": tb._eng().get(d).ladder.to_dict(), "paypal_mode": "sandbox"})
+    with pytest.raises(tb.TogiError) as e:
+        tb.drop_settle(d, tok, ctx=SimpleNamespace(approval_scope="test"))
+    assert e.value.code == "test_approval_outside_test_mode" and "did not come from this fake" in e.value.message
+    assert tb._eng().get(d).state == "closed"
+    assert tb.drop_settle(d, tok, ctx=SimpleNamespace(approval_scope="default"))["outcome"] == "funded"   # a person's own yes still works
 
 
 def test_f10_a_context_without_the_attribute_and_no_context_at_all_still_work(monkeypatch, tmp_path):

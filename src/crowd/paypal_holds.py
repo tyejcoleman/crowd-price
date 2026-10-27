@@ -65,13 +65,19 @@ class HoldError(Exception):
     code = "paypal_error"
 
     def __init__(self, code: str | None = None, message: str = "", issue: str = "", http: int | None = None,
-                 debug_id: str | None = None, issues: list[str] | None = None):
+                 debug_id: str | None = None, issues: list[str] | None = None, name: str = "",
+                 detail_names: list[str | None] | None = None):
         super().__init__(message or code or self.code)
         self.code = code or self.code
         self.message, self.issue, self.http, self.debug_id = message, issue, http, debug_id
         # every error name PayPal gave for this refusal (details[].issue, else the top-level name): the classification
         # below needs all of them, because one unfamiliar name beside a familiar one makes it unfamiliar
         self.issues: list[str] = list(issues) if issues is not None else ([issue] if issue else [])
+        # PayPal's top-level `name`, and one entry per details[] item (None for an item that names nothing). The
+        # classification reads both: a systemic top-level name is systemic whatever the details say, and a detail that
+        # names nothing is as unfamiliar as a name nobody has seen.
+        self.name: str = name
+        self.detail_names: list[str | None] | None = detail_names
         self.order_id: str | None = None
 
 
@@ -159,40 +165,63 @@ BUYER_SPECIFIC_ISSUES = frozenset({
     "INSTRUMENT_DECLINED", "TRANSACTION_REFUSED", "CREDIT_CARD_REFUSED", "CARD_EXPIRED", "INVALID_CARD_NUMBER",
     "INVALID_SECURITY_CODE", "INSUFFICIENT_FUNDS", "PAYER_CANNOT_PAY",          # the card or instrument said no
     "PAYER_ACTION_REQUIRED", "AUTHORIZATION_EXPIRED", "AUTHORIZATION_VOIDED", "AUTHORIZATION_DENIED",
-    "MAX_CAPTURE_AMOUNT_EXCEEDED"})                                              # this one authorisation, not the account
+    "MAX_CAPTURE_AMOUNT_EXCEEDED",                                               # this one authorisation, not the account
+    "PAYER_ACCOUNT_LOCKED_OR_CLOSED", "PAYER_ACCOUNT_RESTRICTED",                # this buyer's PayPal account (docs/crowd-fixes-r3.md C)
+    "REDIRECT_PAYER_FOR_ALTERNATE_FUNDING"})                                     # this buyer's funding source needs another route
 ACCOUNT_LEVEL_HTTP = (401, 403)
+# The top-level name of a 422 whose details say what it is about. Any other top-level name that is not itself on the
+# allow-list (INVALID_REQUEST, NOT_AUTHORIZED, PERMISSION_DENIED, PAYEE_*, a name nobody has seen) makes the refusal systemic
+# whatever the details say: the details of a request that was malformed or not allowed describe nothing about one buyer.
+CARRIER_NAMES = frozenset({"UNPROCESSABLE_ENTITY"})
 
 
 def buyer_specific(e: "HoldError") -> bool:
     """Is this refusal about one buyer's hold (safe to record against them and carry on)? Judged by the names PayPal gave,
-    never by the exception class: every name must be on the allow-list, and a 401 or 403 is never buyer-specific."""
+    never by the exception class. All of these must hold, else it is systemic and a person looks at it:
+      - not a 401 or 403;
+      - the top-level name is absent, a 422's own name (UNPROCESSABLE_ENTITY), or itself on the allow-list;
+      - every details[] entry names an issue on the allow-list (an entry that names nothing counts as unfamiliar), or, when
+        there are no details, the top-level name is on the allow-list."""
     if getattr(e, "http", None) in ACCOUNT_LEVEL_HTTP:
         return False
-    issues = getattr(e, "issues", None) or []
-    return bool(issues) and all(i in BUYER_SPECIFIC_ISSUES for i in issues)
+    name = str(getattr(e, "name", "") or "")
+    if name and name not in CARRIER_NAMES and name not in BUYER_SPECIFIC_ISSUES:
+        return False
+    details = getattr(e, "detail_names", None)
+    if details is None:                       # an error built by hand: its `issues` are all it has
+        details = list(getattr(e, "issues", None) or [])
+    names = list(details) or ([name] if name else [])
+    return bool(names) and all(n in BUYER_SPECIFIC_ISSUES for n in names)
 
 
 def _error_from(http: int, body: dict) -> HoldError:
     """PayPal's answer to a failed call as the most specific exception. Any 4xx that is not transient is a PayPalRefused,
     named or not: an unrecognised refusal must never be mistaken for an outage."""
-    issues = [str(d.get("issue", "")) for d in (body.get("details") or []) if isinstance(d, dict)]
-    name = str(body.get("name", ""))
+    raw = body.get("details")
+    entries = raw if isinstance(raw, list) else ([raw] if raw else [])
+    # one entry per details[] item: its issue name, or None when the item names nothing (a bare string, no `issue`, an empty one)
+    detail_names: list[str | None] = [
+        d["issue"].strip() if isinstance(d, dict) and isinstance(d.get("issue"), str) and d["issue"].strip() else None
+        for d in entries]
+    issues = [n for n in detail_names if n]
+    name = body.get("name") if isinstance(body.get("name"), str) else ""
     debug_id = body.get("debug_id")
+    seen = dict(name=name, detail_names=detail_names)
     for issue in issues + [name]:
         cls = _ISSUES.get(issue)
         if cls:
             # matched on the generic name (UNPROCESSABLE_ENTITY): keep the specific issue PayPal gave as the evidence
             named = issue if issue in issues else (issues[0] if issues else issue)
             return cls(message=f"{named or name}", issue=named or name, http=http, debug_id=debug_id,
-                       issues=_names(issues, name))
+                       issues=_names(issues, name), **seen)
     label = issues[0] if issues else name or f"HTTP_{http}"
     if http in TRANSIENT_HTTP:
         return PayPalUnavailable(message=f"PayPal http {http}", http=http, debug_id=debug_id)
     if 400 <= http < 500:
         return PayPalRefused(message=f"PayPal said {label} (http {http})", issue=label, http=http, debug_id=debug_id,
-                             issues=_names(issues, name))
+                             issues=_names(issues, name), **seen)
     return HoldError("paypal_error", f"PayPal said {label} (http {http})", issue=label, http=http, debug_id=debug_id,
-                     issues=_names(issues, name))
+                     issues=_names(issues, name), **seen)
 
 
 def _names(issues: list[str], name: str) -> list[str]:
@@ -208,7 +237,13 @@ class PayPalHolds:
     Credentials come only from the repo's .env or the process environment (closure.paypal.load_env with its default
     path). Nothing here, and nothing a command can pass in, names another file to read them from."""
     kind = "sandbox"
-    ref = None
+
+    @property
+    def ref(self) -> str | None:
+        """Which sandbox app this is: a short fingerprint of the client id (never the secret, never the id itself). Holds record
+        it, so a store whose holds were made with one app is never operated with another."""
+        cid = (getattr(self.client, "env", None) or {}).get("PAYPAL_CLIENT_ID")
+        return hashlib.sha256(str(cid).encode()).hexdigest()[:12] if cid else None
 
     def __init__(self, client=None, retries: int = 3):
         from closure import paypal as cp  # token, BASE, CTX live there; load_env refuses non-sandbox
@@ -398,6 +433,13 @@ class PayPalHolds:
         o = self._request("GET", f"/v2/checkout/orders/{order_id}")
         caps = (((o.get("purchase_units") or [{}])[0].get("payments") or {}).get("captures") or [])
         return self.get_capture(caps[0]["id"]) if caps else None
+
+    def order_captures(self, order_id: str) -> list[dict]:
+        """EVERY capture PayPal shows on this order (all its purchase units), as capture views, whoever made them. The order is
+        the only place PayPal lists a hold's captures together, so this is how a capture the engine did not make is found."""
+        order = self.get_order(order_id)
+        return [_capture_view(c) for pu in order.get("purchase_units") or [] if isinstance(pu, dict)
+                for c in ((pu.get("payments") or {}).get("captures") or []) if isinstance(c, dict)]
 
 
 def _auth_view(a: dict) -> dict:
@@ -693,6 +735,14 @@ class FakePayPal:
             if not out and order_id not in st["orders"]:
                 raise self._deny(HoldNotFound, "RESOURCE_NOT_FOUND", 404)
             return out
+
+    def order_captures(self, order_id: str) -> list[dict]:
+        """Every capture on any authorisation of this order (what GET order shows), made by anyone."""
+        with self._state() as st:
+            on_order = {aid for aid, a in st["auths"].items() if a["order_id"] == order_id}
+            if not on_order and order_id not in st["orders"]:
+                raise self._deny(HoldNotFound, "RESOURCE_NOT_FOUND", 404)
+            return [dict(c) for c in st["captures"].values() if c.get("auth_id") in on_order]
 
 
 def mode_of(holds) -> str:

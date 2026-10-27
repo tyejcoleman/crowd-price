@@ -41,11 +41,11 @@ def err(fn, *a, **kw):
 def test_effects_are_what_the_spec_says():
     assert tb.EFFECTS == {
         "ladder propose": "read", "drop create": "write", "drop publish": "write", "drop list": "read",
-        "drop status": "read", "drop join": "write", "drop leave": "write", "drop close": "write",
+        "drop status": "read", "drop join": "write", "drop leave": "write", "drop exclude": "money", "drop close": "write",
         "drop plan": "read", "drop settle": "money", "drop verify": "read", "drop tieout": "read",
         "drop explain": "read", "buyers list": "read", "sim join": "write", "test settle": "admin", "test reset": "admin",
     }
-    assert [w for w, e in tb.EFFECTS.items() if e == "money"] == ["drop settle"]     # the only way money moves
+    assert sorted(w for w, e in tb.EFFECTS.items() if e == "money") == ["drop exclude", "drop settle"]  # both wait for a person     # the only way money moves
 
 
 def test_manifest_matches_the_bundle_and_locks_what_moves_money():

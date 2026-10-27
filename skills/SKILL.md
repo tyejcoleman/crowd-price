@@ -28,6 +28,7 @@ the money. You (the agent) plan, watch and explain. You never set or compute a p
 - Never run `togi approve` or `togi deny`, and never try to get around an approval. Money needs a person.
 - Settle only after close. Never edit or re-open a published drop's ladder; open a new drop instead.
 - If a command returns an error, run its `next` command. Do not guess flags: use `--help`.
+- `drop exclude` takes a buyer out of a drop and releases their hold. That is the maker's decision, never yours: report the buyer and hold a block names and let them choose.
 - Test buyers are sandbox cards only. Nothing here touches real money.
 
 ## Money words

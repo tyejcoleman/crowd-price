@@ -24,3 +24,8 @@ env = {CROWD_ENV = "test", CROWD_PAYPAL = "fake"}   # tests and agent tasks neve
 [policy]
 approve_effects = ["money"]
 auto_polish = true
+# Crowd opts in to throwaway (test-scope) approvals because `drop settle` checks ctx.approval_scope itself: a "test" approval is
+# accepted only for the fake PayPal, CROWD_ENV=test and a store holding nothing but that fake's holds. The stone and the tests rely on it.
+test_approvals = true
+# The money path needs a verified lock on the locked tier (engine, PayPal client, verify, store, bundle, manifest).
+require_lock = true

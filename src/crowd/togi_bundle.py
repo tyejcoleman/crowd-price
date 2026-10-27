@@ -30,7 +30,7 @@ except ImportError:  # togi is not installed: a minimal stand-in so the module (
 from . import ladder as lad
 from . import verify as vf
 from .engine import CrowdError, Engine, foreign_holds, m, plan_token
-from .paypal_holds import FakePayPal, HoldError, mode_of
+from .paypal_holds import FakePayPal, HoldError, mode_of, ref_of
 from .store import Store, StoreError
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -254,6 +254,21 @@ def drop_leave(drop: str, buyer: str) -> dict:
     return _eng().leave(drop, buyer)
 
 
+@cmd("drop exclude", "money", ["togi crowd drop exclude --drop d_7f3a --buyer ada-lovelace"])
+def drop_exclude(drop: str, buyer: str) -> dict:
+    """Take ONE buyer out of the crowd and release their hold. For a person getting past a single hold the engine cannot read or
+    release (a block names the exact buyer). The plan changes afterwards, so a fresh plan is approved.
+    A money effect: removing a buyer can cost the maker a sale or drop the crowd below its minimum, so a person approves it.
+
+    Args:
+        drop: the drop
+        buyer: the buyer id the block or `buyers list` names
+    """
+    out = _eng().exclude(drop, buyer)
+    out["next"] = out.get("next") or f"togi crowd drop plan --drop {drop}"
+    return out
+
+
 @cmd("drop close", "write", ["togi crowd drop close --drop d_7f3a"])
 def drop_close(drop: str) -> dict:
     """Close a live drop: joining stops. Settlement is a separate step that needs a person."""
@@ -267,6 +282,9 @@ def drop_plan(drop: str) -> dict:
     """Show exactly what settling would do, in engine numbers. Moves nothing."""
     p = _eng().plan(drop)
     p["expect"] = _expect(p)
+    if not p.get("already_settled"):
+        p["checked"] = ("every remaining hold was read at PayPal just now (the authorisation and the captures on its order); "
+                        "settle reads them again before any money moves and refuses if this plan no longer matches")
     p["next"] = f"togi crowd drop settle --drop {drop} --expect {p['expect']}"
     return p
 
@@ -280,16 +298,31 @@ def _expect(p: dict) -> str:
 def _refuse_test_scope_approval(eng: Engine, ctx) -> None:
     """Togi tells a command which approver signed the approval it is running on (`ctx.approval_scope`): "default" is the
     person's own approver, "test" a throwaway one under TOGI_APPROVER_HOME (tests, the stone). A throwaway approver's
-    yes is worth nothing outside test mode: settling against any PayPal but the fake needs the person's own approval.
+    yes is worth nothing where real value could move, so a "test" approval is accepted only when ALL of these hold: the PayPal
+    is the fake, CROWD_ENV is "test", and the store holds nothing but this fake's holds (`foreign_holds` is empty). The manifest
+    opts Crowd in to test approvals (`[policy] test_approvals`) on the strength of this check.
     `getattr` so this works before and after the Togi that adds the attribute (None = no scope was reported)."""
     scope = getattr(ctx, "approval_scope", None)
+    if scope != "test":
+        return
     mode = mode_of(eng.holds)
-    if scope == "test" and mode != "fake":
-        raise _togi_error("test_approval_outside_test_mode", {"scope": scope, "mode": mode})
+    why = None
+    if mode != "fake":
+        why = f"the PayPal being used is {mode}, not the fake"
+    elif os.environ.get("CROWD_ENV") != "test":
+        why = "CROWD_ENV is not 'test'"
+    else:
+        foreign = foreign_holds(eng.store, ref_of(eng.holds))
+        if foreign:
+            why = (f"the store holds {len({(x['drop'], x['buyer']) for x in foreign})} hold(s) or drop(s) that did not come from "
+                   f"this fake (first: drop {foreign[0]['drop']}, {foreign[0]['mode']})")
+    if why:
+        raise _togi_error("test_approval_outside_test_mode", {"scope": scope, "mode": mode, "why": why})
 
 
 @cmd("drop settle", "money", ["togi crowd drop settle --drop d_7f3a --expect capture:52:33.00:1716.00"],
-     summary="Settle a closed drop: capture every hold at the final price, or void them all (PayPal sandbox).",
+     summary="Settle a closed drop: capture every hold at the final price, or void them all (PayPal sandbox). The plan was "
+             "checked against PayPal when made; settle re-checks every hold first.",
      confirm="drop")
 def drop_settle(drop: str, expect: str, ctx=None) -> dict:
     """Settle a closed drop. Needs a person's approval; pass --expect from `drop plan`.
@@ -302,11 +335,9 @@ def drop_settle(drop: str, expect: str, ctx=None) -> dict:
     """
     eng = _eng()
     _refuse_test_scope_approval(eng, ctx)
-    plan = eng.plan(drop)
-    actual = _expect(plan)
-    if expect.strip() != actual:
-        raise _togi_error("plan_changed", {"drop": drop, "expected": expect, "actual": actual})
-    out = eng.settle(drop, expect=expect.strip())     # the engine works the plan out again, under the lock, and compares
+    # the engine checks the PayPal, reads every remaining hold at PayPal, works the plan out again from that, under the lock, and
+    # compares it with the approved one (`plan_changed`, with the new token, when it differs)
+    out = eng.settle(drop, expect=expect.strip())
     out["next"] = f"togi crowd drop verify --drop {drop}"
     return out
 
@@ -348,8 +379,9 @@ def drop_explain(drop: str) -> dict:
     elif state == "settling" and d.blocked:
         b = d.blocked
         ctx.update(blocked_issue=b.get("issue") or b.get("code") or "a refusal", blocked_debug_id=b.get("debug_id") or "none given",
-                   blocked_phase=b.get("phase") or "settling")
-        key = "settling_blocked"
+                   blocked_phase=b.get("phase") or "settling", blocked_message=str(b.get("message") or "")[:200].rstrip("."))
+        # the engine's own stop (a run of failed captures: no PayPal answer to quote) reads differently from a PayPal refusal
+        key = "settling_blocked" if b.get("issue") or b.get("http") is not None else "settling_blocked_failures"
     elif state == "settled":
         s = d.settled
         c, tot = s["counts"], s["totals"]

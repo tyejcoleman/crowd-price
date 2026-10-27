@@ -343,12 +343,38 @@ def test_decline_next_also_models_a_failed_capture(engine, drop, fake):
     assert out["counts"]["captured"] == 2 and out["counts"]["failed"] == 1 and out["shortfall"] == 1
 
 
-def test_a_hold_voided_behind_the_engines_back_is_a_failed_capture(engine, drop, fake):
-    r = join_many(engine, drop, 3)
+def test_a_hold_voided_behind_the_engines_back_after_close_leaves_the_crowd_before_anything_is_captured(engine, drop, fake):
+    """Round 3 (B): settle reads every hold at PayPal first, so a hold voided since close is not 'a failed capture': it is out
+    of the crowd, with PayPal's own word as the record."""
+    join_many(engine, drop, 4)
     engine.close(drop)
     auth = engine.get(drop).buyers["buyer-01"].auth_id
     fake.void(auth, "someone-else")
     out = engine.settle(drop)
+    assert out["counts"] == {"holds": 4, "captured": 3, "voided": 1, "failed": 0, "left": 0}
+    hv = [e["payload"] for e in engine.store.events(drop) if e["type"] == "hold_voided"][0]
+    assert hv["paypal_status"] == "VOIDED" and hv["reason"] == "paypal_says_voided" and hv["auth_id"] == auth
+
+
+def test_a_hold_voided_between_the_check_and_its_capture_is_still_a_failed_capture(engine, drop, fake, store, clock):
+    """The window that cannot be closed: PayPal voids the hold after settle read it and before the capture reaches it."""
+    join_many(engine, drop, 4)
+    engine.close(drop)
+    victim = engine.get(drop).buyers["buyer-01"].auth_id
+
+    class VoidJustBeforeCapture:
+        def __init__(self, inner):
+            self.inner, self.kind, self.ref = inner, inner.kind, inner.ref
+
+        def __getattr__(self, name):
+            return getattr(self.inner, name)
+
+        def capture(self, auth_id, *a, **k):
+            if auth_id == victim:
+                self.inner.void(auth_id, "someone-else")
+            return self.inner.capture(auth_id, *a, **k)
+
+    out = Engine(store, VoidJustBeforeCapture(fake), clock).settle(drop)
     assert out["counts"]["failed"] == 1 and engine.get(drop).buyers["buyer-01"].error == "authorization_voided"
 
 
