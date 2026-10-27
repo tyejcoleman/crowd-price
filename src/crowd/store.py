@@ -32,6 +32,10 @@ EVENT_TYPES = {
     "void_failed",
     # a join is written down BEFORE PayPal is asked, and closed by hold_placed / hold_failed / orphan_hold_released
     "join_started", "order_created", "orphan_hold_released",
+    # a leave is written down BEFORE PayPal is asked to void, and closed by buyer_left / leave_failed
+    "leave_started", "leave_failed",
+    # settlement stopped because PayPal refused something that is not about one buyer (or a streak of identical failures)
+    "settle_blocked",
     "drop_settled",
 }
 
@@ -76,6 +80,21 @@ def iso(dt: datetime) -> str:
 
 def parse_iso(s: str) -> datetime:
     return datetime.fromisoformat(s.replace("Z", "+00:00"))
+
+
+def parse_utc(s) -> datetime:
+    """A timestamp from outside (PayPal's expiry) as an aware UTC datetime. A time with no zone is read as UTC. Raises
+    ValueError for anything that is not a time at all, so the caller decides what an unreadable time means."""
+    if isinstance(s, datetime):
+        dt = s
+    elif isinstance(s, str) and s.strip():
+        try:
+            dt = datetime.fromisoformat(s.strip().replace("Z", "+00:00").replace("z", "+00:00"))
+        except ValueError:
+            raise ValueError(f"not a timestamp: {s[:40]!r}") from None
+    else:
+        raise ValueError(f"not a timestamp: {s!r}"[:60])
+    return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt.astimezone(timezone.utc)
 
 
 def slug(name: str) -> str:
@@ -249,6 +268,8 @@ class Drop:
     settlement: dict | None = None     # settlement_started payload
     settled: dict | None = None        # drop_settled payload
     unresolved: dict[str, dict] = field(default_factory=dict)   # request id -> join_started payload, not yet closed
+    leaving: dict[str, dict] = field(default_factory=dict)      # buyer -> leave_started payload (+ asked_at), not yet closed
+    blocked: dict | None = None        # the settle_blocked payload while settlement is stopped for a person (cleared on settle)
     event_count: int = 0
 
     @property
@@ -276,6 +297,9 @@ def reduce(events: list[dict]) -> Drop:
     d: Drop | None = None
     for e in events:
         t, p = e["type"], e["payload"]
+        if d is not None and d.blocked and d.state == "settling" and t in (
+                "hold_captured", "hold_voided", "capture_failed", "failed_hold_released", "void_failed"):
+            d.blocked = None       # settlement went on after a block: it is no longer stopped (a new block sets it again)
         if t == "drop_created":
             d = Drop(id=e["drop_id"], title=p["title"], maker=p.get("maker", ""), currency=p.get("currency", "USD"),
                      minimum=int(p["minimum"]), duration_minutes=int(p["duration_minutes"]),
@@ -294,13 +318,21 @@ def reduce(events: list[dict]) -> Drop:
         elif t == "settlement_started":
             d.state, d.settlement = "settling", p
         elif t == "drop_settled":
-            d.state, d.settled = "settled", p
+            d.state, d.settled, d.blocked = "settled", p, None
         elif t == "buyer_joined":
             b = d.buyers.get(p["buyer"]) or Buyer(id=p["buyer"], name=p["name"])
             b.name, b.card_index, b.joined_at = p["name"], int(p.get("card_index", 0)), e["ts"]
             d.buyers[b.id] = b
         elif t == "join_started":
-            d.unresolved[p["request_id"]] = dict(p)
+            prior = d.unresolved.get(p["request_id"])      # the same request asked again: it is still the same order
+            d.unresolved[p["request_id"]] = {**({"order_id": prior["order_id"]} if prior and prior.get("order_id") else {}),
+                                             **p}
+        elif t == "leave_started":
+            d.leaving[p["buyer"]] = {**p, "asked_at": e["ts"]}
+        elif t == "leave_failed":
+            d.leaving.pop(p["buyer"], None)
+        elif t == "settle_blocked":
+            d.blocked = {**p, "at": e["ts"]}
         elif t == "order_created":
             if p.get("request_id") in d.unresolved:
                 d.unresolved[p["request_id"]]["order_id"] = p.get("order_id")
@@ -327,6 +359,7 @@ def reduce(events: list[dict]) -> Drop:
         elif t == "buyer_left":
             b = d.buyers[p["buyer"]]
             b.status = "left"
+            d.leaving.pop(p["buyer"], None)
         elif t == "hold_voided":
             b = d.buyers[p["buyer"]]
             if b.status == "held":  # a `left` buyer was already marked by buyer_left

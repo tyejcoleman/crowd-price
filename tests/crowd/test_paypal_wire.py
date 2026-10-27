@@ -81,7 +81,7 @@ def test_authorize_creates_an_order_without_a_card_then_authorises_it_with_the_c
     assert authz["url"].endswith("/v2/checkout/orders/ORD1/authorize")
     assert authz["body"]["payment_source"]["card"]["number"] == "4111111111111111"
     assert out == {"order_id": "ORD1", "auth_id": "AUTH1", "status": "CREATED", "amount": "40.00",
-                   "expires": "2026-11-25T00:00:00Z"}
+                   "expires": "2026-11-25T00:00:00Z", "replayed": False}
 
 
 def test_a_replayed_join_finds_the_hold_the_first_try_made_instead_of_holding_twice(holds, net):

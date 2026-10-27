@@ -175,6 +175,26 @@ message = "{buyer}'s hold was already captured elsewhere, so it cannot be releas
 next = "togi crowd drop verify --drop {drop}"
 status = "refused"
 
+[errors.settle_blocked]
+message = "Settlement of {drop} is stopped. PayPal answered {issue} (http {http}, debug id {debug_id}) while the engine was {phase} for {buyer}, and that is not something to retry blindly: it may be about the PayPal account or the request, not about one buyer. Nothing more was captured or released, and nothing was guessed."
+next = "A person (the maker, who owns the PayPal account) must look at PayPal's answer for debug id {debug_id} and fix the cause; then ask for a fresh plan with `togi crowd drop plan --drop {drop}` and have a person approve it."
+status = "refused"
+
+[errors.hold_not_open]
+message = "{buyer}'s earlier hold is no longer open at PayPal (PayPal says {status}), so it was not counted. The old try has been closed."
+next = "togi crowd drop join --drop {drop} --buyer {buyer}"
+status = "error"
+
+[errors.earlier_attempt_unresolved]
+message = "{buyer} has an earlier try whose hold could not be released, so no new hold was placed (that could hold their money twice)."
+next = "A person must check the buyer's earlier hold in the PayPal sandbox, then `togi crowd drop verify --drop {drop}` or close the drop."
+status = "refused"
+
+[errors.test_approval_outside_test_mode]
+message = "Refusing to settle: this approval was made by a throwaway test approver (scope {scope}), and the PayPal being used is {mode}, not the fake. Real value is only ever settled on an approval from the person's own approver."
+next = "A person approves it with their own approver (no TOGI_APPROVER_HOME set): togi approve <id>"
+status = "refused"
+
 [errors.drop_busy]
 message = "Drop {drop} is being changed by another process right now."
 next = "togi crowd drop status --drop {drop}"
@@ -234,6 +254,7 @@ ended = "{title} has reached its end time with {buyers} joined and is waiting to
 closed_funded = "{title} is closed with {buyers} joined, enough for the minimum of {minimum}. When settled, every hold will be charged ${price}, and the rest of each ${start_price} hold is released."
 closed_not_funded = "{title} is closed with {buyers} joined, short of the minimum of {minimum}. When settled, every hold will be released and nobody pays."
 settling = "{title} is part way through settling. Run settle again to carry on; nothing is ever charged twice."
+settling_blocked = "Settlement of {title} is stopped for a person. PayPal answered {blocked_issue} (debug id {blocked_debug_id}) while the engine was {blocked_phase}, which may be about the PayPal account rather than one buyer, so nothing more was captured or released. The maker must look into it with PayPal; once it is fixed, ask for a fresh plan and have it approved."
 settled_funded = "{title} was funded. {buyers_at_close} people were in when it closed, over the minimum of {minimum}, so the price landed at ${final_price} for everyone. {captured} holds were charged ${final_price} each, and the rest of each ${start_price} hold (${released_each}) was released. PayPal's fees were ${fees}, so ${net} reaches the maker. Nobody paid more than ${final_price}."
 settled_not_funded = "{title} did not reach its minimum: {buyers_at_close} of the {minimum} needed joined (short by {short_by}). Nobody was charged. All {voided} holds were released and there are no refunds to chase."
 settled_not_funded_open = "{title} did not reach its minimum: {buyers_at_close} of the {minimum} needed joined (short by {short_by}). Nobody was charged. {voided} holds were released, but {unreleased} could not be released by PayPal and may still be held on a buyer's card."

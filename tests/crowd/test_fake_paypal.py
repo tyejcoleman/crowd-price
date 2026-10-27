@@ -60,7 +60,7 @@ def test_void_after_capture_is_refused(fake):
 def test_request_ids_make_retries_safe(fake):
     a = hold(fake, rid="same")
     b = hold(fake, rid="same")
-    assert a == b                                                     # one hold, not two
+    assert {**b} == {**a, "replayed": True}                           # one hold, not two; the second is marked as a replay
     c1 = fake.capture(a["auth_id"], "32.00", "cap-same")
     c2 = fake.capture(a["auth_id"], "32.00", "cap-same")              # a retry returns the same capture
     assert c1 == c2

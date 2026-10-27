@@ -30,7 +30,7 @@ except ImportError:  # togi is not installed: a minimal stand-in so the module (
 from . import ladder as lad
 from . import verify as vf
 from .engine import CrowdError, Engine, foreign_holds, m, plan_token
-from .paypal_holds import FakePayPal, HoldError
+from .paypal_holds import FakePayPal, HoldError, mode_of
 from .store import Store, StoreError
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -277,10 +277,21 @@ def _expect(p: dict) -> str:
     return plan_token(p)
 
 
+def _refuse_test_scope_approval(eng: Engine, ctx) -> None:
+    """Togi tells a command which approver signed the approval it is running on (`ctx.approval_scope`): "default" is the
+    person's own approver, "test" a throwaway one under TOGI_APPROVER_HOME (tests, the stone). A throwaway approver's
+    yes is worth nothing outside test mode: settling against any PayPal but the fake needs the person's own approval.
+    `getattr` so this works before and after the Togi that adds the attribute (None = no scope was reported)."""
+    scope = getattr(ctx, "approval_scope", None)
+    mode = mode_of(eng.holds)
+    if scope == "test" and mode != "fake":
+        raise _togi_error("test_approval_outside_test_mode", {"scope": scope, "mode": mode})
+
+
 @cmd("drop settle", "money", ["togi crowd drop settle --drop d_7f3a --expect capture:52:33.00:1716.00"],
      summary="Settle a closed drop: capture every hold at the final price, or void them all (PayPal sandbox).",
      confirm="drop")
-def drop_settle(drop: str, expect: str) -> dict:
+def drop_settle(drop: str, expect: str, ctx=None) -> dict:
     """Settle a closed drop. Needs a person's approval; pass --expect from `drop plan`.
 
     Args:
@@ -290,6 +301,7 @@ def drop_settle(drop: str, expect: str) -> dict:
             approves exactly what runs
     """
     eng = _eng()
+    _refuse_test_scope_approval(eng, ctx)
     plan = eng.plan(drop)
     actual = _expect(plan)
     if expect.strip() != actual:
@@ -305,7 +317,10 @@ def drop_verify(drop: str, verbose: bool = False) -> dict:
     out = vf.verify(drop, _eng(), verbose=verbose)
     if not verbose:
         out.pop("holds", None)
-    out["next"] = f"togi crowd drop explain --drop {drop}"
+    if not out["ok"]:             # a problem names its own next step; "explain" is only the next step when nothing is wrong
+        out["next"] = out.get("next") or f"togi crowd drop status --drop {drop}"
+    else:
+        out["next"] = f"togi crowd drop explain --drop {drop}"
     return out
 
 
@@ -330,6 +345,11 @@ def drop_explain(drop: str) -> dict:
         key = "live_minimum_met" if v["minimum_met"] else "live"
     elif state == "closed":
         key = "closed_funded" if v["minimum_met"] else "closed_not_funded"
+    elif state == "settling" and d.blocked:
+        b = d.blocked
+        ctx.update(blocked_issue=b.get("issue") or b.get("code") or "a refusal", blocked_debug_id=b.get("debug_id") or "none given",
+                   blocked_phase=b.get("phase") or "settling")
+        key = "settling_blocked"
     elif state == "settled":
         s = d.settled
         c, tot = s["counts"], s["totals"]

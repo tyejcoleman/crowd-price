@@ -65,10 +65,13 @@ class HoldError(Exception):
     code = "paypal_error"
 
     def __init__(self, code: str | None = None, message: str = "", issue: str = "", http: int | None = None,
-                 debug_id: str | None = None):
+                 debug_id: str | None = None, issues: list[str] | None = None):
         super().__init__(message or code or self.code)
         self.code = code or self.code
         self.message, self.issue, self.http, self.debug_id = message, issue, http, debug_id
+        # every error name PayPal gave for this refusal (details[].issue, else the top-level name): the classification
+        # below needs all of them, because one unfamiliar name beside a familiar one makes it unfamiliar
+        self.issues: list[str] = list(issues) if issues is not None else ([issue] if issue else [])
         self.order_id: str | None = None
 
 
@@ -148,6 +151,26 @@ _ISSUES = {
 }
 TRANSIENT_HTTP = (408, 429, 500, 502, 503, 504)
 
+# Refusals that are about ONE buyer's hold or card (docs/crowd-fixes-r2.md F1). Only these may be recorded against that
+# buyer (capture_failed / void_failed) while settlement goes on to the next. Anything else, whatever its name, an unknown
+# name, an empty body, any 401 or 403, may be about the merchant account or the request itself, so it would hit every buyer
+# alike: settlement stops and a person looks at it. An allow-list, not a deny-list: a name nobody has seen is never trusted.
+BUYER_SPECIFIC_ISSUES = frozenset({
+    "INSTRUMENT_DECLINED", "TRANSACTION_REFUSED", "CREDIT_CARD_REFUSED", "CARD_EXPIRED", "INVALID_CARD_NUMBER",
+    "INVALID_SECURITY_CODE", "INSUFFICIENT_FUNDS", "PAYER_CANNOT_PAY",          # the card or instrument said no
+    "PAYER_ACTION_REQUIRED", "AUTHORIZATION_EXPIRED", "AUTHORIZATION_VOIDED", "AUTHORIZATION_DENIED",
+    "MAX_CAPTURE_AMOUNT_EXCEEDED"})                                              # this one authorisation, not the account
+ACCOUNT_LEVEL_HTTP = (401, 403)
+
+
+def buyer_specific(e: "HoldError") -> bool:
+    """Is this refusal about one buyer's hold (safe to record against them and carry on)? Judged by the names PayPal gave,
+    never by the exception class: every name must be on the allow-list, and a 401 or 403 is never buyer-specific."""
+    if getattr(e, "http", None) in ACCOUNT_LEVEL_HTTP:
+        return False
+    issues = getattr(e, "issues", None) or []
+    return bool(issues) and all(i in BUYER_SPECIFIC_ISSUES for i in issues)
+
 
 def _error_from(http: int, body: dict) -> HoldError:
     """PayPal's answer to a failed call as the most specific exception. Any 4xx that is not transient is a PayPalRefused,
@@ -160,13 +183,21 @@ def _error_from(http: int, body: dict) -> HoldError:
         if cls:
             # matched on the generic name (UNPROCESSABLE_ENTITY): keep the specific issue PayPal gave as the evidence
             named = issue if issue in issues else (issues[0] if issues else issue)
-            return cls(message=f"{named or name}", issue=named or name, http=http, debug_id=debug_id)
+            return cls(message=f"{named or name}", issue=named or name, http=http, debug_id=debug_id,
+                       issues=_names(issues, name))
     label = issues[0] if issues else name or f"HTTP_{http}"
     if http in TRANSIENT_HTTP:
         return PayPalUnavailable(message=f"PayPal http {http}", http=http, debug_id=debug_id)
     if 400 <= http < 500:
-        return PayPalRefused(message=f"PayPal said {label} (http {http})", issue=label, http=http, debug_id=debug_id)
-    return HoldError("paypal_error", f"PayPal said {label} (http {http})", issue=label, http=http, debug_id=debug_id)
+        return PayPalRefused(message=f"PayPal said {label} (http {http})", issue=label, http=http, debug_id=debug_id,
+                             issues=_names(issues, name))
+    return HoldError("paypal_error", f"PayPal said {label} (http {http})", issue=label, http=http, debug_id=debug_id,
+                     issues=_names(issues, name))
+
+
+def _names(issues: list[str], name: str) -> list[str]:
+    """The specific names PayPal gave: the detail issues, or the top-level name when it gave no detail."""
+    return [i for i in issues if i] or ([name] if name else [])
 
 
 # ---- the real sandbox client ---------------------------------------------------------------------
@@ -278,6 +309,7 @@ class PayPalHolds:
         order_id = order.get("id")
         if not order_id:
             raise HoldError("paypal_error", "PayPal returned no order id", http=status)
+        replayed = status != 201      # an earlier attempt made this order: whatever it shows is a past answer, not news
         try:
             if on_order is not None:
                 on_order(order_id)
@@ -294,14 +326,17 @@ class PayPalHolds:
                     auth = _authorization_of(self.get_order(order_id))  # an earlier try may have gone through
                     if auth is None:
                         raise
-            if auth is None or auth.get("status") not in ("CREATED", "PENDING"):
+                    replayed = True      # found by reading the order after a failed call: confirm it before trusting it
+            # No authorisation at all, or PayPal's explicit DENIED, is a card that was refused: nothing is held. Any other
+            # status is returned as it is. The caller asks PayPal about it and decides; this client does not guess.
+            if auth is None or auth.get("status") == "DENIED":
                 raise CardDeclined(message=f"authorisation not granted: hold {(auth or {}).get('status') or 'none'}",
                                    issue=(auth or {}).get("status") or "NO_AUTHORIZATION")
         except HoldError as e:
             e.order_id = e.order_id or order_id
             raise
-        return {"order_id": order_id, "auth_id": auth["id"], "status": auth["status"], "amount": value,
-                "expires": auth.get("expiration_time")}
+        return {"order_id": order_id, "auth_id": auth["id"], "status": auth.get("status"), "amount": value,
+                "expires": auth.get("expiration_time"), "replayed": replayed}
 
     def recover_join(self, request_id: str, amount, currency: str, label: str, order_id: str | None = None) -> dict:
         """What a join whose answer was lost left at PayPal: {order_id, auth} where auth is the hold on the order, or
@@ -377,6 +412,18 @@ def _authorization_of(order: dict) -> dict | None:
     return auths[0] if auths else None
 
 
+def _parent_auth_id(c: dict) -> str | None:
+    """The authorisation a capture belongs to, as PayPal says it: related_ids.authorization_id, or an `up` link that points
+    at an authorisation. None when PayPal does not say (an `up` link to an order is not an answer)."""
+    rel = ((c.get("supplementary_data") or {}).get("related_ids") or {}).get("authorization_id")
+    if rel:
+        return str(rel)
+    for link in c.get("links") or []:
+        if isinstance(link, dict) and link.get("rel") == "up" and "/authorizations/" in str(link.get("href", "")):
+            return str(link["href"]).rstrip("/").rsplit("/", 1)[-1]
+    return None
+
+
 def _capture_view(c: dict) -> dict:
     amt = c.get("amount") or {}
     br = c.get("seller_receivable_breakdown") or {}
@@ -384,7 +431,7 @@ def _capture_view(c: dict) -> dict:
     net = (br.get("net_amount") or {}).get("value")
     return {"capture_id": c.get("id"), "status": c.get("status"), "amount": amt.get("value"),
             "currency": amt.get("currency_code"), "fee": fee, "net": net, "final": c.get("final_capture"),
-            "created": c.get("create_time")}
+            "created": c.get("create_time"), "auth_id": _parent_auth_id(c)}
 
 
 # ---- the fake ----------------------------------------------------------------------------------
@@ -512,7 +559,14 @@ class FakePayPal:
         value = lad.money(amount)
         with self._state() as st:
             if request_id in st["requests"]:
-                return dict(st["requests"][request_id])
+                # a replay answers with the hold as it is NOW (it may have been voided or lapsed since), never the first
+                # answer frozen: a cached CREATED on a dead hold would be counted toward the crowd
+                resp = dict(st["requests"][request_id])
+                a = st["auths"].get(resp.get("auth_id"))
+                if a is not None:
+                    resp.update(status=a["status"], amount=a["amount"], expires=a["expires"])
+                resp["replayed"] = True
+                return resp
             if value <= 0:
                 raise self._deny(HoldError, "INVALID_PARAMETER_VALUE")
             order_id = st["order_rids"].get(request_id)         # step 1: the order, idempotent by request id
@@ -575,7 +629,7 @@ class FakePayPal:
             st["captures"][cap_id] = rec
             a["status"] = "CAPTURED" if final else "PARTIALLY_CAPTURED"
             a["capture_id"] = cap_id
-            resp = {k: v for k, v in rec.items() if k != "auth_id"}
+            resp = dict(rec)
             st["requests"][request_id] = resp
             return dict(resp)
 
@@ -612,13 +666,13 @@ class FakePayPal:
             c = st["captures"].get(capture_id)
             if c is None:
                 raise self._deny(HoldNotFound, "RESOURCE_NOT_FOUND", 404)
-            return {k: v for k, v in c.items() if k != "auth_id"}
+            return dict(c)
 
     def recover_capture(self, order_id: str) -> dict | None:
         with self._state() as st:
             for a in st["auths"].values():
                 if a["order_id"] == order_id and a["capture_id"]:
-                    return {k: v for k, v in st["captures"][a["capture_id"]].items() if k != "auth_id"}
+                    return dict(st["captures"][a["capture_id"]])
         return None
 
     def recover_join(self, request_id: str, amount, currency: str, label: str, order_id: str | None = None) -> dict:

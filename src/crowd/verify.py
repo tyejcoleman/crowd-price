@@ -21,13 +21,20 @@ TIEOUT_MARGIN = timedelta(seconds=30)
 
 
 CAPTURED = ("CAPTURED", "PARTIALLY_CAPTURED")
-GONE = ("VOIDED", "EXPIRED")          # PayPal statuses in which a hold no longer holds money
+GONE = ("VOIDED", "EXPIRED", "DENIED")   # PayPal statuses in which a hold no longer holds money (DENIED: never granted)
+
+
+def with_next(problem: str, next_step: str | None) -> str:
+    """A problem always says what to do about it: the text, then `Next: ...` (once)."""
+    return problem if (not next_step or "Next:" in problem) else f"{problem} Next: {next_step}"
 
 
 def _scan(events: list[dict]) -> dict:
     """What the event log says about every hold, order and join (from events, not the projection)."""
     holds, by_auth = [], {}
-    known: set = set()          # authorisations the log accounts for: placed, or voided as an orphan
+    known: set = set()          # authorisations the log accounts for: placed, or released as an orphan
+    released: set = set()       # orphan authorisations the log says were released: PayPal must say so too
+    stuck: set = set()          # orphan authorisations the engine could not release: PayPal must show them gone
     orders: dict = {}           # every PayPal order the log knows of -> who it was for
     for e in events:
         t, p = e["type"], e["payload"]
@@ -37,12 +44,14 @@ def _scan(events: list[dict]) -> dict:
             h = {"buyer": p["buyer"], "auth_id": p["auth_id"], "amount": lad.D(p["amount"]), "end": None,
                  "capture_id": None, "engine_amount": None, "engine_fee": None, "mode": p.get("paypal_mode"),
                  "expires": p.get("expires"), "failed": None, "void_failed": None, "released": False,
-                 "released_reason": None, "voided_expired": False}
+                 "released_reason": None, "voided_expired": False, "voided_status": None, "released_by_void": False,
+                 "taken": False}
             holds.append(h)
             by_auth[p["auth_id"]] = h
             known.add(p["auth_id"])
         elif t == "orphan_hold_released" and p.get("auth_id"):
             known.add(p["auth_id"])
+            released.add(p["auth_id"])
         elif t in ("hold_captured", "hold_voided", "capture_failed") and p.get("auth_id") in by_auth:
             h = by_auth[p["auth_id"]]
             h["end"] = {"hold_captured": "captured", "hold_voided": "voided", "capture_failed": "failed"}[t]
@@ -52,15 +61,21 @@ def _scan(events: list[dict]) -> dict:
                 h["failed"] = p
             else:
                 h["voided_expired"] = bool(p.get("expired"))
+                h["voided_status"] = p.get("paypal_status")
+                h["released_by_void"] = bool(p.get("released_by_void"))
+                h["taken"] = bool(p.get("taken_outside_engine"))
         elif t == "failed_hold_released" and p.get("auth_id") in by_auth:
             by_auth[p["auth_id"]]["released"] = True
             by_auth[p["auth_id"]]["released_reason"] = p.get("reason")
+        elif t == "void_failed" and p.get("orphan") and p.get("auth_id"):
+            known.add(p["auth_id"])
+            stuck.add(p["auth_id"])
         elif t == "void_failed" and not p.get("orphan") and p.get("auth_id") in by_auth:
             h = by_auth[p["auth_id"]]
             h["void_failed"] = p
             if h["end"] is None:
                 h["end"] = "void_failed"
-    return {"holds": holds, "known": known, "orders": orders}
+    return {"holds": holds, "known": known, "orders": orders, "released": released, "stuck": stuck}
 
 
 def _holds(events: list[dict]) -> list[dict]:
@@ -69,16 +84,46 @@ def _holds(events: list[dict]) -> list[dict]:
 
 
 def _evidence_of(p: dict) -> bool:
-    """Does a failed capture carry something PayPal itself said (an error name, a debug id, a status), or, for a hold the
-    engine let lapse by the clock, PayPal's expiry time? Without it the failure is just the engine's say-so."""
-    return bool(p.get("issue") or p.get("debug_id") or p.get("paypal_status") or
-                (p.get("code") == "hold_expired" and p.get("expires")))
+    """Does a failed capture carry something PayPal itself said (an error name, a debug id, a status)? Without it the
+    failure is just the engine's say-so. (A hold the engine let lapse on its own clock's word is not evidence either:
+    `hold_expired` needs PayPal's EXPIRED.)"""
+    if p.get("code") == "hold_expired":
+        return p.get("paypal_status") == "EXPIRED"
+    return bool(p.get("issue") or p.get("debug_id") or p.get("paypal_status"))
+
+
+def _settle_cmd(drop: str) -> str:
+    return f"togi crowd drop plan --drop {drop}"
+
+
+def _verify_cmd(drop: str) -> str:
+    return f"`togi crowd drop verify --drop {drop}`"
+
+
+def _blocked_report(eng: Engine, d, verbose: bool) -> dict:
+    """A settlement that stopped for a person (`settle_blocked`) is not settled and not fine: say what stopped it."""
+    b = d.blocked or {}
+    said = b.get("issue") or b.get("code") or "a refusal"
+    dbg = f", debug id {b['debug_id']}" if b.get("debug_id") else ""
+    who = f" while handling {b['buyer']}" if b.get("buyer") else ""
+    nxt = (f"a person (the maker, who owns the PayPal account) looks at PayPal's answer{dbg}, fixes the cause, then runs "
+           f"`{_settle_cmd(d.id)}` and approves the fresh plan")
+    problem = with_next(f"settlement is blocked: PayPal answered {said} (http {b.get('http')}){dbg} during "
+                        f"{b.get('phase', 'settlement')}{who}, so the engine stopped. Nothing past that point was captured or "
+                        f"released, and the drop is still settling.", nxt)
+    holding = len(d.holding)
+    return {"drop": d.id, "ok": False, "blocked": True, "outcome": (d.settlement or {}).get("outcome"),
+            "checks": [{"check": "settlement is not blocked", "ok": False, "detail": problem}],
+            "problems": [problem], "problem_details": [{"problem": problem, "next": nxt}], "next": nxt,
+            "counts": {"holds_still_open": holding}}
 
 
 def verify(drop: str, engine: Engine | None = None, verbose: bool = True) -> dict:
     eng = engine or default_engine()
     d = eng.get(drop)
     if d.state != "settled":
+        if d.state == "settling" and d.blocked:
+            return _blocked_report(eng, d, verbose)
         raise CrowdError("drop_not_settled", drop=d.id, state=eng.display_state(d))
     events = eng.store.events(d.id)
     scan = _scan(events)
@@ -87,25 +132,33 @@ def verify(drop: str, engine: Engine | None = None, verbose: bool = True) -> dic
     outcome = d.settled["outcome"]
     mode_here = mode_of(eng.holds)
     checks: list[dict] = []
+    details: list[dict] = []        # every problem with the concrete step that deals with it
 
-    def check(name: str, ok: bool, detail: str) -> bool:
+    def check(name: str, ok: bool, detail: str, next_step: str | None = None) -> bool:
         checks.append({"check": name, "ok": bool(ok), "detail": detail})
+        if not ok:
+            details.append({"problem": with_next(detail, next_step), "next": next_step})
         return ok
 
     rows = []
     gross = fees = net = lad.ZERO
     unreadable = 0
     amount_bad = 0
+    parent_unknown = parent_bad = 0
     for h in holds:
-        row = {"buyer": h["buyer"], "auth_id": h["auth_id"], "engine": h["end"], "paypal": None, "ok": True, "problem": None}
+        row = {"buyer": h["buyer"], "auth_id": h["auth_id"], "engine": h["end"], "paypal": None, "ok": True,
+               "problem": None, "next": None}
         rows.append(row)
+        hand = (f"open authorisation {h['auth_id']} in the PayPal sandbox, compare it with what the engine recorded, put right "
+                f"whichever is wrong, then run {_verify_cmd(d.id)} again")
 
-        def bad(msg: str, row=row) -> None:
+        def bad(msg: str, next_step: str | None = None, row=row, hand=hand) -> None:
             if row["ok"]:      # the first problem is the one shown; later ones would only repeat it
-                row["ok"], row["problem"] = False, msg
+                row["ok"], row["problem"], row["next"] = False, msg, next_step or hand
 
         if h["end"] is None:
-            bad("hold never settled: the engine has no capture, void or failure for it")
+            bad("hold never settled: the engine has no capture, void or failure for it",
+                f"run `{_settle_cmd(d.id)}` and have a person approve the plan, so the hold gets an outcome")
             continue
         try:
             auth = eng.holds.get(h["auth_id"])
@@ -123,50 +176,78 @@ def verify(drop: str, engine: Engine | None = None, verbose: bool = True) -> dic
                 cap = eng.holds.get_capture(h["capture_id"])
                 row["capture_id"] = h["capture_id"]
                 amount, cfee = lad.D(cap["amount"]), lad.D(cap["fee"] or "0")
+                cap_hand = (f"open capture {h['capture_id']} in the PayPal sandbox, work out which of PayPal and the engine is "
+                            f"right (refund it if it should not have been taken), then run {_verify_cmd(d.id)} again")
                 if status != "CAPTURED":
-                    bad(f"engine says captured but PayPal says the hold is {status}")
+                    bad(f"engine says captured but PayPal says the hold is {status}", cap_hand)
                 elif cap["status"] not in ("COMPLETED", "PENDING"):
-                    bad(f"PayPal says the capture is {cap['status']}")
+                    bad(f"PayPal says the capture is {cap['status']}", cap_hand)
+                elif cap.get("currency") != d.currency:
+                    bad(f"PayPal captured in {cap.get('currency') or 'an unstated currency'} but the drop is in {d.currency}",
+                        cap_hand)
+                elif cap.get("auth_id") and cap["auth_id"] != h["auth_id"]:
+                    parent_bad += 1
+                    bad(f"PayPal says capture {h['capture_id']} belongs to authorisation {cap['auth_id']}, not to the hold "
+                        f"{h['auth_id']} the engine recorded it against", cap_hand)
                 elif amount != final:
-                    bad(f"captured {m(amount)} but the final price is {m(final)}")
+                    bad(f"captured {m(amount)} but the final price is {m(final)}", cap_hand)
                 elif amount > h["amount"]:
-                    bad(f"captured {m(amount)} which is more than the {m(h['amount'])} hold")
+                    bad(f"captured {m(amount)} which is more than the {m(h['amount'])} hold", cap_hand)
                 elif cap.get("final") is not True:
-                    bad("the capture is not marked final")
+                    bad("the capture is not marked final", cap_hand)
                 elif amount != h["engine_amount"] or cfee != h["engine_fee"]:
-                    bad("PayPal's amount or fee differs from what the engine recorded")
+                    bad("PayPal's amount or fee differs from what the engine recorded", cap_hand)
                 else:
+                    if not cap.get("auth_id"):
+                        parent_unknown += 1
                     gross, fees, net = gross + amount, fees + cfee, net + lad.D(cap["net"] or (amount - cfee))
                     row["amount"], row["fee"] = m(amount), m(cfee)
             elif h["end"] == "voided":
-                if not (status == "VOIDED" or (h["voided_expired"] and status in GONE)):
+                if h["taken"] or status in CAPTURED:
+                    bad(f"engine says voided but PayPal says the hold is {status}: money was taken from the buyer outside "
+                        f"the engine", f"open authorisation {h['auth_id']} in the PayPal sandbox, find the capture, and refund "
+                        f"it if the buyer should not have been charged; then run {_verify_cmd(d.id)} again")
+                elif h["released_by_void"]:
+                    if status != "VOIDED":
+                        bad(f"engine says it voided this hold but PayPal says it is {status}")
+                elif h["voided_status"]:     # recorded from what PayPal itself said: it must still say it
+                    if status != h["voided_status"]:
+                        bad(f"engine recorded PayPal saying {h['voided_status']} but PayPal now says {status}")
+                elif not (status == "VOIDED" or (h["voided_expired"] and status in GONE)):
                     bad(f"engine says voided but PayPal says the hold is {status}")
-            elif h["end"] == "void_failed":      # a missed minimum, and PayPal would not release this hold
+            elif h["end"] == "void_failed":      # PayPal would not release this hold
                 if status in CAPTURED:
                     bad(f"the release was refused and PayPal now says the hold is {status}: money was taken from a drop "
-                        f"that missed its minimum")
+                        f"that missed its minimum", f"open authorisation {h['auth_id']} in the PayPal sandbox and refund the "
+                        f"capture; then run {_verify_cmd(d.id)} again")
                 elif status not in GONE:
-                    bad(_unreleased(h, status))
+                    bad(_unreleased(h, status, d.id))
             else:  # failed capture: nothing may have been taken, and the hold must have been released
                 fp = h["failed"] or {}
                 if not _evidence_of(fp):
                     bad("the capture is recorded as failed with no PayPal evidence (no error name, debug id or status "
-                        "from PayPal): it cannot be told apart from a guess")
+                        "from PayPal): it cannot be told apart from a guess"
+                        + (" (an expiry judged by the engine's own clock is not evidence)" if fp.get("code") == "hold_expired"
+                           else ""))
                 elif status in CAPTURED:
                     bad(f"engine says the capture failed but PayPal says the hold is {status}")
                 elif fp.get("code") == "hold_expired" and status not in GONE:
                     bad(f"engine says the hold expired but PayPal says it is still {status}: it could have been captured")
                 elif h["void_failed"] and status not in GONE:
-                    bad(_unreleased(h, status))
+                    bad(_unreleased(h, status, d.id))
                 elif h["released"] and h["released_reason"] == "expired" and status not in GONE:
                     bad(f"engine says the failed hold lapsed but PayPal says it is {status}")
                 elif h["released"] and h["released_reason"] != "expired" and status != "VOIDED":
                     bad(f"engine says the failed hold was released but PayPal says it is {status}")
                 elif not h["released"] and not h["void_failed"] and status not in GONE:
-                    bad("the capture failed and the hold is still open on the buyer's card")
+                    bad("the capture failed and the hold is still open on the buyer's card",
+                        f"run `{_settle_cmd(d.id)}` and settle again to release it, or void authorisation {h['auth_id']} "
+                        f"in the PayPal sandbox by hand; then run {_verify_cmd(d.id)} again")
         except HoldError as e:
             unreadable += 1
-            bad(f"could not read this hold from PayPal: {e.code}")
+            bad(f"could not read this hold from PayPal: {e.code}",
+                f"run {_verify_cmd(d.id)} again when PayPal answers; if it keeps failing, open authorisation "
+                f"{h['auth_id']} in the PayPal sandbox")
 
     captured = [h for h in holds if h["end"] == "captured"]
     voided = [h for h in holds if h["end"] == "voided"]
@@ -178,47 +259,74 @@ def verify(drop: str, engine: Engine | None = None, verbose: bool = True) -> dic
     check("settled", True, f"outcome {outcome}")
     check("holds accounted for", not open_ and len(holds) == len(captured) + len(voided) + len(failed) + len(void_failed),
           f"{len(holds)} holds = {len(captured)} captured + {len(voided)} voided + {len(failed)} failed"
-          + (f" + {len(void_failed)} that could not be released" if void_failed else ""))
+          + (f" + {len(void_failed)} that could not be released" if void_failed else ""),
+          f"run `{_settle_cmd(d.id)}` and settle again so every hold gets an outcome")
     check("engine counts match its events",
           (counts["holds"], counts["captured"], counts["voided"], counts["failed"], counts.get("void_failed", 0)) ==
-          (len(holds), len(captured), len(voided), len(failed), len(void_failed)), f"settled record says {counts}")
+          (len(holds), len(captured), len(voided), len(failed), len(void_failed)), f"settled record says {counts}",
+          f"treat the event log as the record: run `togi crowd drop explain --drop {d.id}` and compare, and tell the owner "
+          f"the settled record disagrees with its own events")
     # a join PayPal may have acted on that the log never closed: a hold the engine does not know about
     check("no join left unconfirmed", not d.unresolved,
           "every join was confirmed or released" if not d.unresolved else
           f"{len(d.unresolved)} join(s) started but never confirmed (" + ", ".join(
               sorted(str(j.get('buyer')) for j in d.unresolved.values())) + "): a PayPal hold may be open that the "
-          "engine does not know about. Next: run `drop close` or `drop settle` again to reconcile, then verify")
-    strays = _strays(eng, scan)
-    check("every PayPal authorisation on the drop's orders is in the log", not strays,
-          f"{len(scan['orders'])} order(s) read back from PayPal, none holds anything unaccounted for" if not strays
-          else "; ".join(strays))
+          "engine does not know about",
+          f"run `togi crowd drop close --drop {d.id}` or `{_settle_cmd(d.id)}` again to reconcile, then verify")
+    check("no leave left unconfirmed", not d.leaving,
+          "every leave was confirmed or dropped" if not d.leaving else
+          f"{len(d.leaving)} leave(s) started but never confirmed (" + ", ".join(sorted(d.leaving)) + "): the hold may be "
+          "voided at PayPal while the engine still counts the buyer",
+          f"run `togi crowd drop close --drop {d.id}` or `{_settle_cmd(d.id)}` again to reconcile, then verify")
+    strays = _strays(eng, scan, d.id)
+    check("every PayPal authorisation on the drop's orders is accounted for", not strays,
+          f"{len(scan['orders'])} order(s) read back from PayPal, every authorisation on them is accounted for and in the "
+          f"state the log says" if not strays else "; ".join(s["problem"] for s in strays),
+          strays[0]["next"] if strays else None)
     check("every hold's amount matches PayPal's", amount_bad == 0,
           "each hold read back from PayPal at the amount the engine recorded" if not amount_bad
-          else f"{amount_bad} hold(s) differ from what the engine recorded")
+          else f"{amount_bad} hold(s) differ from what the engine recorded",
+          "open each named authorisation in the PayPal sandbox and compare its amount with the engine's")
+    check("every capture belongs to the hold the engine recorded", parent_bad == 0,
+          f"{len(captured) - parent_unknown} of {len(captured)} captures read back with their parent authorisation"
+          + (f"; PayPal did not name the parent of {parent_unknown}, so those were not compared" if parent_unknown else "")
+          if not parent_bad else f"{parent_bad} capture(s) belong to a different authorisation than the engine recorded",
+          "open each named capture in the PayPal sandbox and find which authorisation it was taken from")
     modes = {h["mode"] for h in holds if h["mode"]} | {p.get("paypal_mode") for e in events if e["type"] in (
         "capture_failed", "void_failed", "hold_captured") for p in [e["payload"]] if p.get("paypal_mode")}
     other = modes - {mode_here, "unknown"}      # 'unknown' = a wrapper that would not say: nothing to compare
     check("recorded against the PayPal being checked", not other,
-          f"events were recorded against {', '.join(sorted(modes)) or 'an unrecorded PayPal'}; checking against {mode_here}")
+          f"events were recorded against {', '.join(sorted(modes)) or 'an unrecorded PayPal'}; checking against {mode_here}",
+          "run verify with the same PayPal (fake or sandbox) the drop was settled against")
     check("every hold is in the state the engine says", all(r["ok"] for r in rows),
           f"{sum(1 for r in rows if r['ok'])} of {len(rows)} holds read back from PayPal as recorded"
-          + (f" ({unreadable} unreadable)" if unreadable else ""))
+          + (f" ({unreadable} unreadable)" if unreadable else ""),
+          next((r["next"] for r in rows if not r["ok"]), None))
     n_at_start = (d.settlement or {}).get("count", 0)
     if outcome == "funded":
-        check("minimum was met", n_at_start >= d.minimum, f"{n_at_start} holds at close, minimum {d.minimum}")
+        check("minimum was met", n_at_start >= d.minimum, f"{n_at_start} holds at close, minimum {d.minimum}",
+              f"tell the owner: a funded settlement ran below the minimum; open `togi crowd drop explain --drop {d.id}`")
         want = lad.price_at(d.ladder, n_at_start, d.locked_step)
-        check("final price follows the ladder", want == final, f"ladder gives {m(want)} for {n_at_start} buyers, charged {m(final)}")
+        check("final price follows the ladder", want == final, f"ladder gives {m(want)} for {n_at_start} buyers, charged {m(final)}",
+              f"compare the charged price with the ladder (`togi crowd drop status --drop {d.id}`) and tell the owner")
     else:
-        check("minimum was missed", n_at_start < d.minimum, f"{n_at_start} holds at close, minimum {d.minimum}")
-        check("nobody was charged", not captured and not failed and gross == 0, "no captures, no failed captures")
+        check("minimum was missed", n_at_start < d.minimum, f"{n_at_start} holds at close, minimum {d.minimum}",
+              f"tell the owner: a missed-minimum settlement ran at or above the minimum; open `togi crowd drop explain --drop {d.id}`")
+        check("nobody was charged", not captured and not failed and gross == 0, "no captures, no failed captures",
+              f"open the named captures in the PayPal sandbox and refund them; the drop missed its minimum")
     st = d.settled["totals"]
     check("totals match PayPal", (m(gross), m(fees), m(net)) == (st["gross"], st["fees"], st["net"]),
-          f"PayPal: gross {m(gross)}, fees {m(fees)}, net {m(net)}; engine: gross {st['gross']}, fees {st['fees']}, net {st['net']}")
+          f"PayPal: gross {m(gross)}, fees {m(fees)}, net {m(net)}; engine: gross {st['gross']}, fees {st['fees']}, net {st['net']}",
+          "compare the captures one by one (`togi crowd drop verify --drop " + d.id + " --verbose`) and find the one that differs")
 
-    problems = [c["detail"] for c in checks if not c["ok"]] + [f"{r['buyer']}: {r['problem']}" for r in rows if not r["ok"]]
+    row_details = [{"problem": with_next(f"{r['buyer']}: {r['problem']}", r["next"]), "next": r["next"]}
+                   for r in rows if not r["ok"]]
+    problem_details = details + row_details
+    problems = [x["problem"] for x in problem_details]
     out = {"drop": d.id, "ok": not problems, "outcome": outcome, "final_price": m(final), "checks": checks,
-           "problems": problems, "counts": {"holds": len(holds), "captured": len(captured), "voided": len(voided),
-                                            "failed": len(failed)},
+           "problems": problems, "problem_details": problem_details,
+           "next": next((x["next"] for x in problem_details if x["next"]), None),
+           "counts": {"holds": len(holds), "captured": len(captured), "voided": len(voided), "failed": len(failed)},
            "totals": {"gross": m(gross), "fees": m(fees), "net": m(net)}}
     if void_failed:
         out["counts"]["void_failed"] = len(void_failed)
@@ -227,30 +335,45 @@ def verify(drop: str, engine: Engine | None = None, verbose: bool = True) -> dic
     return out
 
 
-def _unreleased(h: dict, status: str) -> str:
+def _unreleased(h: dict, status: str, drop: str = "") -> str:
     vf = h["void_failed"] or {}
     said = vf.get("issue") or vf.get("code") or "a refusal"
     dbg = f", debug id {vf['debug_id']}" if vf.get("debug_id") else ""
     return (f"PayPal refused to release this hold ({said}{dbg}) and it is still {status}: it may be held on the buyer's "
             f"card until it lapses{' on ' + h['expires'] if h.get('expires') else ''}. Next: open authorisation "
+            f"{h['auth_id']} in the PayPal sandbox and void it by hand (or let it lapse), then run "
+            f"`togi crowd drop verify --drop {drop}` again" if drop else
+            f"PayPal refused to release this hold ({said}{dbg}) and it is still {status}. Next: open authorisation "
             f"{h['auth_id']} in the PayPal sandbox and void it by hand (or let it lapse), then run `drop verify` again")
 
 
-def _strays(eng: Engine, scan: dict) -> list[str]:
-    """Every authorisation PayPal has on the drop's orders that the log does not account for and that is not already
-    gone: a hold on a buyer's card the engine never recorded (or recorded and then lost track of)."""
+def _strays(eng: Engine, scan: dict, drop: str = "") -> list[dict]:
+    """Read back EVERY authorisation PayPal has on the drop's orders and compare it with what the log says about it: one the
+    log does not account for must be gone; one the log calls a released orphan must be gone; one the log could not release
+    must be gone. Returns [{problem, next}]."""
     out = []
+    again = f"then run `togi crowd drop verify --drop {drop}` again" if drop else "then run `drop verify` again"
     for oid in sorted(scan["orders"]):
         try:
             auths = eng.holds.order_authorizations(oid)
         except HoldError as e:
-            out.append(f"could not read order {oid} from PayPal ({e.code}), so a hold on it cannot be ruled out")
+            out.append({"problem": f"could not read order {oid} from PayPal ({e.code}), so a hold on it cannot be ruled out",
+                        "next": f"run verify again when PayPal answers; if it keeps failing, open order {oid} in the PayPal "
+                                f"sandbox and check its authorisations"})
             continue
         for a in auths:
-            if a["auth_id"] not in scan["known"] and a["status"] not in ("VOIDED", "EXPIRED", "DENIED"):
-                out.append(f"PayPal has authorisation {a['auth_id']} ({a['status']}, {a['amount']}) on order {oid} that the "
-                           f"log does not account for. Next: void it in the PayPal sandbox if it is a hold, then run "
-                           f"`drop verify` again")
+            aid, st = a["auth_id"], a["status"]
+            if aid in scan["stuck"] and st not in GONE:
+                out.append({"problem": f"PayPal refused to release orphan hold {aid} on order {oid} and it is still {st}",
+                            "next": f"open authorisation {aid} in the PayPal sandbox and void it by hand, {again}"})
+            elif aid in scan["released"] and st not in GONE:
+                out.append({"problem": f"the engine recorded authorisation {aid} on order {oid} as released but PayPal says "
+                                       f"it is {st}",
+                            "next": f"open authorisation {aid} in the PayPal sandbox and void it by hand, {again}"})
+            elif aid not in scan["known"] and st not in GONE:
+                out.append({"problem": f"PayPal has authorisation {aid} ({st}, {a['amount']}) on order {oid} that the log does "
+                                       f"not account for",
+                            "next": f"void it in the PayPal sandbox if it is a hold, {again}"})
     return out
 
 

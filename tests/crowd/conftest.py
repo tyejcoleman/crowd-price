@@ -28,8 +28,27 @@ class Clock:
 
 @pytest.fixture(autouse=True)
 def _clean_env(monkeypatch):
-    for k in ("CROWD_DB", "CROWD_ENV", "CROWD_PAYPAL", "TOGI_AGENT"):
+    for k in ("CROWD_DB", "CROWD_ENV", "CROWD_PAYPAL", "TOGI_AGENT", "TOGI_APPROVER_HOME"):
         monkeypatch.delenv(k, raising=False)
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _tests_never_touch_the_persons_approver():
+    """A test run must not create, change or remove the person's own Togi approver (<pw_dir>/.togi/approver, approver.key,
+    approver.state): a known passphrase planted there would let anything approve money. Every test approver is a throwaway
+    under TOGI_APPROVER_HOME. This only LOOKS (it never creates or deletes those files). If they already exist when the
+    session starts we cannot tell whose they are, so the session warns and then fails only if they CHANGE; if they do not
+    exist, the session fails if any appears."""
+    import warnings
+    from togi_helpers import approver_files_touched, real_approver_snapshot
+    before = real_approver_snapshot()
+    if before:
+        warnings.warn(f"{sorted(before)} already exist in ~/.togi at the start of this test session; whether a person or an "
+                      f"earlier test run made them is unknown. They are left alone; the session fails if they change.")
+    yield
+    touched = approver_files_touched(before, real_approver_snapshot())
+    assert not touched, (f"this test session created or changed the person's own Togi approver files in ~/.togi: {touched}. "
+                         f"Every test approver must live under TOGI_APPROVER_HOME. Do not delete them from a test; tell the owner.")
 
 
 @pytest.fixture

@@ -2,6 +2,7 @@
 import json
 import os
 import pty
+import pwd
 import select
 import subprocess
 import sys
@@ -16,13 +17,50 @@ def togi_available() -> bool:
     return (TOGI_SRC / "togi" / "cli.py").is_file()
 
 
+# The person's own approver lives here, whatever $HOME or $TOGI_HOME say (Togi: <pw_dir>/.togi). A test must never create,
+# change or read it: every approver a test needs is a throwaway one under TOGI_APPROVER_HOME (whose approvals are scope "test").
+REAL_APPROVER_FILES = ("approver", "approver.key", "approver.state")
+
+
+def real_approver_dir() -> Path:
+    return Path(pwd.getpwuid(os.getuid()).pw_dir) / ".togi"
+
+
+def approver_home_for(home: Path) -> Path:
+    """The throwaway approver home that goes with a throwaway TOGI_HOME: a sibling directory, so it is created fresh with
+    the test's tmp path and removed with it. Never the person's own."""
+    home = Path(home)
+    out = home.with_name(home.name + "-approver")
+    assert out.resolve() != real_approver_dir().resolve(), "a test approver home must not be the person's own"
+    return out
+
+
+def real_approver_snapshot(directory: Path | None = None) -> dict:
+    """{file: (mtime_ns, size)} of the person's approver files that exist right now. Read-only: it only looks."""
+    directory = Path(directory) if directory is not None else real_approver_dir()
+    out = {}
+    for name in REAL_APPROVER_FILES:
+        try:
+            st = (directory / name).stat()
+        except OSError:
+            continue
+        out[name] = (st.st_mtime_ns, st.st_size)
+    return out
+
+
+def approver_files_touched(before: dict, after: dict) -> list[str]:
+    """Names in the person's approver directory that appeared, vanished or changed between two snapshots."""
+    return sorted(n for n in set(before) | set(after) if before.get(n) != after.get(n))
+
+
 def env_for(home: Path, db: Path, **extra) -> dict:
     env = {k: v for k, v in os.environ.items() if not k.startswith(("TOGI_", "CROWD_"))}
-    env.update(TOGI_HOME=str(home), PYTHONPATH=str(TOGI_SRC), PYTHONDONTWRITEBYTECODE="1", CROWD_DB=str(db),
-               CROWD_ENV="test", CROWD_PAYPAL="fake")
+    env.update(TOGI_HOME=str(home), TOGI_APPROVER_HOME=str(approver_home_for(home)), PYTHONPATH=str(TOGI_SRC),
+               PYTHONDONTWRITEBYTECODE="1", CROWD_DB=str(db), CROWD_ENV="test", CROWD_PAYPAL="fake")
     env.update({k: v for k, v in extra.items() if v is not None})
-    for k in [k for k, v in extra.items() if v is None]:
+    for k in [k for k, v in extra.items() if v is None and k != "TOGI_APPROVER_HOME"]:
         env.pop(k, None)
+    assert env.get("TOGI_APPROVER_HOME") and Path(env["TOGI_APPROVER_HOME"]).resolve() != real_approver_dir().resolve()
     return env
 
 
@@ -40,10 +78,13 @@ APPROVER_PASSPHRASE = "correct horse battery staple"     # the approver passphra
 
 
 def set_up_approver(home: Path) -> None:
-    """What a person does once with `togi approver setup`, minus the terminal: write the approver record into this
-    throwaway $TOGI_HOME (with a cheap scrypt cost, which the record stores). Without it Togi refuses every approval."""
+    """What a person does once with `togi approver setup`, minus the terminal: write a THROWAWAY approver record (under
+    TOGI_APPROVER_HOME, so its approvals are scope "test") with a cheap scrypt cost, which the record stores. Without it
+    Togi refuses every approval. It never goes near the person's own approver in <pw_dir>/.togi."""
     env = {k: v for k, v in os.environ.items() if not k.startswith("TOGI_")}
-    env.update(TOGI_HOME=str(home), PYTHONPATH=str(TOGI_SRC), PYTHONDONTWRITEBYTECODE="1")
+    env.update(TOGI_HOME=str(home), TOGI_APPROVER_HOME=str(approver_home_for(home)), PYTHONPATH=str(TOGI_SRC),
+               PYTHONDONTWRITEBYTECODE="1")
+    assert env["TOGI_APPROVER_HOME"] and Path(env["TOGI_APPROVER_HOME"]).resolve() != real_approver_dir().resolve()
     r = subprocess.run([sys.executable, "-c", f"from togi import approver; approver.create({APPROVER_PASSPHRASE!r}, n=2 ** 10)"],
                        env=env, capture_output=True, text=True, cwd=str(REPO.parent))
     assert r.returncode == 0, r.stderr

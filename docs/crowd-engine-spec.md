@@ -191,3 +191,25 @@ See `docs/crowd-fixes-r1.md` for the list and `docs/DECISIONS.md` F-12 for the r
   capture with no PayPal evidence; events recorded against a different PayPal.
 - **`test settle` / `test reset`:** CROWD_ENV=test, CROWD_PAYPAL=fake, TOGI_AGENT unset, and a store whose holds were all
   placed by this store's own fake.
+
+## 7. Fix round 2 (2026-10-27): ask PayPal, or stop
+
+See `docs/crowd-fixes-r2.md` for the list and `docs/DECISIONS.md` D-11 and F-13 for the reasons and the sandbox probes.
+Principle: never infer PayPal's state from our own clock or from an error class when PayPal can be asked; when unsure, stop
+and hand it to a person.
+
+- **Events added:** `leave_started`, `leave_failed`, `settle_blocked`. `hold_voided` also records what PayPal said at close
+  (`reason: paypal_says_<status>`); `hold_placed` carries `replayed` and `confirmed_status` when it came from a replay.
+- **Refusals** are classified by PayPal's names on an allow-list (`paypal_holds.buyer_specific`). Buyer-specific: recorded
+  (`capture_failed` / `void_failed`) and settle goes on. Everything else, including every 401 and 403: `settle_blocked`, nothing
+  more captured, voided or released, the drop stays `settling`, and the refusal's `next` names a person. Two capture failures
+  in a row with the same code stop it the same way. Failed holds are released last, and only when nothing blocked.
+- **`close`** reconciles joins and leaves, then GETs every held authorisation and drops any that is not CREATED or PENDING from
+  the crowd; the funded decision, the price and the plan come from that crowd.
+- **`leave`** is written down before PayPal is asked; `reconcile` resolves it by reading the authorisation.
+- **`join`** reads the clock once; a replayed or non-open answer is confirmed with a GET before it is recorded; a refused retry
+  or a retry on another card first resolves (releases) the earlier unconfirmed try.
+- **Expiry:** our clock only prompts a question. A hold is expired when PayPal says EXPIRED; otherwise it is tried.
+- **`verify`** also checks capture currency and parent authorisation, released orphans, unconfirmed leaves and a blocked settle;
+  every problem has a `next`.
+- **`drop settle`** refuses an approval of scope "test" unless the PayPal is the fake (`ctx.approval_scope`).

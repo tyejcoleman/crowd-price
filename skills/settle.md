@@ -30,7 +30,16 @@ summary: Closing, the approval step, the two outcomes, and checking the result.
 A declined or refused capture is recorded (with PayPal's own error name) and that buyer is not charged; the price
 stays the same for everyone else, and settling carries on with the next buyer. `verify` still passes and names the
 failure. Tell the maker how many charges failed and by how many the drop is now short of its minimum.
-A hold that has passed its expiry is never captured; it is recorded as failed (`hold_expired`) the same way.
+A hold is called expired only when PayPal says so (`hold_expired`); a hold that is merely past its date on the engine's
+clock is still tried, because PayPal decides.
+
+## If settlement stops (`settle_blocked`)
+Some PayPal answers are not about one buyer (the account is restricted, the credentials are refused, a name nobody has
+seen, or two charges in a row fail the same way). Settle then stops at once: nothing more is captured and nothing is
+released or voided, and the drop stays "settling". This is a refusal that names a person: say plainly that settlement is
+stopped, give the issue name and debug id from the error, and that the maker must look into it with PayPal. Do not run
+settle again in a loop. When the cause is fixed, `drop plan` gives a fresh token for a person to approve. `drop verify`
+reports the stop as a problem until then.
 
 If PayPal will not release a hold, settle still finishes and `verify` reports `ok: false` with the hold's id and the
 next step (void it by hand in the PayPal sandbox, then verify again). Tell the maker plainly; do not say "all holds

@@ -20,6 +20,11 @@ Every error has a `next` command: run it. Common ones:
 - `paypal_not_configured`: no sandbox credentials here. For practice use `CROWD_ENV=test CROWD_PAYPAL=fake`.
 - `test_tools_not_for_agents` / `store_has_real_holds`: `togi crowd test ...` is for a person setting up a test store.
   Money moves only through `drop settle`, which waits for a person. Do not look for a way round it.
+- `settle_blocked`: PayPal refused something that may be about the account, not one buyer, or two charges in a row failed
+  alike. Nothing more was captured or released. A person (the maker) must look; do not retry in a loop. See `settle`.
+- `hold_not_open`: that buyer's earlier hold had already been voided or had lapsed at PayPal, so it was not counted. Join again.
+- `earlier_attempt_unresolved`: a buyer's earlier try left a hold that could not be released, so no new hold was placed. Ask a person.
+- `test_approval_outside_test_mode`: the approval came from a throwaway test approver; real PayPal needs a person's own.
 - `drop_busy`: another process is settling this drop. Wait, then `drop status`.
 - Exit 2 (`refused`) means a guard said no; do not retry the same call. Exit 3 means ask a person to approve.
 

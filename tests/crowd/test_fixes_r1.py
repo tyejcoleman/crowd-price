@@ -427,14 +427,16 @@ def test_a_refused_capture_is_recorded_and_settle_goes_on_with_the_next_buyer(en
     assert engine.settle(drop)["already_settled"] is True
 
 
-def test_a_refusal_the_engine_has_never_seen_is_recorded_the_same_way(engine, drop, fake):
+def test_a_buyer_specific_refusal_the_engine_has_no_class_for_is_recorded_the_same_way(engine, drop, fake):
+    """(Round 2 narrowed this: a name nobody has seen is no longer treated as one buyer's; see test_fixes_r2.)
+    A name on the buyer-specific list is recorded per buyer whatever http status carries it."""
     join_many(engine, drop, 4)
     engine.close(drop)
-    fake.refuse("capture", "SOMETHING_NEW", http=409, match=victim_of(engine, drop, "buyer-01"), times=None)
+    fake.refuse("capture", "PAYER_ACTION_REQUIRED", http=409, match=victim_of(engine, drop, "buyer-01"), times=None)
     out = engine.settle(drop)
     assert out["counts"]["captured"] == 3 and out["counts"]["failed"] == 1
     cf = [e["payload"] for e in engine.store.events(drop) if e["type"] == "capture_failed"][0]
-    assert cf["issue"] == "SOMETHING_NEW" and cf["http"] == 409
+    assert cf["issue"] == "PAYER_ACTION_REQUIRED" and cf["http"] == 409
 
 
 def test_a_hold_that_cannot_be_released_is_recorded_and_settle_still_finishes(engine, drop, fake):
@@ -443,11 +445,11 @@ def test_a_hold_that_cannot_be_released_is_recorded_and_settle_still_finishes(en
     engine.close(drop)
     victim = victim_of(engine, drop)
     fake.refuse("capture", "AUTHORIZATION_EXPIRED", match=victim, times=None)
-    fake.refuse("void", "SOMETHING_NEW", match=victim, times=None)
+    fake.refuse("void", "PAYER_ACTION_REQUIRED", match=victim, times=None)
     out = engine.settle(drop)
     assert out["state"] == "settled" and out["counts"]["failed"] == 1 and out["unreleased"] == 1
     vf = [e["payload"] for e in engine.store.events(drop) if e["type"] == "void_failed"][0]
-    assert vf["auth_id"] == victim and vf["issue"] == "SOMETHING_NEW" and vf["debug_id"] and vf["paypal_mode"] == "fake"
+    assert vf["auth_id"] == victim and vf["issue"] == "PAYER_ACTION_REQUIRED" and vf["debug_id"] and vf["paypal_mode"] == "fake"
     assert engine.get(drop).buyers["buyer-02"].void_failed
     v = V.verify(drop, engine)
     assert not v["ok"]
@@ -500,8 +502,8 @@ def test_a_refusal_that_is_not_about_one_buyer_still_stops_settle(engine, drop, 
         def capture(self, *a, **k):
             raise P.HoldError("paypal_not_configured", "PayPal refused the sandbox credentials (http 401)", http=401)
 
-    assert code(Engine(store, BadCredentials(fake), clock).settle, drop) == "paypal_error"
-    assert "capture_failed" not in types(engine, drop)
+    assert code(Engine(store, BadCredentials(fake), clock).settle, drop) == "settle_blocked"     # round 2: a person looks first
+    assert "capture_failed" not in types(engine, drop) and "settle_blocked" in types(engine, drop)
     assert engine.settle(drop)["counts"]["captured"] == 3
 
 
@@ -736,6 +738,8 @@ def test_every_hold_past_its_expiry_is_excluded_from_the_plan(engine, drop, fake
     join_many(engine, drop, 4)
     engine.close(drop)
     clock.advance(days=3650)                          # long after every hold PayPal gave out
+    for b in engine.get(drop).buyers.values():
+        fake.expire(b.auth_id)                        # and PayPal agrees (round 2: the clock alone decides nothing)
     p = engine.plan(drop)
     assert p["expired"] == 4 and p["holds"] == 0 and plan_token(p) == "capture:0:40.00:0.00"
 
@@ -790,11 +794,12 @@ def test_verify_checks_that_a_hold_the_engine_called_expired_really_is(engine, d
     short = (parse_iso(first["expires"]) - timedelta(days=20)).strftime("%Y-%m-%dT%H:%M:%SZ")
     _rewrite_expiry(store, drop, victim, short)
     clock.t = parse_iso(short) + timedelta(hours=1)
-    engine.settle(drop)
-    v = V.verify(drop, engine)                                           # PayPal still says CREATED: the clock was wrong
-    assert not v["ok"] and any("expired" in p and "CREATED" in p for p in v["problems"])
     fake.expire(victim)
-    assert V.verify(drop, engine)["ok"]
+    engine.settle(drop)
+    assert V.verify(drop, engine)["ok"]                                  # PayPal said EXPIRED when it was recorded, and still does
+    edit_fake(fake, lambda st: st["auths"][victim].update(status="CREATED"))      # ... unless PayPal now says otherwise
+    v = V.verify(drop, engine)
+    assert not v["ok"] and any("expired" in p and "CREATED" in p for p in v["problems"])
 
 
 def test_a_lapsed_hold_in_a_missed_drop_needs_no_void_and_nobody_is_charged(engine, drop, fake, store, clock):
