@@ -43,6 +43,11 @@ EVENT_TYPES = {
     "capture_started",
     # a person bound a drop that recorded no PayPal (written before drops did) to the PayPal now in use
     "paypal_bound",
+    # a hold recorded as taken (money captured on it outside the engine) whose uncaptured remainder PayPal would not release: the rest
+    # of the buyer's hold is still open and could be captured later; verify keeps reporting it until PayPal shows it gone
+    "remainder_open",
+    # an earlier order of a join intent that PayPal would not describe (403, 404): the join goes on, verify says to check it by hand
+    "order_unreadable",
     # settlement stopped because PayPal refused something that is not about one buyer (or a streak of identical failures)
     "settle_blocked",
     "drop_settled",
@@ -332,7 +337,9 @@ def reduce(events: list[dict]) -> Drop:
         elif t == "step_locked":
             d.locked_step = max(d.locked_step, int(p["step"]))
         elif t == "drop_closed":
-            d.state, d.closed_at, d.closed_reason, d.closed = "closed", e["ts"], p.get("reason"), p
+            # `closed_at` is the instant the close was ASKED for (read before it waited for the drop lock); a drop closed by older
+            # code has only the event's own time, which is when the lock was won
+            d.state, d.closed_at, d.closed_reason, d.closed = "closed", p.get("closed_at") or e["ts"], p.get("reason"), p
         elif t == "settlement_started":
             d.state, d.settlement = "settling", p
         elif t == "drop_settled":
@@ -358,6 +365,10 @@ def reduce(events: list[dict]) -> Drop:
                 ids = j.setdefault("order_ids", [])        # every order this intent has made: PayPal may answer the same
                 if p.get("order_id") and p["order_id"] not in ids:    # request with a NEW order once it has forgotten the first
                     ids.append(p["order_id"])
+        elif t == "order_unreadable":
+            j = d.unresolved.get(p.get("request_id"))      # an EARLIER order PayPal would not describe: do not ask again, the intent goes on
+            if j is not None and p.get("order_id"):
+                j.setdefault("released_orders", []).append(p["order_id"])
         elif t == "orphan_hold_released" and p.get("superseded"):
             j = d.unresolved.get(p.get("request_id"))      # an EARLIER order's hold, released: the intent itself stays open
             if j is not None and p.get("order_id"):

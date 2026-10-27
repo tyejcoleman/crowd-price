@@ -51,7 +51,7 @@ A maker opens a **drop**:
 - `capture(auth_id, amount, request_id, final=True)`.
 - `void(auth_id, request_id)`.
 - `get(auth_id)`.
-- Every call sends a deterministic `PayPal-Request-Id` (`crowd-<drop>-<buyer>-<action>`), so a
+- Every call sends a deterministic `PayPal-Request-Id` (`crowd-<drop>.<buyer>.<action>[.<attempt>]`, §10), so a
   retry never doubles money.
 - PayPal error names map to clean exceptions: `MAX_CAPTURE_AMOUNT_EXCEEDED`,
   `AUTHORIZATION_ALREADY_CAPTURED`, `AUTHORIZATION_VOIDED`, `REAUTHORIZATION_TOO_SOON`, card
@@ -274,3 +274,33 @@ our clock says about its date, or what an error is called.
 - **The lock (item 9).** `togi.toml` locks every file of the crowd package except `src/crowd/ladder.py` (reshape), including
   `__init__.py`. `tests/crowd/test_fixes_r4.py` fails for a `.py` under `src/crowd/` that is neither, and for a crowd module the bundle
   imports that is not covered. After this round the repo's own lock (`.togi/locked.sha256`) no longer verifies: a person re-locks.
+
+## 10. Fix round 5 (2026-10-27): judge a request by when it was asked; leave nothing half open; the fake proves no more than PayPal does
+
+See `docs/crowd-fixes-r5.md` for the list and `docs/DECISIONS.md` F-17 for the reasons and the sandbox probes still to run. Principle: nobody
+who asked to leave in time is charged however the lock race went; every state the engine cannot leave by itself has a way out a person is told
+about; `verify` passes only when no money is held or taken without the engine's approval.
+
+- **Events added:** `remainder_open` (the rest of a partly captured hold PayPal would not release) and `order_unreadable` (an earlier order of a join
+  intent PayPal would not describe). `drop_closed` also carries `closed_at`, the instant the close was ASKED for. `hold_voided` may carry
+  `remainder_voided`; `failed_hold_released` may carry `reason: taken_outside_engine`, `capture_ids` and `paypal_status`; `leave_failed` may carry
+  `reason: captured_before_leave` and `capture_id`.
+- **Leaves (item 1).** `leave` reads its clock before the lock; `close` now does too (`closed_at`). A leave is timely if it was asked before `ends_at` and,
+  when the drop is closed, before `closed_at` (for a drop closed after its deadline, as of `ends_at`, only the deadline counts; ties go against the leave).
+  A timely leave on a closed, settling or settled drop releases the hold and takes the buyer out of the crowd (`plan_changed` follows for a plan already
+  approved). One that finds the buyer captured by settlement is recorded and refused as `charged_before_leave`; `verify` names the capture to refund and clears
+  it once it is refunded in full. Request ids already on record are never recomputed.
+- **Remainders (item 2).** Recording a hold as `taken` while PayPal shows it PARTIALLY_CAPTURED voids the rest (`remainder_voided`) or records
+  `remainder_open`. `verify` reads the authorisation after any refund: a taken hold passes only when its captures are refunded in full and the authorisation
+  is VOIDED, CAPTURED or EXPIRED. The fake allows that void by default (`void_partially_captured(False)` makes it refuse).
+- **Failed then taken (item 3).** The release pass's void answered ALREADY_CAPTURED: PayPal is asked; money taken means the hold is recorded
+  (`failed_hold_released{taken_outside_engine}`) and settlement goes on; nothing taken means `settle_blocked` as before. `drop exclude` does the same for a
+  buyer whose capture failed.
+- **Unreadable earlier order (item 4).** A refusal on an earlier order of a join intent is recorded once (`order_unreadable`) and close goes on; a join is
+  refused that one time; `verify` says to check the order at PayPal.
+- **Sandbox with no app (item 5).** `drop_unbound` until `drop bind` (which checks that the app in use knows every hold). A mode or ref that differs is
+  still `wrong_paypal`, checked first.
+- **Not found (item 6).** A hold the engine recorded as not found resolves in `verify` with a note (asked once more; open means a problem).
+- **The fake (item 7).** Its answers are PayPal's JSON through the real client's mapping: no request id on a capture, refunds only on the order
+  (`payments.refunds[]`, linked to the capture, COMPLETED, summed per capture). The capture POST is sent once, never retried, so the read-before-capture
+  window is one attempt. Request ids are `crowd-<drop>.<buyer>.<action>[.<attempt>]`, the join's card step `<id>.card`.

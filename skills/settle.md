@@ -51,3 +51,13 @@ reports the stop as a problem until then.
 If PayPal will not release a hold, settle still finishes and `verify` reports `ok: false` with the hold's id and the
 next step (void it by hand in the PayPal sandbox, then verify again). Tell the maker plainly; do not say "all holds
 were released" until verify is ok.
+
+## When money was taken outside the engine, or a leave came too late
+- A hold somebody else captured is left out of the crowd and never captured on top of. `verify` names the capture to refund.
+  If only part of the hold was captured, the engine voids what was left; if PayPal refuses, `verify` keeps saying the rest of
+  the hold is still open (`PARTIALLY_CAPTURED`) after the refund, with the authorisation to void. Refunding is not enough.
+- A buyer who asked to leave before the deadline (and before the maker closed the drop) is not charged, even if the close
+  got there first: the leave is honoured on a closed drop, and `settle` then refuses the old token (`plan_changed`).
+  If settlement had already charged them, the leave is recorded (`charged_before_leave`) and `verify` fails until the
+  maker refunds that capture.
+- A hold PayPal answers "not found" for is left out of the crowd; `verify` notes it and passes.

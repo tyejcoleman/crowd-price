@@ -253,7 +253,9 @@ def drop_join(drop: str, buyer: str, card: int = 0) -> dict:
 
 @cmd("drop leave", "write", ["togi crowd drop leave --drop d_7f3a --buyer ada-lovelace"])
 def drop_leave(drop: str, buyer: str) -> dict:
-    """A buyer leaves: their hold is released at once. Steps already reached stay locked."""
+    """A buyer leaves: their hold is released at once. Steps already reached stay locked. A leave asked before the deadline (and
+    before the maker closed the drop) always counts, even if the drop closed first; if settlement had already charged that buyer, the
+    error says which capture the maker must refund."""
     return _eng().leave(drop, buyer)
 
 
@@ -354,7 +356,8 @@ def drop_settle(drop: str, expect: str, ctx=None) -> dict:
 @cmd("drop holds", "read", ["togi crowd drop holds --drop d_7f3a"])
 def drop_holds(drop: str) -> dict:
     """List the holds a drop's log says it placed, each read at the PayPal in use right now. For a drop that recorded no PayPal (written
-    before drops did), this is exactly what `drop bind` would check, with the token a person approves it for. Moves nothing."""
+    before drops did) or only "sandbox" with no app (written before they recorded it), this is exactly what `drop bind` would check,
+    with the token a person approves it for. Moves nothing."""
     out = _eng().holds_view(drop)
     if out["bound"]:
         out["next"] = f"togi crowd drop status --drop {drop}"
@@ -368,17 +371,17 @@ def drop_holds(drop: str) -> dict:
 
 
 @cmd("drop bind", "money", ["togi crowd drop bind --drop d_7f3a --expect bind:sandbox:9ab12c34de56:3:1a2b3c4d"],
-     summary="Bind a drop that recorded no PayPal to the PayPal now in use: every hold the drop placed is read at this PayPal first "
+     summary="Bind a drop that recorded no PayPal (or no sandbox app) to the PayPal now in use: every hold the drop placed is read at this PayPal first "
              "(`drop holds` lists them), and the bind is refused if it does not know one. From then on the drop is operated only "
              "through this PayPal.",
      confirm="drop")
 def drop_bind(drop: str, expect: str, ctx=None) -> dict:
-    """Record which PayPal a drop belongs to, for a drop written before drops recorded it. Until a person does this, nothing
-    touches PayPal for the drop. Pass --expect from `drop holds`; the approval is bound to it, so the person approves exactly this
+    """Record which PayPal (and sandbox app) a drop belongs to, for a drop written before drops recorded it. Until a person does this,
+    nothing touches PayPal for the drop. Pass --expect from `drop holds`; the approval is bound to it, so the person approves exactly this
     PayPal and exactly these holds.
 
     Args:
-        drop: the drop that records no PayPal
+        drop: the drop that records no PayPal, or no sandbox app
         expect: the token from `togi crowd drop holds` (bind:MODE:REF:HOLDS:DIGEST); the bind is refused if the holds differ
     """
     eng = _eng()

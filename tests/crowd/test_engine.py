@@ -90,7 +90,7 @@ def test_a_buyer_can_rejoin_after_leaving_with_a_fresh_hold(engine, drop, fake):
     second = engine.join(drop, "Boomerang")
     assert second["auth_id"] != first["auth_id"] and fake.get(second["auth_id"])["status"] == "CREATED"
     rids = [e["payload"]["request_id"] for e in engine.store.events(drop) if e["type"] == "hold_placed"]
-    assert rids == [f"crowd-{drop}-boomerang-authorize", f"crowd-{drop}-boomerang-authorize2"]
+    assert rids == [f"crowd-{drop}.boomerang.authorize", f"crowd-{drop}.boomerang.authorize.2"]
 
 
 # ---- the state-machine guards ---------------------------------------------------------------------------
@@ -157,7 +157,7 @@ def test_a_failed_join_is_recorded_but_does_not_count(engine, drop, fake):
     r = engine.join(drop, "Declined Dan", card_index=1)                  # can try again with another card
     assert r["buyers"] == 1
     rids = [e["payload"].get("request_id") for e in engine.store.events(drop) if e["type"] == "hold_placed"]
-    assert rids == [f"crowd-{drop}-declined-dan-authorize2"]              # a new request id: no replayed decline
+    assert rids == [f"crowd-{drop}.declined-dan.authorize.2"]              # a new request id: no replayed decline
 
 
 # ---- settlement -------------------------------------------------------------------------------------------

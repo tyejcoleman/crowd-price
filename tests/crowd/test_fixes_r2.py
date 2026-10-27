@@ -431,7 +431,9 @@ def test_f2_a_hold_captured_outside_the_engine_leaves_the_crowd_and_verify_says_
     assert not v["ok"] and any("taken from the buyer outside the engine" in p and "refund" in p for p in v["problems"])
 
 
-def test_f2_a_hold_paypal_cannot_find_is_left_out_of_the_crowd_and_verify_keeps_reporting_it(engine, drop, fake):
+def test_f2_a_hold_paypal_cannot_find_is_left_out_of_the_crowd_and_verify_resolves_it_with_a_note(engine, drop, fake):
+    """(Round 5, item 6: this used to be "verify keeps reporting it", with "run again when PayPal answers" for ever. PayPal HAD answered:
+    404. The engine accepted that answer at close; verify now accepts the same answer, asks once more, and says so.)"""
     join_many(engine, drop, 4)
     victim = auth_of(engine, drop, "buyer-02")
     edit_fake(fake, lambda st: st["auths"].pop(victim))
@@ -439,7 +441,9 @@ def test_f2_a_hold_paypal_cannot_find_is_left_out_of_the_crowd_and_verify_keeps_
     assert engine.get(drop).closed["count"] == 3
     engine.settle(drop)
     v = V.verify(drop, engine)
-    assert not v["ok"] and any("could not read this hold" in p and "buyer-02" in p for p in v["problems"])
+    assert v["ok"], v["problems"]
+    row = [h for h in v["holds"] if h["buyer"] == "buyer-02"][0]
+    assert row["paypal"] == "NOT_FOUND" and "no record of this authorisation (404)" in row["note"]
 
 
 def test_f2_a_status_nobody_has_a_rule_for_is_voided_not_assumed_gone(engine, drop, fake):
@@ -1016,7 +1020,7 @@ def test_f9_a_retry_on_another_card_releases_the_first_cards_hold_before_holding
     rel = evs(engine, drop, "orphan_hold_released")[0]
     assert rel["reason"] == "card_changed" and rel["auth_id"] == first
     hp = evs(engine, drop, "hold_placed")[0]
-    assert hp["attempt"] == 2 and hp["request_id"].endswith("authorize2") and hp["auth_id"] == r["auth_id"]
+    assert hp["attempt"] == 2 and hp["request_id"].endswith("authorize.2") and hp["auth_id"] == r["auth_id"]
     assert engine.get(drop).buyers["ada"].card_index == 1 and engine.get(drop).unresolved == {}
     join_many(engine, drop, 2, start=2)
     engine.close(drop)
@@ -1052,7 +1056,7 @@ def sandbox_kind_engine(tmp_path, monkeypatch):
 
     class AsSandbox(Wrap):
         kind = "sandbox"
-        ref = None
+        ref = "asandboxapp1"
 
     return lambda: Engine(Store(str(tmp_path / "crowd.db")), AsSandbox(fake))
 

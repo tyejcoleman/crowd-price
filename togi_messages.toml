@@ -180,6 +180,11 @@ message = "Settlement of {drop} is stopped. PayPal answered {issue} (http {http}
 next = "{next}"
 status = "refused"
 
+[errors.charged_before_leave]
+message = "{buyer} asked to leave drop {drop} in time, but settlement had already captured their hold (capture {capture_id}, {amount}), so the leave could not release it. The request is on record. {buyer} should not be charged: the capture has to be refunded."
+next = "A person refunds capture {capture_id} in the PayPal sandbox; `togi crowd drop verify --drop {drop}` keeps reporting it until PayPal shows it refunded."
+status = "refused"
+
 [errors.leave_pending]
 message = "PayPal would not release {buyer}'s hold just now ({issue}, http {http}). The leave is on record, so {buyer} is not charged: closing the drop retries the release and takes them out of the crowd."
 next = "togi crowd drop leave --drop {drop} --buyer {buyer}   # to retry now, or close the drop"
@@ -196,7 +201,7 @@ next = "Use the PayPal the drop was made with (CROWD_PAYPAL={recorded_mode}), or
 status = "refused"
 
 [errors.drop_unbound]
-message = "Drop {drop} records no PayPal (it was written before drops did), so it belongs to no PayPal yet and nothing was read or written. The PayPal in use now is {current}, and the engine will not guess that it is the one that placed the drop's holds."
+message = "Drop {drop} does not record which PayPal app placed its holds (it was written before drops recorded the PayPal, or before they recorded which sandbox app), so it belongs to no PayPal yet and nothing was read or written. The PayPal in use now is {current}, and the engine will not guess that it is the one that placed the drop's holds."
 next = "Look at the holds, then a person binds the drop to the right PayPal: togi crowd drop holds --drop {drop}"
 status = "refused"
 
@@ -236,8 +241,8 @@ next = "togi crowd drop join --drop {drop} --buyer {buyer}"
 status = "error"
 
 [errors.earlier_attempt_unresolved]
-message = "{buyer} has an earlier try whose hold could not be released, so no new hold was placed (that could hold their money twice)."
-next = "A person must check the buyer's earlier hold in the PayPal sandbox, then `togi crowd drop verify --drop {drop}` or close the drop."
+message = "{buyer} has an earlier try whose hold could not be released or looked at, so no new hold was placed this time (that could hold their money twice). It is on record, so asking again goes on."
+next = "A person checks the buyer's earlier order and hold in the PayPal sandbox and voids the hold if there is one; `togi crowd drop verify --drop {drop}` keeps reporting it. Then try again."
 status = "refused"
 
 [errors.test_approval_outside_test_mode]

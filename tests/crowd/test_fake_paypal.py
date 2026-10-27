@@ -119,8 +119,8 @@ def test_bad_amount_and_cards(fake):
 
 
 def test_request_id_shape():
-    assert P.request_id_for("d_1", "sim-001", "authorize") == "crowd-d_1-sim-001-authorize"
-    assert P.request_id_for("d_1", "sim-001", "void", 2) == "crowd-d_1-sim-001-void2"
+    assert P.request_id_for("d_1", "sim-001", "authorize") == "crowd-d_1.sim-001.authorize"
+    assert P.request_id_for("d_1", "sim-001", "void", 2) == "crowd-d_1.sim-001.void.2"
 
 
 def test_make_holds_modes(monkeypatch, tmp_path):

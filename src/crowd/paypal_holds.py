@@ -10,10 +10,18 @@ run fast and free:
     all captures added up > 115%    -> MAX_CAPTURE_AMOUNT_EXCEEDED  (60 of a 40 hold, as the sandbox said, F-08)
     second capture                  -> AUTHORIZATION_ALREADY_CAPTURED
     void                            -> VOIDED;  capture after void -> AUTHORIZATION_VOIDED
+    void of a PARTIALLY_CAPTURED    -> VOIDED (the rest of the hold is released); a switch (`void_partially_captured(False)`)
+                                       makes the fake refuse it with AUTHORIZATION_ALREADY_CAPTURED instead, because the sandbox has
+                                       not been asked (docs/DECISIONS.md F-17)
     decline (decline_next / card 9) -> declined at capture, the hold stays open
 
 Every call carries a deterministic PayPal-Request-Id, so a retry never doubles money; the fake keeps the
 same idempotency (same request id, same answer).
+
+The fake must never prove more than the real API does. What it hands the engine goes through the SAME mapping the real client
+applies to PayPal's JSON (`_capture_view`, `_captures_of_order`), starting from JSON shaped like PayPal's: a capture does not say
+which request made it, and a refund is found on the ORDER (`purchase_units[].payments.refunds[]`, linked to its capture), never as
+a field on the capture.
 """
 from __future__ import annotations
 
@@ -54,9 +62,19 @@ def get_card(i: int) -> dict:
 
 
 def request_id_for(drop: str, buyer: str, action: str, attempt: int = 1) -> str:
-    """crowd-<drop>-<buyer>-<action>, with the buyer's attempt number from the 2nd attempt on, so a
-    buyer who leaves and rejoins never reuses an earlier request's answer."""
-    return f"crowd-{drop}-{buyer}-{action}" + (str(attempt) if attempt > 1 else "")
+    """crowd-<drop>.<buyer>.<action>, with `.<attempt>` from the buyer's 2nd attempt on, so a buyer who leaves and rejoins never
+    reuses an earlier request's answer. The fields are separated by '.', which neither a drop id nor a buyer slug (a-z, 0-9 and '-')
+    can contain, so no buyer name can build another buyer's request id (the old 'crowd-<drop>-<buyer>-<action>' could: a buyer
+    called 'ada-authorize' made the id of the card step of buyer 'ada'). The 'crowd-' prefix is kept, so anything that tells the
+    engine's requests from a person's by it still can. Ids already on record (join_started, leave_started, capture_started) are
+    read back from the event, never recomputed in this form."""
+    return f"crowd-{drop}.{buyer}.{action}" + (f".{attempt}" if attempt > 1 else "")
+
+
+def card_request_id(request_id: str) -> str:
+    """The id of the second step of a join (authorise the order with the card): the join's own id plus '.card'. An id recorded
+    before the '.' form (it has no '.') keeps the '-authorize' suffix it was first sent with."""
+    return request_id + (".card" if "." in request_id else "-authorize")
 
 
 # ---- errors ------------------------------------------------------------------------------------
@@ -270,11 +288,15 @@ class PayPalHolds:
             raise PayPalUnavailable(message=f"could not get a PayPal token: {e}") from None
 
     def _request(self, method: str, path: str, body: dict | None = None, rid: str | None = None,
-                 headers: dict | None = None, want_status: bool = False):
+                 headers: dict | None = None, want_status: bool = False, attempts: int | None = None):
+        """One PayPal call, retried on a transient failure (network trouble, 408, 429, 5xx: up to `self.retries` attempts, with a
+        pause that doubles between them) and on a 401 (a fresh token). `attempts=1` sends the request once and never again: a
+        transient failure is raised as it is (`PayPalUnavailable`) for the caller to resume later. The capture uses it (see `capture`)."""
         cp = self._cp
         data = json.dumps(body).encode() if body is not None else None
         last = None
-        for attempt in range(self.retries):
+        tries = max(1, attempts if attempts is not None else self.retries)
+        for attempt in range(tries):
             req = urllib.request.Request(cp.BASE + path, data=data, method=method)
             req.add_header("Authorization", "Bearer " + self._token())
             req.add_header("Accept", "application/json")
@@ -299,7 +321,7 @@ class PayPalHolds:
                 except ValueError:
                     parsed = {}
                 if e.code == 401:
-                    if attempt + 1 < self.retries:
+                    if attempt + 1 < tries:
                         self.client._token = None  # token expired mid-run: fetch a new one
                         continue
                     # not a refusal of this one request: the credentials are wrong, for every buyer alike
@@ -307,14 +329,14 @@ class PayPalHolds:
                                     http=401) from None
                 if e.code in TRANSIENT_HTTP:
                     last = PayPalUnavailable(message=f"PayPal http {e.code}", http=e.code)
-                    if attempt + 1 < self.retries:
+                    if attempt + 1 < tries:
                         time.sleep(2 ** attempt)
                         continue
                     raise last from None
                 raise _error_from(e.code, parsed if isinstance(parsed, dict) else {}) from None
             except (urllib.error.URLError, TimeoutError, OSError) as e:
                 last = PayPalUnavailable(message=f"could not reach PayPal: {getattr(e, 'reason', e)}")
-                if attempt + 1 < self.retries:
+                if attempt + 1 < tries:
                     time.sleep(2 ** attempt)
                     continue
                 raise last from None
@@ -356,7 +378,7 @@ class PayPalHolds:
             if auth is None:
                 try:
                     authorised = self._request("POST", f"/v2/checkout/orders/{order_id}/authorize",
-                                               rid=request_id + "-authorize", headers={"Prefer": "return=representation"},
+                                               rid=card_request_id(request_id), headers={"Prefer": "return=representation"},
                                                body={"payment_source": {"card": card if card is not None else dict(TEST_CARDS[0])}})
                     auth = _authorization_of(authorised)
                 except (PayPalRefused, PayPalUnavailable):
@@ -413,8 +435,12 @@ class PayPalHolds:
         headers = {"Prefer": "return=representation"}
         if simulate_decline:  # sandbox negative testing: this capture is refused, the hold stays open
             headers["PayPal-Mock-Response"] = json.dumps({"mock_application_codes": MOCK_CAPTURE_DECLINE})
+        # ONE attempt, never retried here. The engine reads the hold (nothing captured on it) and then POSTs this capture; whatever a
+        # person captures in between is the one risk no check on our side can close (docs/DECISIONS.md F-16). A client that retried
+        # (3 x 60 s plus backoff) would stretch that window to about three minutes, so the capture gets a single attempt and a
+        # transient failure stops settlement for a resume, which reads the hold again before anything is sent.
         c = self._request("POST", f"/v2/payments/authorizations/{auth_id}/capture", rid=request_id, headers=headers,
-                          body={"amount": {"currency_code": currency, "value": value}, "final_capture": bool(final)})
+                          body={"amount": {"currency_code": currency, "value": value}, "final_capture": bool(final)}, attempts=1)
         return _capture_view(c)
 
     def void(self, auth_id: str, request_id: str) -> dict:
@@ -437,11 +463,10 @@ class PayPalHolds:
         return self.get_capture(caps[0]["id"]) if caps else None
 
     def order_captures(self, order_id: str) -> list[dict]:
-        """EVERY capture PayPal shows on this order (all its purchase units), as capture views, whoever made them. The order is
-        the only place PayPal lists a hold's captures together, so this is how a capture the engine did not make is found."""
-        order = self.get_order(order_id)
-        return [_capture_view(c) for pu in order.get("purchase_units") or [] if isinstance(pu, dict)
-                for c in ((pu.get("payments") or {}).get("captures") or []) if isinstance(c, dict)]
+        """EVERY capture PayPal shows on this order (all its purchase units), as capture views, whoever made them, each with what has
+        been refunded of it (the order's `payments.refunds[]`, summed per capture). The order is the only place PayPal lists a hold's
+        captures and refunds together, so this is how a capture the engine did not make, and what was given back of it, is found."""
+        return _captures_of_order(self.get_order(order_id))
 
 
 def _auth_view(a: dict) -> dict:
@@ -469,18 +494,69 @@ def _parent_auth_id(c: dict) -> str | None:
 
 
 def _capture_view(c: dict) -> dict:
-    """A capture as the engine reads it. `refunded` is what PayPal says has been given back (`total_refunded_amount`, shown on a
-    PARTIALLY_REFUNDED or REFUNDED capture). `request_id` is the PayPal-Request-Id the capture was made with when PayPal says so; the
-    real API does not (the key is simply absent from its answers), a fake may."""
+    """A capture as the engine reads it, from PayPal's JSON for one capture. `refunded` is None here: what has been refunded of a
+    capture is read from the ORDER (`_captures_of_order`, `payments.refunds[]`), not from a field on the capture. PayPal does not say
+    which request made a capture, so neither does the view; the engine decides whose a capture is without it."""
     amt = c.get("amount") or {}
     br = c.get("seller_receivable_breakdown") or {}
     fee = (br.get("paypal_fee") or {}).get("value")
     net = (br.get("net_amount") or {}).get("value")
-    refunded = (br.get("total_refunded_amount") or {}).get("value")
     return {"capture_id": c.get("id"), "status": c.get("status"), "amount": amt.get("value"),
             "currency": amt.get("currency_code"), "fee": fee, "net": net, "final": c.get("final_capture"),
-            "created": c.get("create_time"), "auth_id": _parent_auth_id(c), "refunded": refunded,
-            "request_id": c.get("request_id") if isinstance(c.get("request_id"), str) else None}
+            "created": c.get("create_time"), "auth_id": _parent_auth_id(c), "refunded": None}
+
+
+def _refund_capture_id(r: dict) -> str | None:
+    """The capture a refund was made against, as PayPal's refund object says it: its `up` link points at the capture."""
+    for link in r.get("links") or []:
+        if isinstance(link, dict) and link.get("rel") == "up" and "/captures/" in str(link.get("href", "")):
+            return str(link["href"]).rstrip("/").rsplit("/", 1)[-1]
+    return None
+
+
+def _captures_of_order(order: dict) -> list[dict]:
+    """Every capture on an order (all purchase units) as capture views, each carrying `refunded`: the sum of the COMPLETED refunds
+    the order lists against it (`purchase_units[].payments.refunds[]`, linked to the capture by their `up` link), "0.00" when none
+    is listed. A refund that names no capture, or is not COMPLETED, counts for nothing: money is shown as given back only when
+    PayPal says so."""
+    given: dict[str, Decimal] = {}
+    units = [pu for pu in order.get("purchase_units") or [] if isinstance(pu, dict)]
+    for pu in units:
+        for r in (pu.get("payments") or {}).get("refunds") or []:
+            cid = _refund_capture_id(r) if isinstance(r, dict) else None
+            if cid and r.get("status") == "COMPLETED":
+                try:
+                    given[cid] = given.get(cid, Decimal(0)) + lad.D((r.get("amount") or {})["value"])
+                except (lad.LadderError, TypeError, ValueError, ArithmeticError, KeyError):
+                    pass            # a refund with no readable amount is not counted as money given back
+    views = []
+    for pu in units:
+        for c in (pu.get("payments") or {}).get("captures") or []:
+            if isinstance(c, dict):
+                v = _capture_view(c)
+                v["refunded"] = f"{given.get(v['capture_id'], Decimal(0)):.2f}"
+                views.append(v)
+    return views
+
+
+def takes_money(c: dict) -> bool:
+    """Does this capture still take money from the buyer? Not if PayPal calls it DECLINED, FAILED or REFUNDED, nor if the order says
+    all of it was refunded; a capture whose amount cannot be read is taken to take money (it cannot be shown to be given back)."""
+    left = capture_left(c)
+    return left is None or left > 0
+
+
+def capture_left(c: dict):
+    """How much of a capture is still taken from the buyer: what it took less what the order says was refunded of it; nothing for a
+    capture PayPal calls DECLINED, FAILED or REFUNDED. None if the amount cannot be read (then it cannot be shown to be given back)."""
+    if c.get("status") in ("DECLINED", "FAILED", "REFUNDED"):
+        return lad.ZERO
+    try:
+        amount = lad.D(c["amount"])
+        back = lad.D(c["refunded"]) if c.get("refunded") is not None else lad.ZERO
+    except (lad.LadderError, TypeError, ValueError, ArithmeticError, KeyError):
+        return None
+    return max(lad.ZERO, amount - back)
 
 
 # ---- the fake ----------------------------------------------------------------------------------
@@ -514,7 +590,7 @@ class FakePayPal:
             except (FileNotFoundError, ValueError):
                 st = {}
             for k, v in (("auths", {}), ("captures", {}), ("requests", {}), ("orders", {}), ("order_rids", {}),
-                         ("faults", []), ("decline_next", 0), ("decline_auth_next", 0)):
+                         ("faults", []), ("decline_next", 0), ("decline_auth_next", 0), ("refunds", []), ("void_partial", True)):
                 st.setdefault(k, v)
             try:
                 yield st
@@ -550,6 +626,13 @@ class FakePayPal:
         """The next `times` calls of `op` go through at PayPal, but the answer never arrives (the caller sees a
         transient outage). The worst case for money: PayPal acted and nobody wrote it down."""
         self._arm({"op": op, "kind": "lose_reply"}, match, times)
+
+    def void_partially_captured(self, allowed: bool = True) -> None:
+        """Whether PayPal lets an authorisation that is PARTIALLY_CAPTURED be voided, which releases what was not captured (the
+        default, as PayPal's documentation reads: only a FULLY captured authorisation cannot be voided). With False the void is refused
+        with AUTHORIZATION_ALREADY_CAPTURED, the other thing the sandbox may answer: the sandbox has not been asked (F-17)."""
+        with self._state() as st:
+            st["void_partial"] = bool(allowed)
 
     def expire(self, auth_id: str) -> None:
         """PayPal lets this hold lapse: status EXPIRED, which can be neither captured nor voided."""
@@ -654,7 +737,7 @@ class FakePayPal:
         value = lad.money(amount)
         with self._state() as st:
             if request_id in st["requests"]:
-                return dict(st["requests"][request_id])
+                return self._view(dict(st["requests"][request_id]))
             a = st["auths"].get(auth_id)
             if a is None:
                 raise self._deny(HoldNotFound, "RESOURCE_NOT_FOUND", 404)
@@ -680,26 +763,64 @@ class FakePayPal:
             rec = {"capture_id": cap_id, "status": "COMPLETED", "amount": f"{value:.2f}", "currency": currency,
                    "fee": f"{f:.2f}", "net": f"{value - f:.2f}", "final": bool(final),
                    "created": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"), "auth_id": auth_id,
-                   "refunded": "0.00", "request_id": request_id}      # this fake says which request made a capture; PayPal does not
+                   "request_id": request_id}        # kept here for the fake's own bookkeeping and for tests; NEVER handed to the engine
             st["captures"][cap_id] = rec
             a["status"] = "CAPTURED" if final else "PARTIALLY_CAPTURED"
             a["capture_id"] = cap_id
             resp = dict(rec)
             st["requests"][request_id] = resp
-            return dict(resp)
+            return self._view(resp)
 
     def refund(self, capture_id: str, amount=None) -> dict:
         """A person refunds a capture (test control, not something the engine ever does): in full (the capture shows REFUNDED), or
-        in part (PARTIALLY_REFUNDED, with `refunded` the sum given back). The authorisation stays CAPTURED either way."""
+        in part (PARTIALLY_REFUNDED). The refund is listed on the ORDER, linked to its capture, as PayPal lists it; the capture itself
+        says only its status. The authorisation stays CAPTURED either way. Returns the capture as PayPal's API shows it."""
         with self._state() as st:
             c = st["captures"].get(capture_id)
             if c is None:
                 raise self._deny(HoldNotFound, "RESOURCE_NOT_FOUND", 404)
             total = Decimal(c["amount"])
-            back = total if amount is None else min(total, Decimal(c.get("refunded") or 0) + lad.money(amount))
-            c["refunded"] = f"{back:.2f}"
-            c["status"] = "REFUNDED" if back >= total else "PARTIALLY_REFUNDED"
-            return dict(c)
+            before = sum((Decimal(r["amount"]) for r in st["refunds"] if r["capture_id"] == capture_id and r["status"] == "COMPLETED"),
+                         Decimal(0))
+            give = min(total - before, total if amount is None else lad.money(amount))
+            if give > 0:
+                st["refunds"].append({"id": "FKR" + secrets.token_hex(6).upper(), "capture_id": capture_id,
+                                      "amount": f"{give:.2f}", "currency": c["currency"], "status": "COMPLETED"})
+            c["status"] = "REFUNDED" if before + give >= total else "PARTIALLY_REFUNDED"
+            return self._view(dict(c))
+
+    # -- what the engine is shown: PayPal's JSON shapes, through the same mapping as the real client
+    @staticmethod
+    def _wire_capture(rec: dict, names_parent: bool = True) -> dict:
+        """One capture as PayPal's API writes it (no request id, no refund total: neither is on a real capture). GET capture (and the
+        capture POST's answer) names the parent authorisation (F-14); a capture listed inside an ORDER is not known to (probe list,
+        F-17), so the order's JSON leaves it out and the engine has to cope without."""
+        cur = rec["currency"]
+        money = lambda v: {"currency_code": cur, "value": v}      # noqa: E731
+        out = {"id": rec["capture_id"], "status": rec["status"], "amount": money(rec["amount"]), "final_capture": rec["final"],
+               "seller_receivable_breakdown": {"gross_amount": money(rec["amount"]), "paypal_fee": money(rec["fee"]),
+                                               "net_amount": money(rec["net"])},
+               "create_time": rec["created"],
+               "links": [{"rel": "self", "href": f"https://api.sandbox.paypal.com/v2/payments/captures/{rec['capture_id']}"}]}
+        if names_parent:
+            out["supplementary_data"] = {"related_ids": {"authorization_id": rec["auth_id"]}}
+        return out
+
+    def _view(self, rec: dict) -> dict:
+        return _capture_view(self._wire_capture(rec))
+
+    def _wire_order(self, st: dict, order_id: str) -> dict:
+        """The order as GET /v2/checkout/orders/{id} shows its payments: the captures on its authorisations, and the refunds made of
+        them, each refund linked to its capture."""
+        on_order = {aid for aid, a in st["auths"].items() if a["order_id"] == order_id}
+        caps = [c for c in st["captures"].values() if c.get("auth_id") in on_order]
+        ids = {c["capture_id"] for c in caps}
+        refunds = [{"id": r["id"], "status": r["status"], "amount": {"currency_code": r["currency"], "value": r["amount"]},
+                    "links": [{"rel": "self", "href": f"https://api.sandbox.paypal.com/v2/payments/refunds/{r['id']}"},
+                              {"rel": "up", "href": f"https://api.sandbox.paypal.com/v2/payments/captures/{r['capture_id']}"}]}
+                   for r in st["refunds"] if r["capture_id"] in ids]
+        return {"id": order_id, "purchase_units": [{"payments": {"captures": [self._wire_capture(c, names_parent=False) for c in caps],
+                                                                 "refunds": refunds}}]}
 
     def void(self, auth_id: str, request_id: str) -> dict:
         self._before("void", auth_id)
@@ -716,9 +837,9 @@ class FakePayPal:
                 raise self._deny(AuthorizationVoided, "AUTHORIZATION_VOIDED")
             if a["status"] == "EXPIRED":
                 raise self._deny(AuthorizationExpired, "AUTHORIZATION_EXPIRED")
-            if a["status"] in ("CAPTURED", "PARTIALLY_CAPTURED"):
+            if a["status"] == "CAPTURED" or (a["status"] == "PARTIALLY_CAPTURED" and not st["void_partial"]):
                 raise self._deny(AuthorizationAlreadyCaptured, "AUTHORIZATION_ALREADY_CAPTURED")
-            a["status"] = "VOIDED"
+            a["status"] = "VOIDED"        # (a PARTIALLY_CAPTURED one too, by default: what was captured stays captured, the rest is released)
             return {"auth_id": auth_id, "status": "VOIDED"}
 
     def get(self, auth_id: str) -> dict:
@@ -734,13 +855,13 @@ class FakePayPal:
             c = st["captures"].get(capture_id)
             if c is None:
                 raise self._deny(HoldNotFound, "RESOURCE_NOT_FOUND", 404)
-            return dict(c)
+            return self._view(dict(c))
 
     def recover_capture(self, order_id: str) -> dict | None:
         with self._state() as st:
             for a in st["auths"].values():
                 if a["order_id"] == order_id and a["capture_id"]:
-                    return dict(st["captures"][a["capture_id"]])
+                    return self._view(dict(st["captures"][a["capture_id"]]))
         return None
 
     def recover_join(self, request_id: str, amount, currency: str, label: str, order_id: str | None = None) -> dict:
@@ -763,12 +884,13 @@ class FakePayPal:
             return out
 
     def order_captures(self, order_id: str) -> list[dict]:
-        """Every capture on any authorisation of this order (what GET order shows), made by anyone."""
+        """Every capture on any authorisation of this order (what GET order shows), made by anyone, each with what has been refunded of
+        it: the order's JSON is built as PayPal's is and read by the same function the real client uses."""
         with self._state() as st:
             on_order = {aid for aid, a in st["auths"].items() if a["order_id"] == order_id}
             if not on_order and order_id not in st["orders"]:
                 raise self._deny(HoldNotFound, "RESOURCE_NOT_FOUND", 404)
-            return [dict(c) for c in st["captures"].values() if c.get("auth_id") in on_order]
+            return _captures_of_order(self._wire_order(st, order_id))
 
 
 def mode_of(holds) -> str:

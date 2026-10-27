@@ -138,7 +138,7 @@ def test_1_the_engines_own_lost_capture_is_still_recovered_not_captured_again_wh
     dee = auth_of(engine, d, "buyer-04")
     fake.lose_reply("capture", match=dee)
     assert code(engine.settle, d, expect=tok) == "paypal_unavailable"
-    assert engine.get(d).capturing["buyer-04"]["request_id"] == "crowd-d_s1d-buyer-04-capture"      # the attempt is on record
+    assert engine.get(d).capturing["buyer-04"]["request_id"] == "crowd-d_s1d.buyer-04.capture"      # the attempt is on record
     clock.advance(days=clock_days)
     p = engine.plan(d)
     assert p["holds"] == 1 and not p.get("changed")                      # it still counts: it is ours
@@ -149,9 +149,10 @@ def test_1_the_engines_own_lost_capture_is_still_recovered_not_captured_again_wh
     assert V.verify(d, engine)["ok"]
 
 
-def test_1_a_capture_another_request_made_is_not_ours_even_when_the_engine_had_started_one(engine, fake, store, clock):
-    """The engine's attempt is on record (its capture never reached PayPal: an outage), and somebody captures the final price in the
-    meantime. Where PayPal says which request made a capture (the fake does), it is not the engine's capture request id: taken."""
+def test_1_an_outside_final_capture_at_the_final_price_after_an_attempt_that_never_reached_paypal_is_adopted_not_doubled(engine, fake, store, clock):
+    """Round 5 (7a). This used to be "not ours, because the fake said a different request made it": PayPal does not say which request
+    made a capture (the fake no longer does), so the engine cannot tell this capture from its own lost one. It is adopted
+    (`hold_captured{recovered}`): the buyer is charged ONCE, at the final price, which is exactly what settlement would have taken."""
     d = final_20_drop(engine, drop_id="d_s1e")
     tok = plan_token(engine.plan(d))
     dee = auth_of(engine, d, "buyer-04")
@@ -160,9 +161,12 @@ def test_1_a_capture_another_request_made_is_not_ours_even_when_the_engine_had_s
     assert "buyer-04" in engine.get(d).capturing
     fake.capture(dee, D("20.00"), "maker-final-2", final=True)
     p = engine.plan(d)
-    assert [(c["buyer"], c["verdict"]) for c in p["changed"]] == [("buyer-04", "taken")]
-    Engine(store, fake, clock).settle(d, expect=plan_token(p))
-    assert len(captures_on(fake, dee)) == 1 and "buyer-04" not in [e["buyer"] for e in evs(engine, d, "hold_captured")]
+    assert p["holds"] == 1 and not p.get("changed")                                   # it still counts: the engine takes it as its own
+    spy = CallSpy(fake)
+    out = Engine(store, spy, clock).settle(d, expect=plan_token(p))
+    assert ("capture", dee) not in spy.calls and len(captures_on(fake, dee)) == 1     # and nothing is POSTed on top of it
+    assert out["counts"]["captured"] == 4 and evs(engine, d, "hold_captured")[-1]["recovered"] is True
+    assert V.verify(d, engine)["ok"]
 
 
 def test_1_could_be_ours_says_yes_only_to_one_final_completed_capture_at_the_final_price_that_the_engine_tried_to_make(engine, fake):
@@ -180,8 +184,7 @@ def test_1_could_be_ours_says_yes_only_to_one_final_completed_capture_at_the_fin
     assert ours(caps=[]) is False and ours(caps=[{**mine, "amount": "19.99"}]) is False            # none, or not the final price
     assert ours(caps=[{**mine, "currency": "EUR"}]) is False and ours(caps=[{**mine, "status": "PENDING"}]) is True
     assert ours(caps=[{**mine, "final": False}]) is False                                           # said not to be a final capture
-    assert ours(caps=[{**mine, "request_id": "somebody-else"}]) is False                            # PayPal says another request made it
-    assert ours(caps=[{**mine, "request_id": None}]) is True                                        # PayPal does not say (the real API): fine
+    assert "request_id" not in mine                                                                 # PayPal does not say which request made a capture
     assert engine._could_be_ours(drop, b, "CAPTURED", None, []) is True                             # cannot list captures: recovery decides
     other = engine.get(d).buyers["buyer-01"]                                                        # no attempt on record for this hold
     assert engine._could_be_ours(drop, other, "CAPTURED", [mine], [mine]) is False
@@ -190,9 +193,11 @@ def test_1_could_be_ours_says_yes_only_to_one_final_completed_capture_at_the_fin
     assert engine._could_be_ours(missed, b, "CAPTURED", [mine], [mine]) is False                    # a missed minimum captures nothing
 
 
-def test_1_a_capture_that_lands_between_the_read_and_the_post_is_looked_at_again_not_adopted(engine, fake, store, clock):
-    """PayPal answers the engine's capture with ALREADY_CAPTURED (a final capture by somebody else slipped in after the read): the
-    hold is looked at again and, being no capture of the engine's, leaves the crowd."""
+def test_1_a_capture_that_lands_between_the_read_and_the_post_is_looked_at_again_and_the_one_final_capture_is_the_hold_s(engine, fake, store, clock):
+    """PayPal answers the engine's capture with ALREADY_CAPTURED (a FINAL capture of exactly the final price slipped in after the read):
+    the hold is looked at again. With the attempt on record, one final capture at the final price is all the engine can tell from its
+    own (PayPal does not say which request made it): the buyer is charged once, at the final price, and it is recorded as the engine's.
+    (A capture that is not that, a partial or another amount, still leaves the crowd: test_1_an_outside_partial_capture_*.)"""
     d = final_20_drop(engine, drop_id="d_s1g")
     tok = plan_token(engine.plan(d))
     dee = auth_of(engine, d, "buyer-04")
@@ -204,14 +209,14 @@ def test_1_a_capture_that_lands_between_the_read_and_the_post_is_looked_at_again
             return self.inner.capture(auth_id, *a, **k)
 
     out = Engine(store, Slips(fake), clock).settle(d, expect=tok)
-    assert len(captures_on(fake, dee)) == 1 and captures_on(fake, dee)[0]["request_id"] == "maker-slipped-in"
-    assert out["counts"]["captured"] == 3 and buyers_with(engine, d, "voided") == ["buyer-04"]
+    assert len(captures_on(fake, dee)) == 1 and captures_on(fake, dee)[0]["request_id"] == "maker-slipped-in"     # (the fake's own record)
+    assert out["counts"]["captured"] == 4 and evs(engine, d, "hold_captured")[-1]["recovered"] is True
 
 
 def test_1_the_fake_enforces_paypals_capture_cap_and_a_partial_capture_leaves_the_hold_partially_captured(fake):
     h = fake.authorize(D("40"), "USD", "d:x", "r-auth")
     a = h["auth_id"]
-    assert fake.capture(a, D("20"), "c1", final=False)["request_id"] == "c1"
+    assert "request_id" not in fake.capture(a, D("20"), "c1", final=False)             # PayPal does not say which request made a capture
     assert pp_status(fake, a) == "PARTIALLY_CAPTURED"
     fake.capture(a, D("20"), "c2", final=False)                                      # 40 in all: the whole hold, still not final
     assert pp_status(fake, a) == "PARTIALLY_CAPTURED"
@@ -225,7 +230,8 @@ def test_1_the_fake_enforces_paypals_capture_cap_and_a_partial_capture_leaves_th
     assert pp_status(fake, h2["auth_id"]) == "CAPTURED"
     with pytest.raises(P.AuthorizationAlreadyCaptured):
         fake.capture(h2["auth_id"], D("1"), "c7")
-    assert fake.get_capture(captures_on(fake, a)[0]["capture_id"])["request_id"] == "c1"
+    assert "request_id" not in fake.get_capture(captures_on(fake, a)[0]["capture_id"])
+    assert captures_on(fake, a)[0]["request_id"] == "c1"                              # (the fake's own bookkeeping, not what it answers)
 
 
 # ===== 2. `drop exclude` took a throwaway approver's yes outside test mode (s2) ==============================================
@@ -796,8 +802,9 @@ def test_8_a_stray_the_engine_did_not_name_is_still_reported_with_what_is_left_o
     engine.settle(drop, expect=plan_token(engine.plan(drop)))
     lead = engine.get(drop).buyers["buyer-01"]
     edit_fake(fake, lambda s: s["captures"].update({"FKCSTRAY": {
-        "capture_id": "FKCSTRAY", "status": "PARTIALLY_REFUNDED", "amount": "10.00", "currency": "USD", "fee": "0.00", "net": "0.00",
-        "final": False, "created": "2026-11-01T12:00:00Z", "auth_id": lead.auth_id, "refunded": "4.00"}}))
+        "capture_id": "FKCSTRAY", "status": "COMPLETED", "amount": "10.00", "currency": "USD", "fee": "0.00", "net": "0.00",
+        "final": False, "created": "2026-11-01T12:00:00Z", "auth_id": lead.auth_id, "request_id": "stray-1"}}))
+    fake.refund("FKCSTRAY", D("4.00"))                      # the order lists a 4.00 refund against it (PARTIALLY_REFUNDED)
     v = V.verify(drop, engine)
     assert not v["ok"] and any("FKCSTRAY" in p and "6.00 of it still taken" in p for p in v["problems"])
     assert any("charged 46.00 in total" in p for p in v["problems"])        # 40.00 captured + the 6.00 still taken (not 50.00: the refund counts)
@@ -819,11 +826,22 @@ def test_8_a_stray_already_refunded_when_the_engine_first_sees_it_is_named_and_c
     assert V.verify(drop, engine)["ok"]
 
 
-def test_8_the_real_clients_capture_view_reads_total_refunded_amount():
-    view = P._capture_view({"id": "C1", "status": "PARTIALLY_REFUNDED", "amount": {"value": "40.00", "currency_code": "USD"},
-                            "seller_receivable_breakdown": {"total_refunded_amount": {"value": "15.00", "currency_code": "USD"}}})
-    assert view["refunded"] == "15.00" and view["request_id"] is None and view["status"] == "PARTIALLY_REFUNDED"
-    assert V._remaining(view) == D("25.00") and V._remaining({**view, "status": "REFUNDED"}) == D("40.00")   # (REFUNDED is cleared by the caller)
+def test_8_the_real_client_reads_what_was_refunded_from_the_order_not_from_the_capture():
+    """Round 5 (7b): the refund total is not a field of a capture (it is on a REFUND's breakdown); an order lists its refunds, each
+    linked to its capture, and that is where the client reads them. The capture alone says only REFUNDED or PARTIALLY_REFUNDED."""
+    cap = {"id": "C1", "status": "PARTIALLY_REFUNDED", "amount": {"value": "40.00", "currency_code": "USD"}}
+    view = P._capture_view(cap)
+    assert view["refunded"] is None and view["status"] == "PARTIALLY_REFUNDED" and "request_id" not in view
+    assert V._remaining(view) == D("40.00")                          # nothing says how much: all of it is still taken, never less
+    order = {"id": "O1", "purchase_units": [{"payments": {"captures": [cap, {**cap, "id": "C2", "status": "COMPLETED"}], "refunds": [
+        {"id": "R1", "status": "COMPLETED", "amount": {"value": "15.00", "currency_code": "USD"},
+         "links": [{"rel": "self", "href": "https://x/v2/payments/refunds/R1"}, {"rel": "up", "href": "https://x/v2/payments/captures/C1"}]},
+        {"id": "R2", "status": "PENDING", "amount": {"value": "5.00", "currency_code": "USD"},
+         "links": [{"rel": "up", "href": "https://x/v2/payments/captures/C1"}]},
+        {"id": "R3", "status": "COMPLETED", "amount": {"value": "9.00", "currency_code": "USD"}}]}}]}
+    c1, c2 = P._captures_of_order(order)
+    assert (c1["capture_id"], c1["refunded"], c2["capture_id"], c2["refunded"]) == ("C1", "15.00", "C2", "0.00")   # pending and unlinked count for nothing
+    assert V._remaining(c1) == D("25.00") and V._remaining({**c1, "status": "REFUNDED"}) == D("0.00")
 
 
 # ===== 9. the lock must cover the code behind every money command ===========================================================

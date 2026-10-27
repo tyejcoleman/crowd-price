@@ -24,11 +24,12 @@ Every error has a `next` command: run it. Common ones:
   alike. Nothing more was captured or released. A person (the maker) must look; do not retry in a loop. See `settle`.
 - `wrong_paypal`: this drop belongs to a different PayPal (the real sandbox versus the fake, or another app) than this session uses. Nothing was changed. Use the PayPal it was made with (`CROWD_PAYPAL`); never copy its drop into another store.
 - `hold_unreadable`: PayPal will not describe one buyer's hold (an account or permission problem), so the drop was not closed or planned. Tell the maker the buyer, the hold id and the issue name; they either void the hold at PayPal or run `drop exclude`. Do not run `drop exclude` yourself.
-- `drop_unbound`: this drop was written before drops recorded their PayPal, so nothing touches PayPal for it. Run `drop holds --drop D` to show the maker its holds as this PayPal reads them. If they all exist, a person approves `drop bind --drop D --expect <token>` (never you); if one is `NOT_FOUND`, this is the wrong PayPal: do not bind. `bind_mismatch` / `bind_changed` / `already_bound` mean nothing was written.
+- `drop_unbound`: this drop was written before drops recorded their PayPal (or which sandbox app), so nothing touches PayPal for it. Run `drop holds --drop D` to show the maker its holds as this PayPal reads them. If they all exist, a person approves `drop bind --drop D --expect <token>` (never you); if one is `NOT_FOUND`, this is the wrong PayPal: do not bind. `bind_mismatch` / `bind_changed` / `already_bound` mean nothing was written.
+- `charged_before_leave`: that buyer asked to leave in time, but settlement had already captured their hold. The request is on record and the buyer should not be charged. Tell the maker which capture to refund (the error and `drop verify` name it); do not say the leave worked.
 - `leave_pending`: PayPal would not release a leaving buyer's hold just now. The leave is on record and is completed when the drop closes; that buyer is not charged.
 - `buyer_excluded` / `already_excluded` / `cannot_exclude`: a person took that buyer out of the drop.
 - `hold_not_open`: that buyer's earlier hold had already been voided or had lapsed at PayPal, so it was not counted. Join again.
-- `earlier_attempt_unresolved`: a buyer's earlier try left a hold that could not be released, so no new hold was placed. Ask a person.
+- `earlier_attempt_unresolved`: a buyer's earlier try left a hold that could not be released or looked at, so no new hold was placed this time (asking again goes on). Tell the maker the order and hold to check in the PayPal sandbox.
 - `test_approval_outside_test_mode`: the approval came from a throwaway test approver; real PayPal needs a person's own.
 - `drop_busy`: another process is settling this drop. Wait, then `drop status`.
 - Exit 2 (`refused`) means a guard said no; do not retry the same call. Exit 3 means ask a person to approve.

@@ -13,8 +13,8 @@ from __future__ import annotations
 from datetime import timedelta, timezone
 
 from . import ladder as lad
-from .engine import NO_MONEY_CAPTURE, CrowdError, Engine, default_engine, m
-from .paypal_holds import HoldError, HoldNotFound, mode_of
+from .engine import CrowdError, Engine, default_engine, m
+from .paypal_holds import HoldError, HoldNotFound, capture_left, mode_of, takes_money
 from .store import parse_iso
 
 TIEOUT_MARGIN = timedelta(seconds=30)
@@ -22,6 +22,9 @@ TIEOUT_MARGIN = timedelta(seconds=30)
 
 CAPTURED = ("CAPTURED", "PARTIALLY_CAPTURED")
 GONE = ("VOIDED", "EXPIRED", "DENIED")   # PayPal statuses in which a hold no longer holds money (DENIED: never granted)
+# The only authorisation statuses in which a hold with money taken from it (outside the engine) is finished with: nothing more can be
+# captured on it. PARTIALLY_CAPTURED (and anything open) means the rest of the hold is still authorised on the buyer's card.
+SETTLED_AFTER_TAKEN = ("VOIDED", "CAPTURED", "EXPIRED")
 
 
 def with_next(problem: str, next_step: str | None) -> str:
@@ -36,16 +39,21 @@ def _scan(events: list[dict]) -> dict:
     released: set = set()       # orphan authorisations the log says were released: PayPal must say so too
     stuck: set = set()          # orphan authorisations the engine could not release: PayPal must show them gone
     orders: dict = {}           # every PayPal order the log knows of -> who it was for
+    unreadable: dict = {}       # earlier orders of a join intent PayPal would not describe -> the `order_unreadable` payload
     for e in events:
         t, p = e["type"], e["payload"]
         if p.get("order_id"):
             orders.setdefault(p["order_id"], p.get("buyer"))
+        if t == "order_unreadable" and p.get("order_id"):
+            unreadable.setdefault(p["order_id"], p)
         if t == "hold_placed":
             h = {"buyer": p["buyer"], "auth_id": p["auth_id"], "amount": lad.D(p["amount"]), "end": None,
                  "capture_id": None, "engine_amount": None, "engine_fee": None, "mode": p.get("paypal_mode"),
                  "expires": p.get("expires"), "failed": None, "void_failed": None, "released": False,
                  "released_reason": None, "voided_expired": False, "voided_status": None, "released_by_void": False,
-                 "taken": False, "order_id": p.get("order_id"), "taken_captures": []}
+                 "taken": False, "order_id": p.get("order_id"), "taken_captures": [],
+                 "leave_after_capture": False,       # a leave asked in time reached the hold after settlement had captured it
+                 "remainder_open": None}             # the `remainder_open` payload: PayPal would not release what was left of it
             holds.append(h)
             by_auth[p["auth_id"]] = h
             known.add(p["auth_id"])
@@ -66,8 +74,15 @@ def _scan(events: list[dict]) -> dict:
                 h["taken"] = bool(p.get("taken_outside_engine"))
                 h["taken_captures"] = list(p.get("capture_ids") or [])
         elif t == "failed_hold_released" and p.get("auth_id") in by_auth:
-            by_auth[p["auth_id"]]["released"] = True
-            by_auth[p["auth_id"]]["released_reason"] = p.get("reason")
+            h = by_auth[p["auth_id"]]
+            h["released"] = True
+            h["released_reason"] = p.get("reason")
+            if p.get("reason") == "taken_outside_engine":      # the capture failed, and then somebody else captured the hold
+                h["taken"], h["taken_captures"] = True, list(p.get("capture_ids") or [])
+        elif t == "leave_failed" and p.get("reason") == "captured_before_leave" and p.get("auth_id") in by_auth:
+            by_auth[p["auth_id"]]["leave_after_capture"] = True
+        elif t == "remainder_open" and p.get("auth_id") in by_auth:
+            by_auth[p["auth_id"]]["remainder_open"] = p
         elif t == "void_failed" and p.get("orphan") and p.get("auth_id"):
             known.add(p["auth_id"])
             stuck.add(p["auth_id"])
@@ -76,7 +91,7 @@ def _scan(events: list[dict]) -> dict:
             h["void_failed"] = p
             if h["end"] is None:
                 h["end"] = "void_failed"
-    return {"holds": holds, "known": known, "orders": orders, "released": released, "stuck": stuck}
+    return {"holds": holds, "known": known, "orders": orders, "released": released, "stuck": stuck, "unreadable": unreadable}
 
 
 def _holds(events: list[dict]) -> list[dict]:
@@ -146,6 +161,8 @@ def _capture_audit(eng: Engine, scan: dict, d, final) -> list[dict]:
         except HoldNotFound:
             caps = []
         except HoldError as e:
+            if oid in scan["unreadable"]:       # reported once, by the order check, with the way out
+                continue
             out.append({"problem": f"could not read the captures on order {oid} from PayPal ({e.code}), so a capture the engine "
                                    f"did not make cannot be ruled out",
                         "next": f"run verify again when PayPal answers; if it keeps failing, open order {oid} in the PayPal "
@@ -153,7 +170,7 @@ def _capture_audit(eng: Engine, scan: dict, d, final) -> list[dict]:
             continue
         total = lad.ZERO
         for c in caps:
-            if c.get("status") in NO_MONEY_CAPTURE:
+            if not takes_money(c):
                 continue
             cid, amount = c.get("capture_id"), lad.D(c["amount"]) if c.get("amount") is not None else None
             left = _remaining(c) if amount is not None else None      # a partly refunded capture still takes what is left
@@ -162,11 +179,11 @@ def _capture_audit(eng: Engine, scan: dict, d, final) -> list[dict]:
                                        f"drop is in {d.currency}",
                             "next": f"open capture {cid} in the PayPal sandbox and work out which currency is right, {again}"})
             if cid not in recorded:
-                partly = c.get("status") == "PARTIALLY_REFUNDED"
+                partly = amount is not None and left is not None and left < amount        # some of it has been given back
                 out.append({"problem": f"PayPal shows capture {cid} ({m(amount) if amount is not None else '?'} {c.get('currency')}, "
-                                       f"{c.get('status')}{', ' + m(left) + ' of it still taken' if partly and left is not None else ''}) "
+                                       f"{c.get('status')}{', ' + m(left) + ' of it still taken' if partly else ''}) "
                                        f"on order {oid} that the engine did not record: money was taken from a buyer outside the engine",
-                            "next": (f"refund the remaining {m(left)} of capture {cid}" if partly and left is not None else
+                            "next": (f"refund the remaining {m(left)} of capture {cid}" if partly else
                                      f"refund capture {cid}") + f" in the PayPal sandbox (it was taken from the buyer's hold outside "
                                                                   f"the engine), {again}"})
             total += left or lad.ZERO
@@ -223,7 +240,18 @@ def verify(drop: str, engine: Engine | None = None, verbose: bool = True) -> dic
                 f"run `{_settle_cmd(d.id)}` and have a person approve the plan, so the hold gets an outcome")
             continue
         try:
-            auth = eng.holds.get(h["auth_id"])
+            try:
+                auth = eng.holds.get(h["auth_id"])
+            except HoldNotFound:
+                if h["voided_status"] != "NOT_FOUND":
+                    raise
+                # The engine recorded PayPal answering 404 for this authorisation ("nothing is held"), and PayPal, asked once more now,
+                # answers 404 again: the same answer, not an outage. Resolved, with a note; only an answer that is NOT a 404 (below) can
+                # make it a problem. (Reporting "could not read it, run again when PayPal answers" for ever was the old behaviour.)
+                row["paypal"], row["note"] = "NOT_FOUND", (
+                    "PayPal has no record of this authorisation (404), as it said when the engine recorded the hold as not found; "
+                    "asked again just now, it says so again")
+                continue
             row["paypal"] = auth["status"]
             status = auth["status"]
             held = lad.D(auth["amount"]) if auth.get("amount") is not None else None
@@ -240,9 +268,12 @@ def verify(drop: str, engine: Engine | None = None, verbose: bool = True) -> dic
                 amount, cfee = lad.D(cap["amount"]), lad.D(cap["fee"] or "0")
                 cap_hand = (f"open capture {h['capture_id']} in the PayPal sandbox, work out which of PayPal and the engine is "
                             f"right (refund it if it should not have been taken), then run {_verify_cmd(d.id)} again")
+                # a buyer who asked to leave in time and was captured anyway: the capture is theirs to get back, and it is the one case in
+                # which a capture the engine made is allowed to read REFUNDED (or part refunded) without being a mismatch
+                refundable = h["leave_after_capture"] and cap["status"] in ("REFUNDED", "PARTIALLY_REFUNDED")
                 if status != "CAPTURED":
                     bad(f"engine says captured but PayPal says the hold is {status}", cap_hand)
-                elif cap["status"] not in ("COMPLETED", "PENDING"):
+                elif cap["status"] not in ("COMPLETED", "PENDING") and not refundable:
                     bad(f"PayPal says the capture is {cap['status']}", cap_hand)
                 elif cap.get("currency") != d.currency:
                     bad(f"PayPal captured in {cap.get('currency') or 'an unstated currency'} but the drop is in {d.currency}",
@@ -264,30 +295,33 @@ def verify(drop: str, engine: Engine | None = None, verbose: bool = True) -> dic
                         parent_unknown += 1
                     gross, fees, net = gross + amount, fees + cfee, net + lad.D(cap["net"] or (amount - cfee))
                     row["amount"], row["fee"] = m(amount), m(cfee)
+                    if h["leave_after_capture"]:
+                        cap = _capture_now(eng, h["order_id"], h["capture_id"])      # (what was refunded of it is on the order)
+                        left = capture_left(cap)
+                        if left is None or left > 0:
+                            part = f" ({m(left)} of it is still taken)" if cap["status"] == "PARTIALLY_REFUNDED" and left is not None else ""
+                            bad(f"{h['buyer']} asked to leave before the drop ended or closed, but settlement had already captured "
+                                f"{m(amount)} from their hold, so they were charged and should not have been: capture "
+                                f"{h['capture_id']}{part} has not been given back in full",
+                                f"refund {'the remaining ' + m(left) + ' of ' if part else ''}capture {h['capture_id']} in the PayPal "
+                                f"sandbox, then run {_verify_cmd(d.id)} again")
+                        else:
+                            row["refunded"] = [h["capture_id"]]
             elif h["end"] == "voided":
                 if h["taken"] or status in CAPTURED:
-                    owed = _still_taken(eng, h)       # None: cannot be shown refunded; else [(capture, status, amount still taken)]
-                    if owed == []:                    # every stray capture the engine named has been refunded in full: cleared
-                        row["refunded"] = list(h["taken_captures"])
-                    elif owed:
-                        parts = [f"{cid} ({cs}: {m(left)} of it is still taken)" if cs == "PARTIALLY_REFUNDED" else f"{cid} ({cs})"
-                                 for cid, cs, left in owed]
-                        bad(f"engine says voided but PayPal says the hold is {status}: money taken from the buyer outside the "
-                            f"engine has not been given back in full: capture {', '.join(parts)}",
-                            "refund " + "; ".join(
-                                f"the remaining {m(left)} of capture {cid}" if cs == "PARTIALLY_REFUNDED" else f"capture {cid}"
-                                for cid, cs, left in owed) + f" in the PayPal sandbox (taken from authorisation {h['auth_id']} "
-                                f"outside the engine), then run {_verify_cmd(d.id)} again")
-                    else:
-                        caps = ", ".join(h["taken_captures"])
-                        bad(f"engine says voided but PayPal says the hold is {status}: money was taken from the buyer outside "
-                            f"the engine", (f"refund capture {caps} in the PayPal sandbox (it was taken from authorisation "
-                                            f"{h['auth_id']} outside the engine)" if caps else
-                                            f"open authorisation {h['auth_id']} in the PayPal sandbox, find the capture on it, and "
-                                            f"refund it") + f" if the buyer should not have been charged; then run {_verify_cmd(d.id)} again")
+                    _taken_hold(eng, d, h, status, row, bad)
                 elif h["released_by_void"]:
                     if status != "VOIDED":
                         bad(f"engine says it voided this hold but PayPal says it is {status}")
+                elif h["voided_status"] == "NOT_FOUND":     # PayPal said it has no such authorisation: that is a 404, not a hold
+                    if status in GONE:
+                        row["note"] = ("PayPal had no record of this authorisation when the engine recorded the hold as not found; "
+                                       f"asked again just now it shows it {status}, so nothing is held")
+                    else:
+                        bad(f"the engine recorded PayPal saying it had no such authorisation, but PayPal now shows it {status}: "
+                            f"the hold is open on the buyer's card",
+                            f"void authorisation {h['auth_id']} in the PayPal sandbox by hand (or let it lapse"
+                            + (f" on {h['expires']}" if h.get("expires") else "") + f"), then run {_verify_cmd(d.id)} again")
                 elif h["voided_status"]:     # recorded from what PayPal itself said: it must still say it
                     if status != h["voided_status"]:
                         bad(f"engine recorded PayPal saying {h['voided_status']} but PayPal now says {status}")
@@ -307,6 +341,8 @@ def verify(drop: str, engine: Engine | None = None, verbose: bool = True) -> dic
                         "from PayPal): it cannot be told apart from a guess"
                         + (" (an expiry judged by the engine's own clock is not evidence)" if fp.get("code") == "hold_expired"
                            else ""))
+                elif h["taken"]:        # the capture failed, and then somebody else captured the hold: the engine never charged it
+                    _taken_hold(eng, d, h, status, row, bad)
                 elif status in CAPTURED:
                     bad(f"engine says the capture failed but PayPal says the hold is {status}")
                 elif fp.get("code") == "hold_expired" and status not in GONE:
@@ -421,27 +457,81 @@ def verify(drop: str, engine: Engine | None = None, verbose: bool = True) -> dic
 
 
 def _remaining(c: dict):
-    """How much of a capture is still taken from the buyer: all of it, less what PayPal says has been refunded."""
-    amount = lad.D(c["amount"]) if c.get("amount") is not None else lad.ZERO
-    if c.get("status") == "PARTIALLY_REFUNDED":
-        return max(lad.ZERO, amount - (lad.D(c["refunded"]) if c.get("refunded") is not None else lad.ZERO))
-    return amount
+    """How much of a capture is still taken from the buyer: all of it, less what the ORDER says has been refunded of it (the capture's
+    own status says only whether it was refunded in full or in part, not how much)."""
+    left = capture_left(c)
+    return lad.ZERO if left is None else left
+
+
+def _capture_now(eng: Engine, order_id: str | None, capture_id: str) -> dict:
+    """A capture as PayPal shows it right now. Its refunds are listed on the ORDER, so when the client can list an order's captures
+    that is where it is read (the capture, with what has been refunded of it); a capture the order does not list, or a client that cannot
+    list, is read on its own, and then nothing says how much of it has been refunded beyond its status."""
+    listing = getattr(eng.holds, "order_captures", None)
+    if listing is not None and order_id:
+        try:
+            for c in listing(order_id):
+                if c.get("capture_id") == capture_id:
+                    return c
+        except HoldNotFound:
+            pass
+    return eng.holds.get_capture(capture_id)
 
 
 def _still_taken(eng: Engine, h: dict):
-    """Each capture the engine named as taken outside it (`taken_captures`), read back from PayPal: a REFUNDED one (and one that was
-    DECLINED or FAILED, which never took anything) is cleared; a PARTIALLY_REFUNDED one still has the rest taken; any other is
-    taken in full. Returns [] when every one is cleared, a list of (capture, status, amount still taken) when not, and None when the
-    engine named none (so nothing can be shown as given back). A read PayPal refuses is the caller's `could not read` problem."""
+    """Each capture the engine named as taken outside it (`taken_captures`), read back from PayPal (from the hold's order, which lists
+    what was refunded of it): a capture that is REFUNDED in full (or that was DECLINED or FAILED, which never took anything) is cleared;
+    a part-refunded one still has the rest taken; any other is taken in full. Returns [] when every one is cleared, a list of (capture,
+    status, amount still taken) when not, and None when the engine named none (so nothing can be shown as given back). A read PayPal
+    refuses is the caller's `could not read` problem."""
     if not h["taken_captures"]:
         return None
     owed = []
     for cid in h["taken_captures"]:
-        cap = eng.holds.get_capture(cid)
-        if cap.get("status") in NO_MONEY_CAPTURE:
+        cap = _capture_now(eng, h.get("order_id"), cid)
+        if not takes_money(cap):
             continue
         owed.append((cid, cap.get("status"), _remaining(cap)))
     return owed
+
+
+def _taken_hold(eng: Engine, d, h: dict, status: str, row: dict, bad) -> None:
+    """A hold somebody else took money from (the engine never charged it): it passes only when EVERY capture the engine named has been
+    refunded in full AND the authorisation can take nothing more, which is when PayPal shows it VOIDED, CAPTURED (in full) or EXPIRED.
+    A hold PayPal still shows PARTIALLY_CAPTURED (or open) has its rest authorised on the buyer's card: refunding the capture does not
+    release that, and anyone could capture it later. The status is read afresh here, after any refund a person has made."""
+    owed = _still_taken(eng, h)       # None: cannot be shown refunded; else [(capture, status, amount still taken)]
+    what = "voided" if h["end"] == "voided" else "the capture failed"
+    again = f"then run {_verify_cmd(d.id)} again"
+    rest, rest_step = "", ""
+    if status not in SETTLED_AFTER_TAKEN:
+        why = h.get("remainder_open") or {}
+        refused = (f"; PayPal refused to release it ({why.get('issue') or why.get('code')}"
+                   f"{', debug id ' + why['debug_id'] if why.get('debug_id') else ''})") if why else ""
+        rest = (f"the authorisation is still {status}, so the rest of the buyer's hold is still authorised on their card and could be "
+                f"captured later{refused}")
+        rest_step = (f"void authorisation {h['auth_id']} in the PayPal sandbox so nothing more can be taken from it (or let it lapse"
+                     f"{' on ' + h['expires'] if h.get('expires') else ''})")
+    if owed == []:                    # every stray capture the engine named has been refunded in full
+        if rest:
+            bad(f"the money taken from the buyer outside the engine has been refunded, but {rest}", f"{rest_step}, {again}")
+        else:
+            row["refunded"] = list(h["taken_captures"])
+    elif owed:
+        parts = [f"{cid} ({cs}: {m(left)} of it is still taken)" if cs == "PARTIALLY_REFUNDED" else f"{cid} ({cs})"
+                 for cid, cs, left in owed]
+        steps = ["refund " + "; ".join(f"the remaining {m(left)} of capture {cid}" if cs == "PARTIALLY_REFUNDED" else f"capture {cid}"
+                                       for cid, cs, left in owed) + f" in the PayPal sandbox (taken from authorisation {h['auth_id']} "
+                 f"outside the engine)"] + ([rest_step] if rest else [])
+        bad(f"engine says {what} but PayPal says the hold is {status}: money taken from the buyer outside the engine has not been "
+            f"given back in full: capture {', '.join(parts)}" + (f"; also {rest}" if rest else ""), "; ".join(steps) + f", {again}")
+    else:
+        caps = ", ".join(h["taken_captures"])
+        step = (f"refund capture {caps} in the PayPal sandbox (it was taken from authorisation {h['auth_id']} outside the engine)"
+                if caps else f"open authorisation {h['auth_id']} in the PayPal sandbox, find the capture on it, and refund it")
+        bad(f"engine says {what} but PayPal says the hold is {status}: money was taken from the buyer outside the engine"
+            + (f"; also {rest}" if rest else ""),
+            step + " if the buyer should not have been charged" + (f"; {rest_step}" if rest else "") + f"; {again}")
 
 
 def _unreleased(h: dict, status: str, drop: str = "") -> str:
@@ -466,38 +556,66 @@ def _strays(eng: Engine, scan: dict, drop: str = "") -> list[dict]:
     listing = getattr(eng.holds, "order_captures", None)
     recorded = {h["capture_id"] for h in scan["holds"] if h["capture_id"]}
 
+    def stray_captures(aid: str, oid: str):
+        """Every capture on this authorisation's order that the engine did not make (PayPal's order listing may not say whose, so one
+        that names no parent counts), or None if the order cannot be listed."""
+        try:
+            return [c for c in (listing(oid) if listing else []) if c.get("capture_id") not in recorded
+                    and c.get("auth_id") in (None, aid)]
+        except HoldError:
+            return None
+
+    def finished(aid: str, oid: str, st: str) -> bool:
+        """Is this authorisation one that holds nothing and can take nothing more? Gone (VOIDED, EXPIRED, DENIED) is; so is a CAPTURED
+        one (final: nothing more can be captured) once every capture on it has been given back in full, shown by the order. A
+        PARTIALLY_CAPTURED one never is: the rest of the hold is still authorised until it is voided or lapses."""
+        if st in GONE:
+            return True
+        if st != "CAPTURED":
+            return False
+        caps = stray_captures(aid, oid)
+        return bool(caps) and not any(takes_money(c) for c in caps)
+
     def refund_or_void(aid: str, oid: str, st: str) -> str:
         if st not in CAPTURED:
             return f"open authorisation {aid} in the PayPal sandbox and void it by hand, {again}"
-        try:       # the captures on this authorisation that the engine did not make (PayPal's order listing may not say whose)
-            ids = [c["capture_id"] for c in (listing(oid) if listing else [])
-                   if c.get("status") not in NO_MONEY_CAPTURE and c.get("capture_id") not in recorded
-                   and c.get("auth_id") in (None, aid)]
-        except HoldError:
-            ids = []
+        caps = stray_captures(aid, oid)
+        ids = [c["capture_id"] for c in caps or [] if takes_money(c)]
+        rest = (f"; it is only PARTIALLY_CAPTURED, so also void authorisation {aid} (or let it lapse) to release the rest of the hold"
+                if st == "PARTIALLY_CAPTURED" else "")
         return (f"refund capture {', '.join(ids)} in the PayPal sandbox (authorisation {aid} was captured, so there is no hold left "
-                f"to void), {again}" if ids else
+                f"to void){rest}, {again}" if ids else
                 f"open authorisation {aid} in the PayPal sandbox, find the capture on it and refund it (it was captured, so there "
-                f"is no hold left to void), {again}")
+                f"is no hold left to void){rest}, {again}")
 
     for oid in sorted(scan["orders"]):
         try:
             auths = eng.holds.order_authorizations(oid)
+        except HoldNotFound:
+            auths = []            # PayPal ANSWERED: it has no such order, so no authorisation on it (a 404 is not an outage)
         except HoldError as e:
+            if oid in scan["unreadable"]:
+                u = scan["unreadable"][oid]
+                out.append({"problem": f"order {oid} (an earlier try of {u.get('buyer') or 'a buyer'}'s join) could not be read from "
+                                       f"PayPal when the engine cleaned up the join ({u.get('issue') or u.get('code')}) and still cannot "
+                                       f"({e.code}), so a hold on it cannot be ruled out",
+                            "next": f"check order {oid} at PayPal (open it in the sandbox dashboard); void its hold if one exists; "
+                                    f"{again}"})
+                continue
             out.append({"problem": f"could not read order {oid} from PayPal ({e.code}), so a hold on it cannot be ruled out",
                         "next": f"run verify again when PayPal answers; if it keeps failing, open order {oid} in the PayPal "
                                 f"sandbox and check its authorisations"})
             continue
         for a in auths:
             aid, st = a["auth_id"], a["status"]
-            if aid in scan["stuck"] and st not in GONE:
+            if aid in scan["stuck"] and not finished(aid, oid, st):
                 out.append({"problem": f"PayPal refused to release orphan hold {aid} on order {oid} and it is still {st}",
                             "next": refund_or_void(aid, oid, st)})
-            elif aid in scan["released"] and st not in GONE:
+            elif aid in scan["released"] and not finished(aid, oid, st):
                 out.append({"problem": f"the engine recorded authorisation {aid} on order {oid} as released but PayPal says "
                                        f"it is {st}",
                             "next": refund_or_void(aid, oid, st)})
-            elif aid not in scan["known"] and st not in GONE:
+            elif aid not in scan["known"] and not finished(aid, oid, st):
                 out.append({"problem": f"PayPal has authorisation {aid} ({st}, {a['amount']}) on order {oid} that the log does "
                                        f"not account for",
                             "next": refund_or_void(aid, oid, st) if st in CAPTURED else

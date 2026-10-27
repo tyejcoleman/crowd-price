@@ -31,7 +31,15 @@ ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)
 
 
 class StandInSandbox(Wrap):
-    """A fake that calls itself the sandbox (so nothing real is touched): its holds are recorded as `sandbox`."""
+    """A fake that calls itself the sandbox app `standinsand1` (so nothing real is touched): its holds are recorded as `sandbox` with
+    that app's ref, as the real client records the fingerprint of its client id."""
+    kind = "sandbox"
+    ref = "standinsand1"
+
+
+class RefLessSandbox(Wrap):
+    """What a sandbox client looked like before drops recorded which app they used: a mode and no ref (round 5: such a drop is
+    `drop_unbound` for every app until a person binds it)."""
     kind = "sandbox"
     ref = None
 
@@ -126,24 +134,34 @@ def test_a_a_second_sandbox_app_cannot_operate_on_a_drop_made_with_the_first(tmp
     assert one.recorded_paypals(d) == {("sandbox", "aaaaaaaaaaaa")}
     two = Engine(store, App(base, "bbbbbbbbbbbb"), clock)
     assert refused(two.close, d).code == "wrong_paypal"
-    assert refused(Engine(store, StandInSandbox(base), clock).close, d).code == "wrong_paypal"    # no ref at all is not a match either
+    assert refused(Engine(store, StandInSandbox(base), clock).close, d).code == "wrong_paypal"    # another app's ref is not a match either
     assert one.close(d)["state"] == "closed"
 
 
-def test_a_a_drop_written_before_refs_existed_is_not_locked_out(tmp_path, clock):
-    """A sandbox drop from an older version has a mode and no ref: it cannot be compared more closely, so it is let through
-    (otherwise every drop from the live runs would be unreachable)."""
+def test_a_a_drop_written_before_refs_existed_is_not_operated_by_any_app_until_a_person_binds_it(tmp_path, clock):
+    """Round 5 (was: "let through, otherwise every drop from the live runs would be unreachable"). A sandbox drop from an older version
+    has a mode and no ref, so ANY sandbox app passed for it, and one that cannot see its holds read them as missing and closed the drop
+    unfunded. It now belongs to no app until a person binds it (`drop holds`, then `drop bind`), which reads every hold at the app in
+    use; after that the drop is reachable again, through that app only. (tests/crowd/test_fixes_r5.py walks the whole story.)"""
     store = Store(str(tmp_path / "crowd.db"))
     base = FakePayPal(str(tmp_path / "crowd.db.fakepaypal.json"))
-    old = Engine(store, StandInSandbox(base), clock)
+    old = Engine(store, RefLessSandbox(base), clock)
     d = old.create_drop("Old", "3:40,5:36", 3, 60, drop_id="d_old")
-    old.publish(d)
-    join_many(old, d, 3)
+    assert old.recorded_paypals(d) == {("sandbox", None)}
+    assert refused(old.publish, d).code == "drop_unbound"                       # not even the client that cannot say which app it is
+    app = Engine(store, StandInSandbox(base), clock)
+    assert refused(app.publish, d).code == "drop_unbound"
+    p = app.bind_plan(d)
+    assert p["unmatched"] == [] and p["paypal"] == "sandbox app standinsand1"
+    assert app.bind(d, p["expect"])["bound"] is True
+    assert app.publish(d)["state"] == "live"
+    join_many(app, d, 3)
 
-    class App(StandInSandbox):
+    class Other(StandInSandbox):
         ref = "cccccccccccc"
 
-    assert Engine(store, App(base), clock).close(d)["state"] == "closed"
+    assert refused(Engine(store, Other(base), clock).close, d).code == "wrong_paypal"        # and through no other app
+    assert app.close(d)["state"] == "closed"
 
 
 def test_a_the_real_client_s_ref_is_a_fingerprint_of_the_client_id_never_the_secret(monkeypatch):
