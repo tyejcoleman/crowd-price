@@ -820,7 +820,7 @@ def test_a_lapsed_hold_in_a_missed_drop_needs_no_void_and_nobody_is_charged(engi
 # ---- R3: the only road to money is `drop settle` through the host -------------------------------------------------------------
 
 def test_exactly_one_command_moves_money_and_it_waits_for_a_person():
-    assert sorted(w for w, e in tb.EFFECTS.items() if e == "money") == ["drop exclude", "drop settle"]  # both wait for a person
+    assert sorted(w for w, e in tb.EFFECTS.items() if e == "money") == ["drop bind", "drop exclude", "drop settle"]  # all wait for a person
     assert tb.EFFECTS["test settle"] == "admin" and tb.EFFECTS["test reset"] == "admin"
 
 

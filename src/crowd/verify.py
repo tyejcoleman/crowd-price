@@ -156,17 +156,20 @@ def _capture_audit(eng: Engine, scan: dict, d, final) -> list[dict]:
             if c.get("status") in NO_MONEY_CAPTURE:
                 continue
             cid, amount = c.get("capture_id"), lad.D(c["amount"]) if c.get("amount") is not None else None
+            left = _remaining(c) if amount is not None else None      # a partly refunded capture still takes what is left
             if c.get("currency") != d.currency:
                 out.append({"problem": f"capture {cid} on order {oid} is in {c.get('currency') or 'an unstated currency'} but the "
                                        f"drop is in {d.currency}",
                             "next": f"open capture {cid} in the PayPal sandbox and work out which currency is right, {again}"})
             if cid not in recorded:
+                partly = c.get("status") == "PARTIALLY_REFUNDED"
                 out.append({"problem": f"PayPal shows capture {cid} ({m(amount) if amount is not None else '?'} {c.get('currency')}, "
-                                       f"{c.get('status')}) on order {oid} that the engine did not record: money was taken from a "
-                                       f"buyer outside the engine",
-                            "next": f"refund capture {cid} in the PayPal sandbox (it was taken from the buyer's hold outside the "
-                                    f"engine), {again}"})
-            total += amount or lad.ZERO
+                                       f"{c.get('status')}{', ' + m(left) + ' of it still taken' if partly and left is not None else ''}) "
+                                       f"on order {oid} that the engine did not record: money was taken from a buyer outside the engine",
+                            "next": (f"refund the remaining {m(left)} of capture {cid}" if partly and left is not None else
+                                     f"refund capture {cid}") + f" in the PayPal sandbox (it was taken from the buyer's hold outside "
+                                                                  f"the engine), {again}"})
+            total += left or lad.ZERO
         h = by_order.get(oid)
         if h is not None and total > final:
             out.append({"problem": f"{h['buyer']} was charged {m(total)} in total on order {oid}, more than the final price "
@@ -263,12 +266,25 @@ def verify(drop: str, engine: Engine | None = None, verbose: bool = True) -> dic
                     row["amount"], row["fee"] = m(amount), m(cfee)
             elif h["end"] == "voided":
                 if h["taken"] or status in CAPTURED:
-                    caps = ", ".join(h["taken_captures"])
-                    bad(f"engine says voided but PayPal says the hold is {status}: money was taken from the buyer outside "
-                        f"the engine", (f"refund capture {caps} in the PayPal sandbox (it was taken from authorisation "
-                                        f"{h['auth_id']} outside the engine)" if caps else
-                                        f"open authorisation {h['auth_id']} in the PayPal sandbox, find the capture on it, and "
-                                        f"refund it") + f" if the buyer should not have been charged; then run {_verify_cmd(d.id)} again")
+                    owed = _still_taken(eng, h)       # None: cannot be shown refunded; else [(capture, status, amount still taken)]
+                    if owed == []:                    # every stray capture the engine named has been refunded in full: cleared
+                        row["refunded"] = list(h["taken_captures"])
+                    elif owed:
+                        parts = [f"{cid} ({cs}: {m(left)} of it is still taken)" if cs == "PARTIALLY_REFUNDED" else f"{cid} ({cs})"
+                                 for cid, cs, left in owed]
+                        bad(f"engine says voided but PayPal says the hold is {status}: money taken from the buyer outside the "
+                            f"engine has not been given back in full: capture {', '.join(parts)}",
+                            "refund " + "; ".join(
+                                f"the remaining {m(left)} of capture {cid}" if cs == "PARTIALLY_REFUNDED" else f"capture {cid}"
+                                for cid, cs, left in owed) + f" in the PayPal sandbox (taken from authorisation {h['auth_id']} "
+                                f"outside the engine), then run {_verify_cmd(d.id)} again")
+                    else:
+                        caps = ", ".join(h["taken_captures"])
+                        bad(f"engine says voided but PayPal says the hold is {status}: money was taken from the buyer outside "
+                            f"the engine", (f"refund capture {caps} in the PayPal sandbox (it was taken from authorisation "
+                                            f"{h['auth_id']} outside the engine)" if caps else
+                                            f"open authorisation {h['auth_id']} in the PayPal sandbox, find the capture on it, and "
+                                            f"refund it") + f" if the buyer should not have been charged; then run {_verify_cmd(d.id)} again")
                 elif h["released_by_void"]:
                     if status != "VOIDED":
                         bad(f"engine says it voided this hold but PayPal says it is {status}")
@@ -404,6 +420,30 @@ def verify(drop: str, engine: Engine | None = None, verbose: bool = True) -> dic
     return out
 
 
+def _remaining(c: dict):
+    """How much of a capture is still taken from the buyer: all of it, less what PayPal says has been refunded."""
+    amount = lad.D(c["amount"]) if c.get("amount") is not None else lad.ZERO
+    if c.get("status") == "PARTIALLY_REFUNDED":
+        return max(lad.ZERO, amount - (lad.D(c["refunded"]) if c.get("refunded") is not None else lad.ZERO))
+    return amount
+
+
+def _still_taken(eng: Engine, h: dict):
+    """Each capture the engine named as taken outside it (`taken_captures`), read back from PayPal: a REFUNDED one (and one that was
+    DECLINED or FAILED, which never took anything) is cleared; a PARTIALLY_REFUNDED one still has the rest taken; any other is
+    taken in full. Returns [] when every one is cleared, a list of (capture, status, amount still taken) when not, and None when the
+    engine named none (so nothing can be shown as given back). A read PayPal refuses is the caller's `could not read` problem."""
+    if not h["taken_captures"]:
+        return None
+    owed = []
+    for cid in h["taken_captures"]:
+        cap = eng.holds.get_capture(cid)
+        if cap.get("status") in NO_MONEY_CAPTURE:
+            continue
+        owed.append((cid, cap.get("status"), _remaining(cap)))
+    return owed
+
+
 def _unreleased(h: dict, status: str, drop: str = "") -> str:
     vf = h["void_failed"] or {}
     said = vf.get("issue") or vf.get("code") or "a refusal"
@@ -469,6 +509,7 @@ def tieout_program(drop: str, engine: Engine | None = None) -> dict:
     """The Closure program for this drop: its capture ids (gross, fee) plus a rest part. Needs live captures."""
     eng = engine or default_engine()
     d = eng.get(drop)
+    eng.require_paypal(d.id)        # captures read from another PayPal say nothing about this drop
     if d.state != "settled":
         raise CrowdError("drop_not_settled", drop=d.id, state=eng.display_state(d))
     ids = [b.capture_id for b in d.buyers.values() if b.status == "captured" and b.capture_id]
@@ -490,10 +531,11 @@ def tieout(drop: str, engine: Engine | None = None, source=None) -> dict:
     """The balance proof. Returns the certifier's answer as it is (agent-safe view): a certificate summary,
     or its refusal. With a certificate, `engine_net` and `matches_engine` compare it with the engine's own net."""
     eng = engine or default_engine()
+    d = eng.get(drop)
+    eng.require_paypal(d.id)        # a drop is only ever read through the PayPal it was made with (and a fake is no stand-in)
     if getattr(eng.holds, "kind", "") != "sandbox":
         return {"kind": "refusal", "reason": "no_transaction_search",
                 "what_to_do": "The fake PayPal has no Transaction Search; run against the sandbox for a balance tie-out."}
-    d = eng.get(drop)
     try:
         program = tieout_program(drop, eng)
     except CrowdError as e:

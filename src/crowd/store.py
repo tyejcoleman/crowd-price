@@ -38,6 +38,11 @@ EVENT_TYPES = {
     "leave_started", "leave_failed",
     # a person took one buyer out of the crowd (settle was stuck on them, or PayPal would not say what their hold is)
     "buyer_excluded",
+    # a capture is written down BEFORE PayPal is asked to make it, so that a capture found on a hold later can be told from one
+    # somebody else made: only a capture the engine has an attempt on record for can be the engine's own lost one
+    "capture_started",
+    # a person bound a drop that recorded no PayPal (written before drops did) to the PayPal now in use
+    "paypal_bound",
     # settlement stopped because PayPal refused something that is not about one buyer (or a streak of identical failures)
     "settle_blocked",
     "drop_settled",
@@ -276,6 +281,7 @@ class Drop:
     settled: dict | None = None        # drop_settled payload
     unresolved: dict[str, dict] = field(default_factory=dict)   # request id -> join_started payload, not yet closed
     leaving: dict[str, dict] = field(default_factory=dict)      # buyer -> leave_started payload (+ asked_at), not yet closed
+    capturing: dict[str, dict] = field(default_factory=dict)    # buyer -> capture_started payload, no outcome recorded yet
     blocked: dict | None = None        # the settle_blocked payload while settlement is stopped for a person (cleared on settle)
     lost_after_close: int = 0          # holds that left the crowd after the drop closed and before settlement started
     event_count: int = 0
@@ -361,8 +367,11 @@ def reduce(events: list[dict]) -> Drop:
             if p.get("buyer"):      # that attempt's request id is spent (PayPal would replay the voided hold): move on
                 b = d.buyers.setdefault(p["buyer"], Buyer(id=p["buyer"], name=p.get("name", p["buyer"])))
                 b.attempts += 1
+        elif t == "capture_started":
+            d.capturing[p["buyer"]] = p
         elif t == "hold_placed":
             d.unresolved.pop(p.get("request_id"), None)
+            d.capturing.pop(p["buyer"], None)
             b = d.buyers.setdefault(p["buyer"], Buyer(id=p["buyer"], name=p.get("name", p["buyer"])))
             b.status, b.attempts = "held", b.attempts + 1
             b.order_id, b.auth_id, b.expires = p.get("order_id"), p["auth_id"], p.get("expires")
@@ -380,16 +389,20 @@ def reduce(events: list[dict]) -> Drop:
             b = d.buyers[p["buyer"]]
             b.status = "left"
             d.leaving.pop(p["buyer"], None)
+            d.capturing.pop(p["buyer"], None)
         elif t == "hold_voided":
             b = d.buyers[p["buyer"]]
+            d.capturing.pop(p["buyer"], None)
             if b.status == "held":  # a `left` buyer was already marked by buyer_left
                 b.status = "voided"
         elif t == "hold_captured":
             b = d.buyers[p["buyer"]]
+            d.capturing.pop(p["buyer"], None)
             b.status, b.capture_id = "captured", p["capture_id"]
             b.captured, b.fee, b.net = lad.D(p["amount"]), lad.D(p.get("fee", "0")), lad.D(p.get("net", p["amount"]))
         elif t == "capture_failed":
             b = d.buyers[p["buyer"]]
+            d.capturing.pop(p["buyer"], None)
             b.status, b.error = "capture_failed", p.get("code")
         elif t == "failed_hold_released":
             d.buyers[p["buyer"]].released = True
@@ -397,6 +410,7 @@ def reduce(events: list[dict]) -> Drop:
             b = d.buyers[p["buyer"]]
             b.excluded, b.status = True, "excluded"        # out of the crowd for good; the events that follow say what became of the hold
             d.leaving.pop(p["buyer"], None)
+            d.capturing.pop(p["buyer"], None)
         elif t == "void_failed":
             if p.get("orphan") and p.get("superseded"):     # an earlier order's hold that could not be released: resolved as stuck
                 j = d.unresolved.get(p.get("request_id"))

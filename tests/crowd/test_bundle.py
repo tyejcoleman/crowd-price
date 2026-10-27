@@ -44,8 +44,9 @@ def test_effects_are_what_the_spec_says():
         "drop status": "read", "drop join": "write", "drop leave": "write", "drop exclude": "money", "drop close": "write",
         "drop plan": "read", "drop settle": "money", "drop verify": "read", "drop tieout": "read",
         "drop explain": "read", "buyers list": "read", "sim join": "write", "test settle": "admin", "test reset": "admin",
+        "drop holds": "read", "drop bind": "money",
     }
-    assert sorted(w for w, e in tb.EFFECTS.items() if e == "money") == ["drop exclude", "drop settle"]  # both wait for a person     # the only way money moves
+    assert sorted(w for w, e in tb.EFFECTS.items() if e == "money") == ["drop bind", "drop exclude", "drop settle"]  # all wait for a person
 
 
 def test_manifest_matches_the_bundle_and_locks_what_moves_money():
@@ -53,8 +54,8 @@ def test_manifest_matches_the_bundle_and_locks_what_moves_money():
     assert m["bundle"]["name"] == "crowd" == tb.bundle.name and m["bundle"]["module"] == "crowd.togi_bundle:bundle"
     assert m["policy"]["approve_effects"] == ["money"]
     assert m["tiers"]["polish"] == ["skills/**", "togi_messages.toml"] and m["tiers"]["reshape"] == ["src/crowd/ladder.py"]
-    for f in ("togi.toml", "stone/**", "src/crowd/engine.py", "src/crowd/paypal_holds.py", "src/crowd/verify.py",
-              "src/closure/**", "src/crowd/togi_bundle.py", "src/crowd/store.py"):
+    for f in ("togi.toml", "stone/**", "src/crowd/__init__.py", "src/crowd/engine.py", "src/crowd/paypal_holds.py",
+              "src/crowd/verify.py", "src/closure/**", "src/crowd/togi_bundle.py", "src/crowd/store.py"):
         assert f in m["tiers"]["locked"], f
     assert m["stone"] == {"tests": "tests", "tasks": "stone/tasks",
                           "env": {"CROWD_ENV": "test", "CROWD_PAYPAL": "fake"}}      # the stone never touches PayPal

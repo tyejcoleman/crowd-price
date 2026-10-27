@@ -730,16 +730,18 @@ class CannotListCaptures(Wrap):
 
 
 def test_f6_a_hold_paypal_says_is_captured_but_whose_capture_cannot_be_found_stops_settle(engine, drop, fake, store, clock):
-    """Settlement is under way (so a capture may be the engine's own, lost with its reply) and PayPal says the hold is CAPTURED,
-    but the capture of the final price cannot be found: nothing is guessed, a person looks."""
+    """Settlement is under way and the engine has an attempt on record for a hold (its capture reached PayPal; the reply was lost), so
+    a capture on it may be the engine's own. PayPal says the hold is CAPTURED, but the one capture of the final price cannot be found
+    (here: what PayPal shows is for another amount): nothing is guessed, a person looks. (Round 4: a CAPTURED hold the engine never
+    tried to capture is somebody else's, not a block; see tests/crowd/test_fixes_r4.py.)"""
     join_many(engine, drop, 3)
     engine.close(drop)
     victim = auth_of(engine, drop, "buyer-02")
-    fake.unavailable("capture", match=auth_of(engine, drop, "buyer-01"))
     eng = Engine(store, CannotListCaptures(fake), clock)
-    assert code(eng.settle, drop) == "paypal_unavailable"             # settlement_started is written; nothing captured yet
+    fake.lose_reply("capture", match=victim)
+    assert code(eng.settle, drop) == "paypal_unavailable"             # the capture reached PayPal; its reply never came back
     clock.advance(days=3650)
-    edit_fake(fake, lambda st: st["auths"][victim].update(status="CAPTURED"))      # captured, with no capture on the order
+    edit_fake(fake, lambda st: [c.update(amount="39.00") for c in st["captures"].values() if c["auth_id"] == victim])
     e = blocked(eng.settle, drop)
     assert e.ctx["phase"] == "capture" and not evs(engine, drop, "capture_failed")
     assert evs(engine, drop, "settle_blocked")[0]["code"] == "captured_not_as_approved"

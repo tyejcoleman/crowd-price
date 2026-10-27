@@ -6,7 +6,8 @@ run fast and free:
 
     authorise                       -> CREATED, expires in 29 days
     capture <= amount, final        -> COMPLETED, fee = 2.59% + 0.49 (half-up cents), auth CAPTURED
-    capture > amount                -> MAX_CAPTURE_AMOUNT_EXCEEDED
+    capture, not final              -> COMPLETED, auth PARTIALLY_CAPTURED, open to another capture
+    all captures added up > 115%    -> MAX_CAPTURE_AMOUNT_EXCEEDED  (60 of a 40 hold, as the sandbox said, F-08)
     second capture                  -> AUTHORIZATION_ALREADY_CAPTURED
     void                            -> VOIDED;  capture after void -> AUTHORIZATION_VOIDED
     decline (decline_next / card 9) -> declined at capture, the hold stays open
@@ -35,6 +36,7 @@ DECLINE_CARD_INDEX = 9      # decline at capture: flow E (a charge fails at the 
 # (probed 2026-10-27: INSTRUMENT_DECLINED is not accepted for captures, it returns an empty 403).
 MOCK_CAPTURE_DECLINE = "TRANSACTION_REFUSED"
 HOLD_DAYS = 29              # observed in the sandbox (F-08)
+CAPTURE_CAP = Decimal("1.15")   # PayPal lets all the captures on one authorisation add up to about 115% of what was authorised
 
 # Sandbox test cards (all but index 9 placed a hold in the sandbox on 2026-10-27; 5105105105105100 was refused as
 # invalid and is not used). Index 9 is an ordinary card whose capture is made to fail (PayPal-Mock-Response in the
@@ -467,13 +469,18 @@ def _parent_auth_id(c: dict) -> str | None:
 
 
 def _capture_view(c: dict) -> dict:
+    """A capture as the engine reads it. `refunded` is what PayPal says has been given back (`total_refunded_amount`, shown on a
+    PARTIALLY_REFUNDED or REFUNDED capture). `request_id` is the PayPal-Request-Id the capture was made with when PayPal says so; the
+    real API does not (the key is simply absent from its answers), a fake may."""
     amt = c.get("amount") or {}
     br = c.get("seller_receivable_breakdown") or {}
     fee = (br.get("paypal_fee") or {}).get("value")
     net = (br.get("net_amount") or {}).get("value")
+    refunded = (br.get("total_refunded_amount") or {}).get("value")
     return {"capture_id": c.get("id"), "status": c.get("status"), "amount": amt.get("value"),
             "currency": amt.get("currency_code"), "fee": fee, "net": net, "final": c.get("final_capture"),
-            "created": c.get("create_time"), "auth_id": _parent_auth_id(c)}
+            "created": c.get("create_time"), "auth_id": _parent_auth_id(c), "refunded": refunded,
+            "request_id": c.get("request_id") if isinstance(c.get("request_id"), str) else None}
 
 
 # ---- the fake ----------------------------------------------------------------------------------
@@ -657,7 +664,12 @@ class FakePayPal:
                 raise self._deny(AuthorizationExpired, "AUTHORIZATION_EXPIRED")
             if a["status"] == "CAPTURED":
                 raise self._deny(AuthorizationAlreadyCaptured, "AUTHORIZATION_ALREADY_CAPTURED")
-            if value <= 0 or value > Decimal(a["amount"]):
+            # PayPal's cap: every capture taken on one authorisation, added up, is at most about 115% of what was authorised. A
+            # capture that is not final leaves the authorisation PARTIALLY_CAPTURED and open to another capture inside that cap, which
+            # is exactly how a second charge lands on a buyer whose first capture was made by somebody else.
+            taken = sum((Decimal(c["amount"]) for c in st["captures"].values()
+                         if c.get("auth_id") == auth_id and c.get("status") not in ("DECLINED", "FAILED")), Decimal(0))
+            if value <= 0 or taken + value > Decimal(a["amount"]) * CAPTURE_CAP:
                 raise self._deny(MaxCaptureAmountExceeded, "MAX_CAPTURE_AMOUNT_EXCEEDED")
             if st["decline_next"] > 0 or simulate_decline:
                 if st["decline_next"] > 0:
@@ -667,13 +679,27 @@ class FakePayPal:
             cap_id = "FKC" + secrets.token_hex(7).upper()
             rec = {"capture_id": cap_id, "status": "COMPLETED", "amount": f"{value:.2f}", "currency": currency,
                    "fee": f"{f:.2f}", "net": f"{value - f:.2f}", "final": bool(final),
-                   "created": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"), "auth_id": auth_id}
+                   "created": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"), "auth_id": auth_id,
+                   "refunded": "0.00", "request_id": request_id}      # this fake says which request made a capture; PayPal does not
             st["captures"][cap_id] = rec
             a["status"] = "CAPTURED" if final else "PARTIALLY_CAPTURED"
             a["capture_id"] = cap_id
             resp = dict(rec)
             st["requests"][request_id] = resp
             return dict(resp)
+
+    def refund(self, capture_id: str, amount=None) -> dict:
+        """A person refunds a capture (test control, not something the engine ever does): in full (the capture shows REFUNDED), or
+        in part (PARTIALLY_REFUNDED, with `refunded` the sum given back). The authorisation stays CAPTURED either way."""
+        with self._state() as st:
+            c = st["captures"].get(capture_id)
+            if c is None:
+                raise self._deny(HoldNotFound, "RESOURCE_NOT_FOUND", 404)
+            total = Decimal(c["amount"])
+            back = total if amount is None else min(total, Decimal(c.get("refunded") or 0) + lad.money(amount))
+            c["refunded"] = f"{back:.2f}"
+            c["status"] = "REFUNDED" if back >= total else "PARTIALLY_REFUNDED"
+            return dict(c)
 
     def void(self, auth_id: str, request_id: str) -> dict:
         self._before("void", auth_id)

@@ -7,11 +7,14 @@ skills = "skills"
 
 [tiers]
 # first match wins: locked > reshape > polish. Anything that moves money or enforces a guard is locked.
+# The code behind a money command is locked as a whole (Togi: a gated command may only run code that is locked or reshape): EVERY
+# module of the crowd package, the package's own __init__ included, except ladder.py, the pure price arithmetic, which stays reshape.
+# A module added to src/crowd/ must be added here (tests/crowd/test_fixes_r4.py fails until it is).
 polish  = ["skills/**", "togi_messages.toml"]
 reshape = ["src/crowd/ladder.py"]
 locked  = [
   "togi.toml", "stone/**",
-  "src/crowd/engine.py", "src/crowd/paypal_holds.py", "src/crowd/verify.py",
+  "src/crowd/__init__.py", "src/crowd/engine.py", "src/crowd/paypal_holds.py", "src/crowd/verify.py",
   "src/crowd/store.py", "src/crowd/togi_bundle.py",
   "src/closure/**",
 ]

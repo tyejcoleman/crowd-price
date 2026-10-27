@@ -149,9 +149,19 @@ class SandboxLike:
         return getattr(self.fake, name)
 
 
-def test_tieout_program_is_this_drops_captures_plus_a_rest_part(engine, drop, fake):
-    settled(engine, drop, 3)
+def sandboxed_settled(engine, fake, n):
+    """(a sandbox-like engine, a drop made, joined, closed and settled through it): the drop records the PayPal the tie-out is read
+    through. A drop is only ever read through the PayPal it was made with (`wrong_paypal`), so a tie-out cannot be tried on a fake's
+    drop with a stand-in."""
     eng = type(engine)(engine.store, SandboxLike(fake), engine._clock)
+    d = eng.create_drop("Speckled mugs", "3:40,5:36,7:33", 3, 60, maker="Juniper")
+    eng.publish(d)
+    settled(eng, d, n)
+    return eng, d
+
+
+def test_tieout_program_is_this_drops_captures_plus_a_rest_part(engine, fake):
+    eng, drop = sandboxed_settled(engine, fake, 3)
     prog = V.tieout_program(drop, eng)
     caps = sorted(b.capture_id for b in engine.get(drop).buyers.values())
     assert prog["parts"][0] == {"name": "drop gross", "take": "gross", "where": {"id": caps}} or \
@@ -165,9 +175,8 @@ def test_tieout_program_is_this_drops_captures_plus_a_rest_part(engine, drop, fa
     cp.validate(prog)
 
 
-def test_tieout_hands_the_program_to_the_certifier_and_returns_its_answer_as_is(engine, drop, fake, monkeypatch):
-    settled(engine, drop, 3)
-    eng = type(engine)(engine.store, SandboxLike(fake), engine._clock)
+def test_tieout_hands_the_program_to_the_certifier_and_returns_its_answer_as_is(engine, fake, monkeypatch):
+    eng, drop = sandboxed_settled(engine, fake, 3)
     seen = {}
 
     def fake_ask(source, program):
@@ -187,16 +196,14 @@ def test_tieout_hands_the_program_to_the_certifier_and_returns_its_answer_as_is(
     assert out["matches_engine"] is True and out["engine_net"] == engine.get(drop).settled["totals"]["net"]
 
 
-def test_tieout_with_no_captures_says_so(engine, drop, fake):
-    settled(engine, drop, 2)
-    eng = type(engine)(engine.store, SandboxLike(fake), engine._clock)
+def test_tieout_with_no_captures_says_so(engine, fake):
+    eng, drop = sandboxed_settled(engine, fake, 2)
     assert V.tieout(drop, eng)["reason"] == "nothing_captured"
 
 
-def test_tieout_maps_transaction_search_not_having_the_window_yet_to_not_yet_indexed(engine, drop, fake, monkeypatch):
+def test_tieout_maps_transaction_search_not_having_the_window_yet_to_not_yet_indexed(engine, fake, monkeypatch):
     from closure.paypal import PayPalError
-    settled(engine, drop, 3)
-    eng = type(engine)(engine.store, SandboxLike(fake), engine._clock)
+    eng, drop = sandboxed_settled(engine, fake, 3)
 
     def boom(source, program):
         raise PayPalError("GET /v1/reporting/transactions -> http 404 INVALID_REQUEST")

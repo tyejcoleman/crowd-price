@@ -635,13 +635,29 @@ def test_c_exactly_half_or_failures_a_capture_apart_below_four_attempts_do_not_s
     assert engine.settle(drop, expect=tok)["counts"]["failed"] == 2
 
 
+class LapsesAtCapture(Wrap):
+    """PayPal lets some holds lapse in the moment between the engine's read of them and its capture: the capture is refused with
+    AUTHORIZATION_EXPIRED, and PayPal, asked, says EXPIRED."""
+
+    def __init__(self, inner, victims):
+        super().__init__(inner)
+        self.victims = set(victims)
+
+    def capture(self, auth_id, *a, **k):
+        if auth_id in self.victims:
+            self.inner.expire(auth_id)
+        return self.inner.capture(auth_id, *a, **k)
+
+
 def test_c_a_lapsed_authorisation_is_a_fact_about_one_hold_and_never_counts_toward_the_breaker(engine, drop, fake):
-    """r2: PayPal lapses holds early; every hold lapsing once used to need a fresh person approval per two buyers."""
+    """r2: PayPal lapses holds early; every hold lapsing once used to need a fresh person approval per two buyers. Round 4: the
+    name AUTHORIZATION_EXPIRED is exempt only because PayPal, asked, says EXPIRED."""
     tok = closed_drop(engine, drop, 8)
-    for n in ("buyer-01", "buyer-02", "buyer-03", "buyer-04"):
-        fake.refuse("capture", "AUTHORIZATION_EXPIRED", match=auth_of(engine, drop, n), times=None)
-    out = engine.settle(drop, expect=tok)
+    lapsing = [auth_of(engine, drop, n) for n in ("buyer-01", "buyer-02", "buyer-03", "buyer-04")]
+    eng = Engine(engine.store, LapsesAtCapture(fake, lapsing), engine._clock)
+    out = eng.settle(drop, expect=tok)
     assert out["counts"]["failed"] == 4 and out["counts"]["captured"] == 4 and not evs(engine, drop, "settle_blocked")
+    assert all(e["paypal_status"] == "EXPIRED" and e["issue"] == "AUTHORIZATION_EXPIRED" for e in evs(engine, drop, "capture_failed"))
     assert V.verify(drop, engine)["ok"]
 
 

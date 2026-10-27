@@ -237,3 +237,40 @@ the engine trusts neither the PayPal this process happens to use nor its own rec
 - **Recovery.** `_recover` raises `paypal_unavailable` on an outage and blocks on a refusal; only a 404 means none. A join retry that gets a
   different order is a new hold: the earlier order's hold is released first (D-11).
 - **Leaves (D-11b).** An unresolved or refused leave stands; close and settle retry the void and the buyer is out either way.
+
+## 9. Fix round 4 (2026-10-27): ask just before sending; a name is a claim; lock the whole package
+
+See `docs/crowd-fixes-r4.md` for the list and `docs/DECISIONS.md` F-16 for the reasons and the probes still to run on the sandbox.
+Principle: the engine acts on what PayPal says a moment ago, never on what the same hold looked like when settlement started, what
+our clock says about its date, or what an error is called.
+
+- **Events added:** `capture_started` (written before PayPal is asked to capture a hold: buyer, auth id, amount, deterministic request
+  id) and `paypal_bound`. Commands added: `drop holds` [read] and `drop bind` [money]. The drop projection has `capturing`.
+- **Whose capture is it (item 1).** `_capture_one` reads the hold (the authorisation and the captures on its order) first. Open with
+  nothing taken: the attempt is written down, then the capture sent. A capture already there is the engine's own (`_could_be_ours`)
+  only if settlement is funded, the authorisation is CAPTURED (the engine's capture is final, so PARTIALLY_CAPTURED never is), a
+  `capture_started` exists for that hold at the final price, exactly one completed capture is on it at exactly the final price, not
+  marked other than final, and, where PayPal says which request made it, that is the attempt's request id. Then it is recorded
+  (`hold_captured{recovered}`), not made again. Any other capture is somebody else's: `hold_voided{taken_outside_engine, capture_ids}`,
+  the hold leaves the crowd, nothing is ever POSTed on top of it, and `verify` names the capture to refund. Our clock is not read.
+  An ALREADY_CAPTURED answer to a capture sends it through the same look again. The fake enforces PayPal's cap (all captures on one
+  authorisation add up to at most 115% of the hold; a non-final capture leaves PARTIALLY_CAPTURED and room for another) and says
+  which request made each capture (`request_id`; the real API does not say, and `_capture_view` leaves it empty).
+- **`drop exclude` (item 2)** takes `ctx` and refuses a throwaway approver's yes outside test mode exactly as settle does; so does
+  `drop bind`. Every command the manifest gates calls `_refuse_test_scope_approval` first; `togi_bundle.COMMANDS` and a test check it.
+- **The clock (item 3).** `join` and `leave` read it before waiting for the drop lock. That instant decides the deadline and stamps
+  the events, so a request asked in time stands however long it queued behind another request.
+- **A name is a claim (item 4).** A capture refused as AUTHORIZATION_EXPIRED is followed by a GET; only an EXPIRED answer
+  (`capture_failed{paypal_status: EXPIRED}`) keeps it out of the breaker. If PayPal shows the hold open, or will not say, it counts.
+- **Several orders (item 5).** `join` releases every earlier order of the join intent whenever more than one is on record, replay or not.
+- **Pending leaves (item 6).** `_reconcile_leaves` answers a 404 as `_revalidate` does (nothing is held: the buyer left) and a 403 with
+  `hold_unreadable` and the `drop exclude` way out (settle: `settle_blocked`). Never a bare `paypal_error`.
+- **Unbound drops (item 7).** A drop whose events record no PayPal is refused by every operation (`drop_unbound`, nothing written, no PayPal
+  asked) until a person runs `drop bind --drop D --expect <token>`. `drop holds` lists the holds the log says the drop placed, each read
+  at the PayPal in use, with the token `bind:MODE:REF:HOLDS:DIGEST`; `bind` reads them again and refuses (`bind_mismatch`) if that PayPal
+  does not know one, else records `paypal_mode` and `paypal_ref`. `tieout` and `tieout_program` also require the PayPal.
+- **Refunds (item 8).** A `taken` hold clears in `verify` once every capture the engine named reads REFUNDED (and not otherwise); a
+  PARTIALLY_REFUNDED one fails with `refund the remaining N`. The order audit counts only what is left of a partly refunded capture.
+- **The lock (item 9).** `togi.toml` locks every file of the crowd package except `src/crowd/ladder.py` (reshape), including
+  `__init__.py`. `tests/crowd/test_fixes_r4.py` fails for a `.py` under `src/crowd/` that is neither, and for a crowd module the bundle
+  imports that is not covered. After this round the repo's own lock (`.togi/locked.sha256`) no longer verifies: a person re-locks.

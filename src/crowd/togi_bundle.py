@@ -39,6 +39,7 @@ MAX_SIM = 60
 
 bundle = Bundle("crowd")
 EFFECTS: dict[str, str] = {}  # command words -> effect, kept here so tests can assert the guard levels
+COMMANDS: dict[str, object] = {}   # command words -> the function the host runs, so tests can look at what each one does
 
 
 def _eng() -> Engine:
@@ -119,7 +120,9 @@ def cmd(words: str, effect: str, examples: list, **kw):
     EFFECTS[words] = effect
 
     def deco(fn):
-        return bundle.command(words, effect=effect, examples=examples, **kw)(_guarded(fn))
+        wrapped = bundle.command(words, effect=effect, examples=examples, **kw)(_guarded(fn))
+        COMMANDS[words] = wrapped
+        return wrapped
     return deco
 
 
@@ -255,16 +258,19 @@ def drop_leave(drop: str, buyer: str) -> dict:
 
 
 @cmd("drop exclude", "money", ["togi crowd drop exclude --drop d_7f3a --buyer ada-lovelace"])
-def drop_exclude(drop: str, buyer: str) -> dict:
+def drop_exclude(drop: str, buyer: str, ctx=None) -> dict:
     """Take ONE buyer out of the crowd and release their hold. For a person getting past a single hold the engine cannot read or
     release (a block names the exact buyer). The plan changes afterwards, so a fresh plan is approved.
-    A money effect: removing a buyer can cost the maker a sale or drop the crowd below its minimum, so a person approves it.
+    A money effect: removing a buyer can cost the maker a sale or drop the crowd below its minimum, so a person approves it, and
+    a throwaway test approver's yes is refused outside test mode exactly as it is for `drop settle`.
 
     Args:
         drop: the drop
         buyer: the buyer id the block or `buyers list` names
     """
-    out = _eng().exclude(drop, buyer)
+    eng = _eng()
+    _refuse_test_scope_approval(eng, ctx, "drop exclude")
+    out = eng.exclude(drop, buyer)
     out["next"] = out.get("next") or f"togi crowd drop plan --drop {drop}"
     return out
 
@@ -295,13 +301,16 @@ def _expect(p: dict) -> str:
     return plan_token(p)
 
 
-def _refuse_test_scope_approval(eng: Engine, ctx) -> None:
+def _refuse_test_scope_approval(eng: Engine, ctx, command: str = "this command") -> None:
     """Togi tells a command which approver signed the approval it is running on (`ctx.approval_scope`): "default" is the
     person's own approver, "test" a throwaway one under TOGI_APPROVER_HOME (tests, the stone). A throwaway approver's
     yes is worth nothing where real value could move, so a "test" approval is accepted only when ALL of these hold: the PayPal
     is the fake, CROWD_ENV is "test", and the store holds nothing but this fake's holds (`foreign_holds` is empty). The manifest
     opts Crowd in to test approvals (`[policy] test_approvals`) on the strength of this check.
-    `getattr` so this works before and after the Togi that adds the attribute (None = no scope was reported)."""
+    `getattr` so this works before and after the Togi that adds the attribute (None = no scope was reported).
+
+    EVERY command the manifest gates (`[policy] approve_effects`) calls this first, before it reads or writes anything: the manifest's
+    `test_approvals = true` is only safe if no gated command forgets it (tests/crowd/test_fixes_r4.py walks `EFFECTS` and checks)."""
     scope = getattr(ctx, "approval_scope", None)
     if scope != "test":
         return
@@ -317,7 +326,7 @@ def _refuse_test_scope_approval(eng: Engine, ctx) -> None:
             why = (f"the store holds {len({(x['drop'], x['buyer']) for x in foreign})} hold(s) or drop(s) that did not come from "
                    f"this fake (first: drop {foreign[0]['drop']}, {foreign[0]['mode']})")
     if why:
-        raise _togi_error("test_approval_outside_test_mode", {"scope": scope, "mode": mode, "why": why})
+        raise _togi_error("test_approval_outside_test_mode", {"scope": scope, "mode": mode, "why": why, "command": command})
 
 
 @cmd("drop settle", "money", ["togi crowd drop settle --drop d_7f3a --expect capture:52:33.00:1716.00"],
@@ -334,11 +343,48 @@ def drop_settle(drop: str, expect: str, ctx=None) -> dict:
             approves exactly what runs
     """
     eng = _eng()
-    _refuse_test_scope_approval(eng, ctx)
+    _refuse_test_scope_approval(eng, ctx, "drop settle")
     # the engine checks the PayPal, reads every remaining hold at PayPal, works the plan out again from that, under the lock, and
     # compares it with the approved one (`plan_changed`, with the new token, when it differs)
     out = eng.settle(drop, expect=expect.strip())
     out["next"] = f"togi crowd drop verify --drop {drop}"
+    return out
+
+
+@cmd("drop holds", "read", ["togi crowd drop holds --drop d_7f3a"])
+def drop_holds(drop: str) -> dict:
+    """List the holds a drop's log says it placed, each read at the PayPal in use right now. For a drop that recorded no PayPal (written
+    before drops did), this is exactly what `drop bind` would check, with the token a person approves it for. Moves nothing."""
+    out = _eng().holds_view(drop)
+    if out["bound"]:
+        out["next"] = f"togi crowd drop status --drop {drop}"
+    elif out["unmatched"]:
+        out["next"] = (f"do NOT bind: this PayPal ({out['paypal']}) does not know, or will not say what it is about, hold(s) "
+                       f"{', '.join(out['unmatched'])}, so it cannot be shown to be the PayPal the drop was made with. Use that PayPal "
+                       f"(CROWD_PAYPAL, the sandbox credentials) and run this again")
+    else:
+        out["next"] = f"a person approves: togi crowd drop bind --drop {drop} --expect {out['expect']}"
+    return out
+
+
+@cmd("drop bind", "money", ["togi crowd drop bind --drop d_7f3a --expect bind:sandbox:9ab12c34de56:3:1a2b3c4d"],
+     summary="Bind a drop that recorded no PayPal to the PayPal now in use: every hold the drop placed is read at this PayPal first "
+             "(`drop holds` lists them), and the bind is refused if it does not know one. From then on the drop is operated only "
+             "through this PayPal.",
+     confirm="drop")
+def drop_bind(drop: str, expect: str, ctx=None) -> dict:
+    """Record which PayPal a drop belongs to, for a drop written before drops recorded it. Until a person does this, nothing
+    touches PayPal for the drop. Pass --expect from `drop holds`; the approval is bound to it, so the person approves exactly this
+    PayPal and exactly these holds.
+
+    Args:
+        drop: the drop that records no PayPal
+        expect: the token from `togi crowd drop holds` (bind:MODE:REF:HOLDS:DIGEST); the bind is refused if the holds differ
+    """
+    eng = _eng()
+    _refuse_test_scope_approval(eng, ctx, "drop bind")
+    out = eng.bind(drop, expect.strip())
+    out["next"] = f"togi crowd drop status --drop {drop}"
     return out
 
 

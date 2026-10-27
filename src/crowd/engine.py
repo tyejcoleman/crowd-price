@@ -21,13 +21,21 @@ What the engine promises, and where it is enforced:
 - PayPal is asked again right before money moves: `settle` reads every remaining hold (and the captures on its order), records
   what it finds, and refuses a plan that no longer matches what PayPal shows (`plan_changed`);
 - nobody who saw an error is charged (D-11, D-11b): a hold the engine never confirmed is released, and a leave asked for before
-  the deadline is honoured even if PayPal errored;
+  the deadline is honoured even if PayPal errored; a request's clock is read when it is TAKEN, before any wait for the drop lock;
+- nobody is charged twice: a capture is only POSTed for a hold PayPal, asked a moment before, shows open with nothing taken. A
+  capture already on a hold is the engine's own only if the engine wrote down an attempt for it (`capture_started`) and it is the
+  one final capture at the final price; any other is somebody else's and the hold leaves the crowd for a person to refund. Our
+  clock plays no part in that;
+- an error NAME is a claim, not a fact: AUTHORIZATION_EXPIRED stays out of the breaker only if PayPal, asked, says EXPIRED;
+- a drop that recorded no PayPal belongs to none until a person binds it (`bind`), after every hold it placed is read at the
+  PayPal in use;
 - `verify` (verify.py) reads everything back from PayPal and reports any mismatch.
 
 Every guard raises CrowdError with a stable `code`; the Togi bundle turns codes into messages.
 """
 from __future__ import annotations
 
+import hashlib
 import inspect
 import re
 from collections import Counter
@@ -49,7 +57,8 @@ TAKEN_AUTH = ("CAPTURED", "PARTIALLY_CAPTURED")   # money moved
 NO_MONEY_CAPTURE = ("DECLINED", "FAILED", "REFUNDED")   # capture statuses in which nothing is (any longer) taken from the buyer
 BREAKER_LIMIT = 2                    # this many capture failures in a row, of any buyer-specific codes, stop settlement
 BREAKER_RATE_MIN = 4                 # ... and so does more than half of the captures failing once this many were attempted
-BREAKER_EXEMPT = ("hold_expired", "authorization_expired")   # a fact about that one hold (PayPal says it lapsed), not a shared cause
+BREAKER_EXEMPT = ("hold_expired", "authorization_expired")   # a fact about that one hold, not a shared cause: but only once PayPal has
+                                                              # said EXPIRED when asked (the failure carries `paypal_status: EXPIRED`)
 
 
 class CrowdError(Exception):
@@ -63,6 +72,16 @@ class CrowdError(Exception):
 def m(x) -> str:
     """Money as text with cents: '33.00'. Rounds half up, exactly as the PayPal client does when it writes the amount."""
     return f"{lad.money(x):.2f}"
+
+
+def _says_expired(e: HoldError) -> bool:
+    """Does this refusal NAME the hold as lapsed (AUTHORIZATION_EXPIRED, top-level or in a detail)? A name is a claim, not a fact:
+    the caller asks PayPal before it counts for anything."""
+    if isinstance(e, AuthorizationExpired):
+        return True
+    named = {str(x or "").upper() for x in [getattr(e, "issue", ""), getattr(e, "name", ""), *(getattr(e, "issues", None) or []),
+                                            *(getattr(e, "detail_names", None) or [])]}
+    return "AUTHORIZATION_EXPIRED" in named
 
 
 def _accepts(fn, name: str) -> bool:
@@ -170,7 +189,13 @@ class Engine:
         """Refuse (`wrong_paypal`, nothing written) unless the PayPal in use is the one this drop's holds were made with. A
         process pointed at another PayPal (a fake on a sandbox store, another sandbox app) reads every real hold as missing
         and would close, price and settle the drop on a crowd that PayPal never had. With no drop given the whole store is
-        checked: a store belongs to one PayPal from the first drop made in it."""
+        checked: a store belongs to one PayPal from the first drop made in it.
+
+        A drop whose log records no PayPal at all (written before drops did) belongs to NO PayPal until a person binds it
+        (`bind`): with nothing to compare, "any PayPal will do" would let a fake read every real hold as missing and close the
+        drop unfunded. It is refused (`drop_unbound`) and nothing is written."""
+        if drop is not None and not self.recorded_paypals(drop):
+            raise CrowdError("drop_unbound", drop=drop, current=_describe_paypal(*self.paypal_key()))
         for rec in sorted(self.recorded_paypals(drop), key=str):
             if not self._same_paypal(rec):
                 mode, ref = self.paypal_key()
@@ -321,13 +346,14 @@ class Engine:
         and the order the moment it exists (`order_created`), so a reply that never arrives, or a crash after PayPal
         acted, leaves a trail `reconcile` follows instead of a hold nobody knows about.
 
-        The clock is read ONCE, when the request is taken: that instant decides whether the drop still takes joins and
-        stamps every event of the join, so a slow PayPal can never put half a join on each side of the deadline.
+        The clock is read ONCE, when the request is taken and BEFORE the drop lock is waited for: that instant decides whether the
+        drop still takes joins and stamps every event of the join, so neither a slow PayPal nor a queue behind another request can
+        put half a join on each side of the deadline, or turn a join asked in time into a late one.
 
         A hold that came back from a replay (the buyer is trying again after a lost reply), or in any status but open, is
         never trusted as it arrived: PayPal is asked for its current status before the hold is recorded."""
+        asked = self.now()             # the moment of the request, not the moment the lock was won (it can be a long wait)
         with self.store.lock(drop):
-            asked = self.now()
             d = self.get(drop)
             self.require_paypal(d.id)
             self._require_joinable(d, asked)
@@ -377,7 +403,11 @@ class Engine:
             # (D-11), the new one is confirmed with a GET, and it is never called `replayed` (the order id does not match).
             superseded = bool(prior_order) and hold.get("order_id") != prior_order
             replayed = (bool(hold.get("replayed")) or rid in earlier) and not superseded
-            if superseded:
+            # An intent can have made more than one order even when this answer is a replay of the LAST one (PayPal forgot the
+            # request id once, remembered it the next time): every order on record other than the one that answered is read, and any
+            # hold on it released, whether or not this answer counts as a replay. Otherwise the first order's hold stays open.
+            orders = (d.unresolved.get(rid) or {}).get("order_ids") or []
+            if superseded or len(orders) > 1:
                 self._release_stale_orders(d, bid, rid, hold.get("order_id"))
                 d = self.get(drop)
             if replayed or superseded or hold.get("status") not in OPEN_AUTH:
@@ -481,11 +511,13 @@ class Engine:
 
         Like a join, a leave is written down before PayPal is asked (`leave_started`): if the void goes through but the
         reply is lost, `reconcile` reads the authorisation and, finding it VOIDED, records the leave as it happened. The
-        clock is read once and stamps both the intent and the outcome. Decision D-11b: if PayPal cannot be reached or refuses
-        the void, the leave still stands, and close or settle completes it (retries the void; the buyer is out of the crowd
-        either way); nobody who saw an error is charged. A hold that is already captured is the one thing that cannot be left."""
+        clock is read once, BEFORE the drop lock is waited for, and stamps both the intent and the outcome: a leave queued behind
+        another request (a join on a slow PayPal holds the lock) that was asked in time stands, however long it waited. Decision
+        D-11b: if PayPal cannot be reached or refuses the void, the leave still stands, and close or settle completes it (retries
+        the void; the buyer is out of the crowd either way); nobody who saw an error is charged. A hold that is already captured
+        is the one thing that cannot be left."""
+        now = self.now()          # the moment of the request decides the deadline and stamps the events, not when the lock was won
         with self.store.lock(drop):
-            now = self.now()      # the moment of the request is what the events are stamped with, not when PayPal answers
             d = self.get(drop)
             self.require_paypal(d.id)
             if d.state != "live":
@@ -575,6 +607,74 @@ class Engine:
                 out["next"] = f"void hold {b.auth_id} at PayPal by hand; `togi crowd drop verify` keeps reporting it until PayPal shows it gone"
             return out
 
+    def _logged_holds(self, drop: str) -> list[dict]:
+        """Every authorisation the log says this drop ever placed, once each, in the order placed: {buyer, auth_id, order_id}."""
+        seen, out = set(), []
+        for e in self.store.events(drop):
+            p = e["payload"]
+            if e["type"] == "hold_placed" and p.get("auth_id") and p["auth_id"] not in seen:
+                seen.add(p["auth_id"])
+                out.append({"buyer": p.get("buyer"), "auth_id": p["auth_id"], "order_id": p.get("order_id")})
+        return out
+
+    def _read_logged_holds(self, drop: str) -> list[dict]:
+        """`_logged_holds`, each with what the PayPal in use says the hold is right now: its status, `NOT_FOUND` if it has no such
+        authorisation (it is not the PayPal that placed it), or `UNREADABLE (<name>)` if it will not say."""
+        out = []
+        for h in self._logged_holds(drop):
+            try:
+                status = self.holds.get(h["auth_id"]).get("status")
+            except PayPalUnavailable:
+                raise CrowdError("paypal_unavailable", drop=drop) from None
+            except HoldNotFound:
+                status = "NOT_FOUND"
+            except HoldError as e:
+                status = f"UNREADABLE ({e.issue or e.code})"
+            out.append({**h, "status": status})
+        return out
+
+    def holds_view(self, drop: str) -> dict:
+        """The holds a drop's log says it placed, read at the PayPal in use (moves nothing). For a drop bound to a PayPal it must be
+        that one (`wrong_paypal` otherwise); for one that recorded none, this is what `bind` would check, with the token to approve."""
+        d = self.get(drop)
+        if not self.recorded_paypals(d.id):
+            return {**self.bind_plan(d.id), "bound": False}
+        self.require_paypal(d.id)
+        mode, ref = self.paypal_key()
+        return {"drop": d.id, "bound": True, "paypal": _describe_paypal(mode, ref), "holds": self._read_logged_holds(d.id)}
+
+    def bind_plan(self, drop: str) -> dict:
+        """What `bind` would check, read from the PayPal in use right now (moves nothing): the PayPal that would be recorded for the
+        drop and, for every hold the log says it placed, what that PayPal says the hold is (`NOT_FOUND` if it has no such
+        authorisation, which means it is not the PayPal the drop was made with). `expect` is the token the bind is approved for: the
+        PayPal and the holds."""
+        d = self.get(drop)
+        recorded = self.recorded_paypals(d.id)
+        if recorded:
+            raise CrowdError("already_bound", drop=d.id, paypal=_describe_paypal(*sorted(recorded, key=str)[0]))
+        mode, ref = self.paypal_key()
+        holds = self._read_logged_holds(d.id)
+        missing = [h for h in holds if h["status"] == "NOT_FOUND" or str(h["status"]).startswith("UNREADABLE")]
+        digest = hashlib.sha1("|".join(sorted(h["auth_id"] for h in holds)).encode()).hexdigest()[:8]
+        return {"drop": d.id, "paypal": _describe_paypal(mode, ref), "paypal_mode": mode, "paypal_ref": ref, "holds": holds,
+                "unmatched": [h["auth_id"] for h in missing], "expect": f"bind:{mode}:{ref or 'none'}:{len(holds)}:{digest}"}
+
+    def bind(self, drop: str, expect: str) -> dict:
+        """A person binds a drop that recorded no PayPal to the PayPal in use now: it records `paypal_mode` and `paypal_ref`, and from
+        then on the drop is operated only through that PayPal. Before anything is written every hold the log placed for the drop is
+        read at this PayPal; if it has no such hold (or will not say) the PayPal is not the drop's, and the bind is refused
+        (`bind_mismatch`) with nothing written. The approval is bound to `expect` (the PayPal and the holds, from `bind_plan`), so a
+        person approves exactly what runs."""
+        with self.store.lock(drop):
+            p = self.bind_plan(drop)
+            if str(expect).strip() != p["expect"]:
+                raise CrowdError("bind_changed", drop=p["drop"], expected=str(expect).strip(), actual=p["expect"])
+            if p["unmatched"]:
+                raise CrowdError("bind_mismatch", drop=p["drop"], paypal=p["paypal"], holds=", ".join(p["unmatched"]))
+            self.store.append(p["drop"], "paypal_bound", {
+                "holds": [h["auth_id"] for h in p["holds"]], "checked_at": iso(self.now()), **self._evidence()}, ts=self.now())
+            return {**p, "bound": True}
+
     def close(self, drop: str) -> dict:
         """Stop joining. In order: settle any join or leave whose answer was lost (`reconcile`); ask PayPal about every
         hold on record and drop from the crowd any that is no longer open (`revalidate`); then count the crowd as it stood
@@ -626,35 +726,44 @@ class Engine:
                 if unreadable is not None:
                     unreadable(u)
                 raise self._unreadable_error(d, u) from None
-            verdict, status = seen["verdict"], seen["status"]
-            if verdict in ("open", "ours"):
+            if seen["verdict"] in ("open", "ours"):
                 continue
-            ev = {"buyer": b.id, "auth_id": b.auth_id, "reason": f"paypal_says_{str(status).lower()}",
-                  "paypal_status": status, "checked_at": iso(now), **self._evidence()}
-            if verdict != "odd":              # gone, missing, or money taken: PayPal's own answer, recorded as it is
-                if status == "EXPIRED":
-                    ev["expired"] = True
-                if verdict == "taken":        # money left a buyer's card outside the engine: verify will say so
-                    ev["taken_outside_engine"] = True
-                    ev["capture_ids"] = [c["capture_id"] for c in seen["money"] if c.get("capture_id")]
-                    if status not in TAKEN_AUTH:
-                        ev["reason"] = "paypal_shows_a_capture"
-                self.store.append(d.id, "hold_voided", ev, ts=stamp)
-                found.append({"buyer": b.id, "paypal_status": status, "action": "recorded"})
-                continue
-            try:                              # DENIED, or a status nobody has a rule for: release it, do not assume
-                self._void_call(d, b.id, b.attempts, b.auth_id)
-            except PayPalRefused as e:
-                self.store.append(d.id, "void_failed", {
-                    "buyer": b.id, "auth_id": b.auth_id, "code": e.code, "message": str(e)[:200],
-                    "paypal_status": status, **self._evidence(e)}, ts=stamp)
-                found.append({"buyer": b.id, "paypal_status": status, "action": "void_failed"})
-                continue
-            except HoldError as e:
-                raise CrowdError("paypal_error", drop=d.id, buyer=b.id, issue=e.issue or e.code, http=e.http) from None
-            self.store.append(d.id, "hold_voided", {**ev, "released_by_void": True}, ts=stamp)
-            found.append({"buyer": b.id, "paypal_status": status, "action": "voided"})
+            found.append(self._record_hold_left(d, b, seen, stamp, now))
         return found
+
+    def _record_hold_left(self, d: Drop, b: Buyer, seen: dict, stamp: datetime, now: datetime) -> dict:
+        """PayPal shows this hold as something other than open (and not as the engine's own capture): record PayPal's word and
+        take it out of the crowd. Used by `_revalidate` at close and at the start of settle, and by `_capture_one` for a hold that
+        changed in the moment before its capture. Gone, missing, or money taken by somebody else is recorded as it is (a stray
+        capture is never captured on top of, and is for a person to refund); a status nobody has a rule for is voided, and counts as
+        released only if the void goes through."""
+        verdict, status = seen["verdict"], seen["status"]
+        ev = {"buyer": b.id, "auth_id": b.auth_id, "reason": f"paypal_says_{str(status).lower()}",
+              "paypal_status": status, "checked_at": iso(now), **self._evidence()}
+        if verdict != "odd":              # gone, missing, or money taken: PayPal's own answer, recorded as it is
+            if status == "EXPIRED":
+                ev["expired"] = True
+            if verdict == "taken":        # money left a buyer's card outside the engine: verify will say so
+                ev["taken_outside_engine"] = True
+                # every capture PayPal lists on the order, refunded or declined ones too: verify reads each back, and one already
+                # refunded in full is what lets a person's refund clear the hold (a stray that was refunded before the engine ever
+                # saw it would otherwise be recorded with no capture to read, and could never be shown refunded)
+                ev["capture_ids"] = [c["capture_id"] for c in (seen["captures"] or seen["money"]) if c.get("capture_id")]
+                if status not in TAKEN_AUTH:
+                    ev["reason"] = "paypal_shows_a_capture"
+            self.store.append(d.id, "hold_voided", ev, ts=stamp)
+            return {"buyer": b.id, "paypal_status": status, "action": "recorded"}
+        try:                              # DENIED, or a status nobody has a rule for: release it, do not assume
+            self._void_call(d, b.id, b.attempts, b.auth_id)
+        except PayPalRefused as e:
+            self.store.append(d.id, "void_failed", {
+                "buyer": b.id, "auth_id": b.auth_id, "code": e.code, "message": str(e)[:200],
+                "paypal_status": status, **self._evidence(e)}, ts=stamp)
+            return {"buyer": b.id, "paypal_status": status, "action": "void_failed"}
+        except HoldError as e:
+            raise CrowdError("paypal_error", drop=d.id, buyer=b.id, issue=e.issue or e.code, http=e.http) from None
+        self.store.append(d.id, "hold_voided", {**ev, "released_by_void": True}, ts=stamp)
+        return {"buyer": b.id, "paypal_status": status, "action": "voided"}
 
     # ---- asking PayPal what a hold is right now ----------------------------------------------------------
 
@@ -674,18 +783,33 @@ class Engine:
         except HoldError as e:
             raise _Unreadable(b, e) from None
 
-    def _could_be_ours(self, d: Drop, status: str | None, captures: list[dict] | None, money: list[dict]) -> bool:
-        """Settlement is under way and PayPal shows a hold as captured: is that plausibly the engine's own capture, whose reply was
-        lost or whose crash came before it was written down? Only if the settlement is a funded one, the hold is CAPTURED, and the
-        one capture on it is for exactly the final price. `_capture_one` then recovers and records it (or blocks if it cannot).
-        Before settlement starts the engine has captured nothing, so any capture is somebody else's."""
-        if d.settlement is None or d.settlement.get("outcome") != "funded" or status not in TAKEN_AUTH:
+    def _could_be_ours(self, d: Drop, b: Buyer, status: str | None, captures: list[dict] | None, money: list[dict]) -> bool:
+        """Settlement is under way and PayPal shows a hold with money taken: is that the engine's own capture, whose reply was lost or
+        whose crash came before it was written down? Only if ALL of these hold; any other capture was made outside the engine and is
+        never captured on top of (`_inspect` calls it `taken`):
+          - the settlement is a funded one (before it starts, and in a missed minimum, the engine has captured nothing);
+          - the authorisation is CAPTURED, not PARTIALLY_CAPTURED: the engine's capture is always the final one;
+          - the engine has an attempt on record for this very hold (`capture_started`: written before PayPal is asked), at the final
+            price. A capture nobody here tried to make cannot be ours, however much it looks like one;
+          - exactly one capture is on it, completed or pending, in the drop's currency, at exactly the final price, and not marked
+            as other than final; and, where PayPal says which request made it, that is the engine's capture request id.
+        Nothing here reads our clock: a hold's date says nothing about whose capture it carries. A client that cannot list a hold's
+        captures (`captures` is None) leaves the last two to the recovery in `_capture_one`, which needs the one capture to match."""
+        if d.settlement is None or d.settlement.get("outcome") != "funded" or status != "CAPTURED":
             return False
-        if captures is None:                  # the client cannot list captures: the recovery path in _capture_one decides
+        final = lad.D(d.settlement["final_price"])
+        tried = d.capturing.get(b.id)
+        if not tried or tried.get("auth_id") != b.auth_id or not self._same_amount(tried, final):
+            return False
+        if captures is None:
             return True
         c = money[0] if len(money) == 1 else None
-        return (c is not None and c.get("status") in ("COMPLETED", "PENDING") and c.get("currency") == d.currency
-                and self._same_amount(c, lad.D(d.settlement["final_price"])))
+        if c is None or c.get("status") not in ("COMPLETED", "PENDING") or c.get("currency") != d.currency:
+            return False
+        if c.get("final") is False or not self._same_amount(c, final):
+            return False
+        said = c.get("request_id")          # only a client that can say which request made a capture (the fake) is asked
+        return said is None or said == tried.get("request_id")
 
     def _inspect(self, d: Drop, b: Buyer) -> dict:
         """What PayPal says about one hold RIGHT NOW (read-only): the authorisation and every capture on its order. `verdict`:
@@ -709,7 +833,7 @@ class Engine:
         captures = self._captures_on(d, b)
         money = [c for c in captures or [] if c.get("status") not in NO_MONEY_CAPTURE]
         if status in TAKEN_AUTH or money:
-            verdict = "ours" if self._could_be_ours(d, status, captures, money) else "taken"
+            verdict = "ours" if self._could_be_ours(d, b, status, captures, money) else "taken"
         elif status in OPEN_AUTH:
             verdict = "open"
         elif status in GONE_AUTH:
@@ -739,9 +863,11 @@ class Engine:
             self.require_paypal(self.get(drop).id)
             return self._reconcile(drop)
 
-    def _reconcile(self, drop: str) -> dict:
+    def _reconcile(self, drop: str, unreadable=None) -> dict:
+        """`unreadable(u)` is how the caller says what a hold PayPal will not describe (403 and the like) means for it: settle blocks,
+        everything else stops with `hold_unreadable`."""
         out = self._new_out()
-        self._reconcile_leaves(drop, out)
+        self._reconcile_leaves(drop, out, unreadable)
         for rid in list(self.get(drop).unresolved):
             d = self.get(drop)
             if rid not in d.unresolved:
@@ -750,7 +876,7 @@ class Engine:
             self._reconcile_one(d, rid, d.unresolved[rid], out)
         return out
 
-    def _reconcile_leaves(self, drop: str, out: dict) -> None:
+    def _reconcile_leaves(self, drop: str, out: dict, unreadable=None) -> None:
         """A leave that was started and never confirmed is resolved by reading the authorisation and, if the hold is still open,
         by releasing it. Decision D-11b (Tye, 2026-10-27, extending D-11): a leave the buyer asked for before the deadline is
         honoured even if PayPal errored, because nobody who saw an error is charged. So:
@@ -759,7 +885,10 @@ class Engine:
             the buyer is still out of the crowd and the hold is recorded as `void_failed`, which `verify` keeps reporting
             (with the hold to void by hand) until PayPal shows it gone. If PayPal cannot be reached, nothing is decided: the
             leave stays open and the caller stops (to be resumed);
-          - captured: money moved before the leave was honoured, so it cannot be: `leave_failed`, and verify reports it."""
+          - captured: money moved before the leave was honoured, so it cannot be: `leave_failed`, and verify reports it.
+        The read of the hold is answered exactly as `_revalidate` answers it: a 404 means PayPal has no such authorisation, so nothing
+        is held and the buyer left; any other refusal (a 403) means PayPal will not say, which stops the caller with
+        `hold_unreadable` and the way out (void the hold by hand, or `drop exclude`), never a bare `paypal_error`."""
         for bid, j in list(self.get(drop).leaving.items()):
             d = self.get(drop)
             if bid not in d.leaving:
@@ -775,10 +904,15 @@ class Engine:
                 cur = self.holds.get(b.auth_id)
             except PayPalUnavailable:
                 raise CrowdError("paypal_unavailable", drop=d.id) from None
+            except HoldNotFound:              # PayPal's own answer: it has no such authorisation, so it holds nothing
+                cur = {"status": "NOT_FOUND"}
             except HoldError as e:
-                raise CrowdError("paypal_error", drop=d.id, buyer=bid, issue=e.issue or e.code, http=e.http) from None
+                u = _Unreadable(b, e)
+                if unreadable is not None:
+                    unreadable(u)
+                raise self._unreadable_error(d, u) from None
             status = cur.get("status")
-            if status in GONE_AUTH:
+            if status in GONE_AUTH or status == "NOT_FOUND":
                 voided = {"buyer": bid, "auth_id": b.auth_id, "reason": "left", "reconciled": True, "paypal_status": status,
                           **self._evidence()}
                 if status == "EXPIRED":
@@ -1095,7 +1229,7 @@ class Engine:
             if d.state not in ("closed", "settling"):
                 raise CrowdError("drop_not_closed", drop=d.id, state=self.display_state(d))
             self.require_paypal(d.id)
-            self._reconcile(d.id)
+            self._reconcile(d.id, unreadable=lambda u: self._block(self.get(drop), u.err, u.buyer, "check"))
             d = self.get(drop)
             self._check_breaker(d)                 # on every settle, before anything is captured or released
             read_at = self.now()
@@ -1187,8 +1321,10 @@ class Engine:
         """Failed captures that share a cause are not unlucky buyers. Stop, before anything is released, on either sign:
           - two capture failures in a row, of ANY buyer-specific codes (a shared cause need not show the same code twice);
           - more than half of the captures attempted failing, once at least four were attempted.
-        `AUTHORIZATION_EXPIRED` and the engine's own `hold_expired` are facts about one hold and do not count (settle removes
-        holds PayPal says have lapsed before the plan is approved anyway). The count starts again after every capture that goes
+        `AUTHORIZATION_EXPIRED` and the engine's own `hold_expired` are facts about one hold and do not count, but only when PayPal,
+        asked, said EXPIRED (the failure carries `paypal_status: EXPIRED`): the error NAME alone is a claim, and a refusal that
+        PayPal's own GET contradicts (it shows the hold open) counts like any other, so a shared cause dressed as a per-hold one
+        stops settlement instead of failing and releasing every hold. The count starts again after every capture that goes
         through (for the streak) and after every block (for both), so a person who looked and ran settle again is not stopped
         by the failures already looked at. Evaluated from the whole event history at the start of EVERY settle, so a crash
         between the failure that should have tripped it and the block cannot skip it."""
@@ -1200,8 +1336,9 @@ class Engine:
             elif t == "hold_captured":
                 streak, attempts = [], attempts + 1
             elif t == "capture_failed":
-                if p.get("code") in BREAKER_EXEMPT or str(p.get("issue") or "").upper() == "AUTHORIZATION_EXPIRED":
-                    continue
+                named_expired = p.get("code") in BREAKER_EXEMPT or str(p.get("issue") or "").upper() == "AUTHORIZATION_EXPIRED"
+                if named_expired and p.get("paypal_status") == "EXPIRED":
+                    continue          # PayPal, asked, said this hold lapsed: a fact about one hold. The NAME alone proves nothing
                 attempts += 1
                 failed.append(p.get("buyer"))
                 streak.append((p.get("buyer"), p.get("issue") or p.get("code")))
@@ -1222,40 +1359,65 @@ class Engine:
             return False
 
     def _capture_one(self, d: Drop, b: Buyer, final: Decimal) -> None:
+        """Capture ONE hold at the final price, having asked PayPal what the hold is at this very moment. The rule is the same
+        whatever the hold's date or our clock says, and it comes before anything is sent:
+          - open (CREATED or PENDING, no capture on its order): write the attempt down (`capture_started`), then capture;
+          - the engine's own capture, whose reply was lost (see `_could_be_ours`): recorded, never made a second time;
+          - anything else: a capture by somebody else, a hold voided, lapsed or missing. The hold leaves the crowd with PayPal's
+            word on it, and no capture is ever POSTed on top of money already taken.
+        The cap on what PayPal lets one authorisation take is not a guard: a partial capture by someone else leaves room for ours, and
+        the two together would charge the buyer twice."""
         if final > b.hold_amount or final <= 0:
             raise CrowdError("capture_exceeds_hold", drop=d.id, buyer=b.id)
-        cur = self._ask_if_clock_expired(b)
-        if cur is not None and cur.get("status") == "EXPIRED":      # our clock said so, and PayPal agrees: the only reason not to try
+        d = self.get(d.id)                # the attempts on record are those of now, not of when settle started
+        seen = self._inspect_or_block(d, b, "capture")
+        verdict, status = seen["verdict"], seen["status"]
+        rid = request_id_for(d.id, b.id, "capture", b.attempts)
+        if verdict == "ours":
+            self._record_recovered(d, b, final, None)
+            return
+        if verdict == "gone" and status == "EXPIRED":     # PayPal says it lapsed: the only reason to skip the capture, and it said it
             self.store.append(d.id, "capture_failed", {
                 "buyer": b.id, "auth_id": b.auth_id, "code": "hold_expired", "message": "PayPal says the hold has expired",
                 "paypal_status": "EXPIRED", "expires": b.expires, "checked_at": iso(self.now()), **self._evidence()},
                 ts=self.now())
             return
-        rid = request_id_for(d.id, b.id, "capture", b.attempts)
-        failure, proof, c, recovered = None, {}, None, False
+        if verdict != "open":
+            self._record_hold_left(d, b, seen, self.now(), self.now())
+            return
+        tried = d.capturing.get(b.id)
+        if not tried or tried.get("request_id") != rid or tried.get("auth_id") != b.auth_id or not self._same_amount(tried, final):
+            self.store.append(d.id, "capture_started", {
+                "buyer": b.id, "auth_id": b.auth_id, "amount": m(final), "currency": d.currency, "request_id": rid,
+                "attempt": b.attempts, **self._evidence()}, ts=self.now())
+        failure, proof, c = None, {}, None
         try:
-            if cur is not None and cur.get("status") in TAKEN_AUTH:
-                # The date passed while a capture was already made (its reply lost, or settle stopped). PayPal says the money
-                # was taken: find that capture and record it, rather than call the hold expired or capture it again.
-                c, recovered = self._recover(d, b), True
-                if not self._same_amount(c, final):
-                    self._block(d, None, b, "capture", code="captured_not_as_approved",
-                                message=f"PayPal says the hold is {cur.get('status')}, but no single capture of the final price "
-                                        f"can be found for it.")
-            else:
-                c = self.holds.capture(b.auth_id, final, rid, final=True, currency=d.currency,
-                                       simulate_decline=(b.card_index == DECLINE_CARD_INDEX))
+            c = self.holds.capture(b.auth_id, final, rid, final=True, currency=d.currency,
+                                   simulate_decline=(b.card_index == DECLINE_CARD_INDEX))
         except AuthorizationAlreadyCaptured as e:
-            c, recovered = self._recover(d, b), True   # captured on an earlier run that crashed before it was recorded
-            if not self._same_amount(c, final):        # PayPal's word that it is captured, and nothing we can match to it
-                self._block(d, e, b, "capture", message="PayPal says the hold was already captured, but no single capture of "
-                                                        "the final price can be found for it.")
+            # Taken in the moment between the read and the call. Look again, and apply the same rule: the engine's own capture is
+            # recorded, anything else leaves the crowd as a stray for a person to refund.
+            now_seen = self._inspect_or_block(self.get(d.id), b, "capture")
+            if now_seen["verdict"] == "ours":
+                self._record_recovered(self.get(d.id), b, final, e)
+            elif now_seen["verdict"] == "open":
+                self._block(d, e, b, "capture", message="PayPal says the hold was already captured, but it shows nothing taken from it.")
+            else:
+                self._record_hold_left(self.get(d.id), b, now_seen, self.now(), self.now())
+            return
         except PayPalUnavailable:
             raise CrowdError("paypal_unavailable", drop=d.id) from None
         except PayPalRefused as e:
             if not buyer_specific(e):     # the account, the request, or a name nobody has seen: not this buyer's doing
                 self._block(d, e, b, "capture")
             failure, proof = (e.code, str(e)[:200]), self._evidence(e)
+            if _says_expired(e):
+                # PayPal has just refused with a name that means "this hold lapsed". The name is only a claim: PayPal is asked. Only
+                # an EXPIRED answer makes it a fact about this one hold (and keeps it out of the breaker's count); anything else
+                # (PayPal still shows the hold open, or will not say) leaves a refusal that cannot be explained, which counts.
+                said = self._read_status(d, b.auth_id)
+                if said is not None:
+                    proof = {**proof, "paypal_status": said}
         except HoldError as e:            # not about this buyer (credentials, configuration): stop
             self._block(d, e, b, "capture")
         if failure is None and c is not None and c.get("auth_id") and c["auth_id"] != b.auth_id:
@@ -1275,6 +1437,37 @@ class Engine:
                                                        "message": failure[1], **proof}, ts=self.now())
             self._check_breaker(self.get(d.id))
             return
+        self._record_captured(d, b, final, c, recovered=False)
+
+    def _inspect_or_block(self, d: Drop, b: Buyer, phase: str) -> dict:
+        """`_inspect`, with a hold PayPal will not describe stopping settlement for a person (the exact way out is in the block)."""
+        try:
+            return self._inspect(d, b)
+        except _Unreadable as u:
+            self._block(d, u.err, u.buyer, phase)
+            raise AssertionError("unreachable")       # _block always raises
+
+    def _record_recovered(self, d: Drop, b: Buyer, final: Decimal, why: HoldError | None) -> None:
+        """The hold shows the engine's own capture (see `_could_be_ours`): find it, check it is the one capture for exactly the final
+        price, and record it as made, rather than capture again. If it cannot be matched with certainty, settlement stops."""
+        c = self._recover(d, b)
+        if not self._same_amount(c, final):    # PayPal's word that it is captured, and nothing we can match to it
+            self._block(d, why, b, "capture", code=None if why is not None else "captured_not_as_approved",
+                        message="PayPal says the hold was already captured, but no single capture of the final price can be found "
+                                "for it.")
+        if c.get("auth_id") and c["auth_id"] != b.auth_id:
+            self._block(d, None, b, "capture", code="capture_on_another_hold", paypal_capture_id=c.get("capture_id"),
+                        message=f"PayPal's capture {c.get('capture_id')} belongs to authorisation {c['auth_id']}, not to "
+                                f"the hold {b.auth_id}.")
+        if c.get("status") not in ("COMPLETED", "PENDING"):
+            self.store.append(d.id, "capture_failed", {
+                "buyer": b.id, "auth_id": b.auth_id, "code": "capture_not_completed", "message": f"capture status {c.get('status')}",
+                "paypal_capture_id": c.get("capture_id"), "paypal_status": c.get("status"), **self._evidence()}, ts=self.now())
+            self._check_breaker(self.get(d.id))
+            return
+        self._record_captured(d, b, final, c, recovered=True)
+
+    def _record_captured(self, d: Drop, b: Buyer, final: Decimal, c: dict, recovered: bool) -> None:
         fee = lad.D(c["fee"]) if c.get("fee") is not None else lad.fee(final)
         net = lad.D(c["net"]) if c.get("net") is not None else final - fee
         self.store.append(d.id, "hold_captured", {

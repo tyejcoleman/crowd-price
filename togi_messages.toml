@@ -195,6 +195,26 @@ message = "Drop {drop} belongs to a different PayPal ({recorded}) than the one t
 next = "Use the PayPal the drop was made with (CROWD_PAYPAL={recorded_mode}), or work in a different store (CROWD_DB)."
 status = "refused"
 
+[errors.drop_unbound]
+message = "Drop {drop} records no PayPal (it was written before drops did), so it belongs to no PayPal yet and nothing was read or written. The PayPal in use now is {current}, and the engine will not guess that it is the one that placed the drop's holds."
+next = "Look at the holds, then a person binds the drop to the right PayPal: togi crowd drop holds --drop {drop}"
+status = "refused"
+
+[errors.already_bound]
+message = "Drop {drop} is already bound to a PayPal ({paypal}); it cannot be bound again."
+next = "togi crowd drop status --drop {drop}"
+status = "refused"
+
+[errors.bind_mismatch]
+message = "Not binding {drop}: the PayPal in use ({paypal}) does not know, or will not say what it is about, hold(s) {holds} that the drop placed, so it cannot be shown to be the PayPal the drop was made with. Nothing was written."
+next = "Use the PayPal the drop was made with (CROWD_PAYPAL, the sandbox credentials), then: togi crowd drop holds --drop {drop}"
+status = "refused"
+
+[errors.bind_changed]
+message = "Not binding {drop} as {expected}: the PayPal and holds now read give {actual}. Nothing was written."
+next = "A person approves what is there now: togi crowd drop bind --drop {drop} --expect {actual}"
+status = "refused"
+
 [errors.buyer_excluded]
 message = "{buyer} was taken out of drop {drop} by a person and cannot rejoin it."
 next = "togi crowd drop status --drop {drop}"
@@ -221,7 +241,7 @@ next = "A person must check the buyer's earlier hold in the PayPal sandbox, then
 status = "refused"
 
 [errors.test_approval_outside_test_mode]
-message = "Refusing to settle: this approval was made by a throwaway test approver (scope {scope}), and {why}. Real value is only ever settled on an approval from the person's own approver."
+message = "Refusing to run {command}: this approval was made by a throwaway test approver (scope {scope}), and {why}. Real value is only ever moved, released or bound on an approval from the person's own approver."
 next = "A person approves it with their own approver (no TOGI_APPROVER_HOME set): togi approve <id>"
 status = "refused"
 
