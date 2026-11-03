@@ -113,11 +113,13 @@ svg.ladder .crowd circle { fill: var(--ink); stroke: var(--paper); stroke-width:
 svg.ladder .crowd text { font-family: var(--sans); font-size: 13px; font-weight: 600; fill: var(--ink); }
 .caption { margin: 10px 0 0; font-size: 15px; color: var(--ink-2); display: flex; flex-wrap: wrap; gap: 4px 22px; }
 .caption .n { font-family: var(--mono); color: var(--ink); font-weight: 500; }
-.profitrow { margin: 14px 0 0; padding-top: 12px; border-top: 1px solid var(--line); display: flex; flex-wrap: wrap; gap: 6px 22px; font-size: 14px; color: var(--muted); }
-.profitrow .k { color: var(--ink-2); font-weight: 600; margin-right: 4px; }
+.profit { margin: 14px 0 0; padding-top: 12px; border-top: 1px solid var(--line); }
+.profitnow { margin: 0 0 6px; font-size: 15px; color: var(--ink-2); }
+.profitnow .k { color: var(--ink-2); font-weight: 600; }
+.profitnow .v { font-family: var(--mono); color: var(--go); font-weight: 500; }      /* the one green figure: the profit at the crowd's own count */
+.profitrow { margin: 0; display: flex; flex-wrap: wrap; gap: 6px 22px; font-size: 14px; color: var(--muted); }
+.profitrow .k { color: var(--muted); font-weight: 500; margin-right: 4px; }
 .profitrow .v { font-family: var(--mono); }
-.profitrow .now { color: var(--ink); }
-.profitrow .now .v { color: var(--go); font-weight: 500; }
 
 .foot { padding: 28px 0 56px; color: var(--muted); font-size: 13px; border-top: 1px solid var(--line); margin-top: 36px; }
 
@@ -157,6 +159,10 @@ svg.ladder .crowd text { font-family: var(--sans); font-size: 13px; font-weight:
 .buyers .st { font: 12px var(--mono); color: var(--muted); white-space: nowrap; }
 .buyers .st.bad { color: var(--stop); }
 .counts { font: 12px var(--mono); color: var(--muted); font-weight: 400; }
+.buyerlink { font: 500 13.5px var(--sans); color: var(--ink-2); text-decoration: none; }
+.buyerlink:hover { color: var(--ink); text-decoration: underline; text-underline-offset: 3px; }
+.facts .keep dt { color: var(--ink-2); font-weight: 600; }
+.facts .keep .v { color: var(--go); font-weight: 500; }
 .keyform { max-width: 460px; margin: 80px auto; }
 
 /* ---- the index */

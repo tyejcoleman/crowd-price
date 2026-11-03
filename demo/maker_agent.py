@@ -55,8 +55,12 @@ SCENARIOS = {
 
 
 def build_command(model, prompt, claude="claude"):
-    """The exact `claude -p` call: one tool (Bash), only `togi` commands, no saved session, no MCP servers."""
-    return [claude, "-p", prompt, "--model", model, "--system-prompt", SYSTEM,
+    """The exact `claude -p` call: one tool (Bash), only `togi` commands, no saved session, no MCP servers.
+
+    `--restricted` matters: an allow-list only ADDS to the person's own settings, and a `Bash(*)` rule or an `auto` default
+    mode in ~/.claude/settings.json would let every other command through (seen on the founder's machine: `cat
+    /etc/hosts` ran). Restricted mode reads no user, project or local settings file, so `Bash(togi:*)` is the whole list."""
+    return [claude, "-p", prompt, "--model", model, "--system-prompt", SYSTEM, "--restricted",
             "--tools", "Bash", "--allowedTools", "Bash(togi:*)", "--strict-mcp-config", "--disable-slash-commands",
             "--no-session-persistence", "--output-format", "stream-json", "--verbose"]
 

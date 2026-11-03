@@ -68,3 +68,9 @@ An agent cannot approve: `togi approve` needs a real terminal and refuses when `
 
 - The agent runs in an empty temp directory with one tool: Bash restricted to `togi ...`.
 - `claude -p` uses your Claude plan. Use `--model haiku` while rehearsing.
+
+## The same assistant in a browser
+
+`python3 -I web/studio.py --maker-name Juniper` runs an assistant like this one as a chat beside a live panel of the drop
+(on the same Crowd Price tools, reached over MCP instead of the CLI, with no other tool), and lets Juniper approve the
+charge in that panel with her passphrase instead of a terminal. See the main README, step 6.

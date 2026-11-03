@@ -722,8 +722,20 @@ class Api:
         out["feed"] = feed(events, {b.id: b.name for b in d.buyers.values()}, d.title)
         out["approvals"] = self.approvals(d.id)
         if d.costs:
+            unit, fixed = d.costs["unit_cost"], d.costs["fixed_cost"]
             out["profit"] = [{"from_buyers": r["min_buyers"], "price": m(r["price"]), "profit": m(r["profit"])}
-                             for r in lad.profit_table(d.ladder, d.costs["unit_cost"], d.costs["fixed_cost"])]
+                             for r in lad.profit_table(d.ladder, unit, fixed)]
+            # The profit NOW: each step's figure is at exactly that step's count, so the crowd's own count gives its own figure.
+            # Before settling, the ladder's sum at this count and price (the engine's lad.profit, PayPal's fee model); once
+            # charged, what PayPal paid out less the costs (the same subtraction the maker would do, on the engine's totals).
+            s = d.settled or {}
+            if s.get("outcome") == "funded" and (s.get("totals") or {}).get("net") is not None:
+                n = int((s.get("counts") or {}).get("captured") or 0)
+                out["profit_now"] = {"buyers": n, "price": s["final_price"], "settled": True,
+                                     "profit": m(lad.D(s["totals"]["net"]) - lad.D(unit) * n - lad.D(fixed))}
+            elif not d.settled and d.count >= d.minimum:
+                out["profit_now"] = {"buyers": d.count, "price": m(d.price()), "settled": False,
+                                     "profit": m(lad.profit(d.count, d.price(), unit, fixed))}
         if d.closed:
             out["closed"] = {k: d.closed.get(k) for k in ("reason", "count", "funded", "price", "closed_at")}
         if d.settled:

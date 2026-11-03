@@ -136,7 +136,101 @@ for your `togi approve`; once settled, it checks every hold and capture with Pay
 page can settle, exclude or bind: those move money, and only a person approves them, in Togi. How to host it behind a proxy, what
 it limits, and the rare cases it does not close: [web/SECURITY.md](web/SECURITY.md).
 
-### 6. The same in the PayPal sandbox
+### 6. The studio: run a drop from a chat, approve the charge in the panel
+
+The whole story in one page, from your own terminal:
+
+```bash
+export CROWD_ENV=test CROWD_PAYPAL=fake CROWD_DETAILS=web/demo/details.json
+python3 -I web/studio.py --maker-name Juniper       # prints the studio link with its key; this machine only
+```
+
+Open the studio link. On the left is a chat with your assistant; on the right, the drop it is working on, live: the
+price, the ladder with your profit at each step and the profit now, the buyers as they join, the activity, the outcome.
+Tell it your costs ("clay and glaze are 9 dollars a mug, the firing is 260, I need 30 sold"); it asks the engine for a
+ladder, opens the drop and runs it. Each thing it does shows as a step in plain words ("Asked the engine for a price ladder
+from your costs", "Checked every charge with PayPal"); open a step for what it came to, and one click further for the exact
+tool call and Togi's reply. On a phone the chat and the drop are two tabs. When the drop closes it asks to settle, and the
+panel shows what Togi will sign: how many buyers are charged what, the total, what goes back of each hold, the drop the yes
+binds to, and how long the yes works; "Exactly what you sign" opens on those lines in plain words, with Togi's exact signed
+text behind "Show the signed text". Approve there with your approver passphrase (or "Not now": the request waits until it
+lapses, and nothing is charged); the assistant settles, checks every charge with PayPal and explains the outcome.
+
+How the approval stays yours:
+
+- **It is Togi's own check, not a shortcut around it.** The panel uses Togi's approval desk (`togi.desk`). Togi
+  recomputes the request from the live repo exactly as `togi approve` does, fixes the expiry it will sign, and shows you
+  that; your yes is bound to what you were shown (the review), and if the request, the plan or the locked code changed
+  since, nothing is approved. The card is built from that signed review only. The drop's name is the assistant's words, so
+  the card shows it only quoted, cut short, with any character that could move or hide text shown as its code, and labelled
+  "your assistant's name for it". The terminal's typed confirmation word is not retyped: the card shows it (for a settle,
+  the drop the request binds to) and sends back the word it showed. The passphrase is checked against the same approver
+  (same record, the same five-wrong lock-out, shared with the terminal; a passphrase that cannot even be encoded counts as
+  a wrong one), and the grant is the same signed, single-use, 15-minute one.
+- **Only a server you started can approve.** The desk opens once, as the studio starts, and not under `TOGI_AGENT` or
+  `togi run`, not in an interpreter that is not isolated (so use `python3 -I web/studio.py`; `python3 -m crowdweb` cannot
+  approve), not without an approver, and, for your own approver, only from a terminal (a `TOGI_APPROVER_HOME` that is your
+  own approver by another path counts as your own). The launcher puts this repo and Togi after the standard library on the
+  import path, so nothing in them can stand in for a standard module (nor for the three modules that exist only on Windows,
+  which it closes first), and imports only the Togi your `togi` launcher runs (`TOGI_SRC`, if set, must be that one; the options
+  are read exactly as written, never abbreviated, so `--tog` cannot name a different Togi for the assistant). If the desk did
+  not open, the panel shows the `togi approve` command and says why.
+- **A request it cannot read is not shown or approved.** The card is built from the plan token Togi signed
+  (`capture:45:37.00:1665.00` or `void:22`, with `+release:K`). A token that is anything else, even with a space around it
+  (Togi files it as given and the engine strips the space, so it would settle the real plan), gets no approve form: the panel
+  says "This request cannot be read" and the assistant has to ask again. While a request waits, the headline says "Your drop"
+  and the assistant's name for it appears only on the card, quoted and labelled.
+- **The passphrase goes from your browser to that check and nowhere else**: not to the assistant, its context, a log
+  (the server logs request lines only) or the disk.
+- **The assistant cannot reach it, and has nothing but the drop tools.** It is `claude -p` (on your own Claude plan;
+  `ANTHROPIC_API_KEY` is removed from its environment, so never per-call API billing) with no built-in tools at all
+  (`--tools ""`: no shell, no files, no web), in Claude Code's restricted mode (your own settings files are not read), with
+  one MCP server: the studio is an MCP client of `togi mcp serve crowd`, exactly what any MCP client gets. That server is
+  reached through a small gate the studio writes, which lists only the tools a maker needs and refuses any other call
+  itself; Claude Code's allow-list names the same tools, with `dontAsk`. The studio reads a step's result only from a call
+  that passed its own check, so nothing else can move the panel or announce an approval. `TOGI_AGENT` is set and the
+  studio's key is not in its environment. Buyer names and drop titles reach it inside tool replies; they are data, and
+  nothing it can call moves money without you. Every studio route needs the key, every POST must come from the studio page
+  itself, and the server listens on 127.0.0.1 only.
+
+Options: `--port` (8790), `--model` (sonnet), `--maker-key` or `CROWD_MAKER_KEY`, `--claude`, `--togi` (the launcher the
+assistant's tools run, and the Togi the desk uses). With a throwaway test approver (`TOGI_APPROVER_HOME` set) the desk opens
+without a terminal, and Crowd honours its yes only on the Pretend PayPal.
+
+Threat model, one limit to know: Togi tells your own approver from a test one by where its files are (the same directory by
+another path, a link, or its files linked in). **A plain copy of your approver's files, used as a test approver, is not
+detected.** The desk then opens for it without a terminal, as it does for any test approver. What it signs is test scope, and
+Crowd honours test-scope grants only on the Pretend PayPal, where no money moves; on the PayPal sandbox only your own
+approver's yes counts. Anything that can read your files can already make a test approver of its own; the copy adds nothing to
+that, but do not treat "the desk opened without a terminal" as proof that the approver is not yours.
+
+Tests: `TOGI_SRC=<a Togi with togi/desk.py>/src python3 -m pytest -q web/tests` (the desk tests fail, never skip, without
+that Togi); `CROWD_STUDIO_REAL_CLAUDE=1` adds one run of the real `claude` with the studio's own flags.
+
+### The same tools from any MCP client or the command line
+
+The studio is one client of Crowd Price; the engine does not know or care which agent drives it. Any agent can use the
+same commands, with the same rule that money waits for a person:
+
+```bash
+togi skill crowd                  # what an agent reads first: the commands, the rules, the next step
+togi tools crowd --json           # the same commands as a JSON tool list
+togi crowd drop status --drop d_...   # the CLI: compact JSON, an exact `next` command on every refusal
+togi mcp serve crowd              # an MCP server over stdio (pip install mcp): crowd_skill, crowd_drop_create, ...
+```
+
+For an MCP client (Claude Desktop, an IDE, your own), the server entry is:
+
+```json
+{"mcpServers": {"crowd": {"command": "togi", "args": ["mcp", "serve", "crowd"],
+                          "env": {"TOGI_AGENT": "my-agent", "CROWD_ENV": "test", "CROWD_PAYPAL": "fake"}}}}
+```
+
+A money tool (`crowd_drop_settle`) returns `needs_approval` with an approval id; a person grants it with `togi approve`
+in their terminal or in the studio's panel, then the agent calls the tool again with `approval`. No MCP tool, CLI command
+or flag can grant one.
+
+### 7. The same in the PayPal sandbox
 
 Create a free sandbox app at [developer.paypal.com](https://developer.paypal.com/) (Apps & Credentials, Sandbox), then:
 
@@ -167,8 +261,8 @@ The live tests: `CROWD_LIVE=1 PYTHONPATH=../togi/src python3 -m pytest -q tests/
 ## AI tools used
 
 - **In the product:** Claude, through Claude Code (`claude -p`, Sonnet or Haiku), is the maker's assistant in
-  `demo/maker_agent.py`. It learns Crowd Price from `togi skill crowd` ([skills/](skills/)) and acts only through
-  `togi crowd ...` commands. Togi serves the same commands as a JSON tool list, a code-mode API (`togi run`) and MCP
+  `demo/maker_agent.py` and in the studio (`web/studio.py`), where it streams its words and steps beside the live drop.
+  It learns Crowd Price from `togi skill crowd` ([skills/](skills/)) and acts only through `togi crowd ...` commands. Togi serves the same commands as a JSON tool list, a code-mode API (`togi run`) and MCP
   tools (`togi mcp serve`), so any agent can drive it.
 - **Machine-checked agent tasks:** [stone/tasks](stone/tasks) holds 7 tasks (2 held out) that an agent must complete
   against the pretend PayPal: open a drop, report the price after joins, request settlement, handle a missed minimum,
@@ -203,7 +297,8 @@ The live tests: `CROWD_LIVE=1 PYTHONPATH=../togi/src python3 -m pytest -q tests/
 - `src/crowd/`: the engine (`engine.py`), price ladder (`ladder.py`), PayPal holds client and pretend PayPal
   (`paypal_holds.py`), store, settlement check (`verify.py`), Togi bundle (`togi_bundle.py`)
 - `src/closure/`: the balance certifier used by `drop tieout` ([docs/closure.md](docs/closure.md))
-- `web/crowdweb/`: the drop page and the maker view (standard library server, plain HTML, CSS and JavaScript); `web/tests/`
+- `web/crowdweb/`: the drop page, the maker view and the studio (standard library server, plain HTML, CSS and JavaScript;
+  `studio.py`, `studio_http.py`, `studio_main.py`, launched by `web/studio.py`); `web/tests/`
 - `skills/`: what the assistant reads; `stone/tasks/`: the agent tasks; `togi.toml`: tiers, locks and policy
 - `demo/`: the assistant; `tests/`: the test suite; `harness/`: sandbox seeder and checks; `eval/`: the certifier's
   scorecard

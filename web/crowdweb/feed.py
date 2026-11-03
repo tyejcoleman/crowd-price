@@ -1,13 +1,16 @@
 """The maker's activity feed: a drop's event log in plain words.
 
 Built from the events as recorded, newest first. Runs of the same thing (thirty buyers joining in one batch, fifty-two
-captures at settlement) become one line with a count. Bookkeeping events (a join or capture written down before PayPal is
+captures at settlement) become one line with a count; a batch of the assistant's test buyers is one line of its own ("30 test
+buyers joined"), and a real buyer who joins in the middle of one gets a line of their own between its parts. Bookkeeping events (a join or capture written down before PayPal is
 asked) are left out; what they lead to is shown instead. Every amount is copied from an event; nothing is added up.
 """
 from __future__ import annotations
 
 import re
 from datetime import datetime
+
+from .text import visible
 
 # event type -> the kind of line it makes; consecutive events of the same kind are grouped into one line
 KINDS = {
@@ -74,9 +77,11 @@ def _line(kind: str, items: list[dict], title: str) -> tuple[str | None, str]:
     n = len(items)
     who = _names(items)
     if kind == "created":
-        return None, f"Drop created: {title}, minimum {p.get('minimum')}"
+        return None, f"Drop created: {visible(title, 60)}, minimum {p.get('minimum')}"       # the assistant's words: escaped, cut short
     if kind == "published":
         return None, "Published. Buyers can join"
+    if kind == "joined" and items[0].get("sim"):        # a batch of the assistant's test buyers: said as one, never with a real name in it
+        return None, (f"{n} test buyers joined · ${p.get('amount')} held each" if n > 1 else f"1 test buyer joined · ${p.get('amount')} held")
     if kind == "joined":
         return who, (f"joined. ${p.get('amount')} held each" if n > 1 else f"joined. ${p.get('amount')} held")
     if kind == "declined":
@@ -154,8 +159,10 @@ def feed(events: list[dict], buyers: dict, title: str, limit: int = 60) -> list[
         if kind is None or (e["type"] == "hold_voided" and p.get("reason") == "left"):   # a leave says so in its own line
             continue
         item = {"ts": e["ts"], "payload": p, "name": p.get("name") or buyers.get(p.get("buyer"), p.get("buyer") or "")}
+        item["sim"] = display_name(item["name"]) != item["name"]
         last = groups[-1] if groups else None
         if (last and kind in GROUPED and last["kind"] == kind
+                and (kind != "joined" or last["items"][-1]["sim"] == item["sim"])      # test buyers and real ones never share a line
                 and (_ts(e["ts"]) - _ts(last["items"][-1]["ts"])).total_seconds() <= GROUP_GAP_SECONDS):
             last["items"].append(item)
         else:
