@@ -210,9 +210,9 @@ def test_the_feed_groups_a_batch_and_says_when_the_price_drops(api, engine, drop
     sim(engine, drop, 5)
     lines = [(f["who"], f["text"]) for f in api.maker(drop)["feed"]]
     assert lines[:4] == [(None, "5 buyers: everyone now pays $36.00"),
-                         ("Simulated buyer 004 and Simulated buyer 005", "joined. $40.00 held each"),
+                         (None, "2 test buyers joined · $40.00 held each"),
                          (None, "Minimum reached with 3 buyers: everyone pays $40.00"),
-                         ("Simulated buyer 001, Simulated buyer 002 and Simulated buyer 003", "joined. $40.00 held each")]
+                         (None, "3 test buyers joined · $40.00 held each")]
     assert lines[-1] == (None, "Drop created: Speckled mugs, minimum 3")
     many = [{"ts": "2026-11-01T12:00:00Z", "type": "hold_placed", "payload": {"buyer": f"b{i}", "name": f"B{i}", "amount": "40.00"}}
             for i in range(6)]
@@ -1029,7 +1029,7 @@ def drop_js(tmp_path, **scenario) -> dict:
 MAKER_JS_HARNESS = r'''
 const fs = require("fs"), vm = require("vm");
 const sc = JSON.parse(fs.readFileSync(0, "utf8"));
-const src = fs.readFileSync(process.argv[2], "utf8");
+const srcs = process.argv.slice(2).map(f => fs.readFileSync(f, "utf8"));     // panel.js (shared), then maker.js
 let drawn = [];
 const app = { replaceChildren(...k) { drawn = k.flat(Infinity); } };
 function el(tag, attrs, ...kids) { return { tag, attrs: attrs || {}, kids: kids.flat(Infinity) }; }
@@ -1047,7 +1047,7 @@ const ctx = { CP, document: { getElementById: id => (id === "app" ? app : null),
   location: { hash: "#drop=d_test", pathname: "/maker" }, history: { replaceState() {} }, sessionStorage: {}, URLSearchParams,
   requestAnimationFrame: f => f(), setTimeout, clearTimeout, setInterval: () => 0, console, JSON, Math, Object, Array, Set, Promise, Date, String, Number };
 vm.createContext(ctx);
-vm.runInContext(src, ctx);
+for (const src of srcs) vm.runInContext(src, ctx);
 setTimeout(() => {
   const rows = drawn.flatMap(n => find(n, x => x.attrs.class === "buyers")).flatMap(ul => ul.kids.map(li => li.kids.flatMap(words)));
   const counts = drawn.flatMap(n => find(n, x => x.attrs.class === "panel buyers-panel")).flatMap(p => find(p, x => x.attrs.class === "counts")).flatMap(words);
@@ -1060,7 +1060,7 @@ setTimeout(() => {
 def maker_js(tmp_path, maker: dict) -> dict:
     harness = tmp_path / "maker_js_harness.js"
     harness.write_text(MAKER_JS_HARNESS)
-    run = subprocess.run(["node", str(harness), str(WEB / "static" / "maker.js")], input=json.dumps({"maker": maker}), text=True,
+    run = subprocess.run(["node", str(harness), str(WEB / "static" / "panel.js"), str(WEB / "static" / "maker.js")], input=json.dumps({"maker": maker}), text=True,
                          capture_output=True, timeout=60)
     assert run.returncode == 0, run.stderr
     return json.loads(run.stdout)
@@ -1960,7 +1960,7 @@ def test_r5_f1_a_leave_paypal_would_not_release_reaches_the_buyer_and_the_maker(
     assert (me["status"], me["fate"]) == ("left", "not_released")
     row = next(r for r in api.maker(drop)["buyers_list"] if r["name"] == "Alex")
     assert (row["status"], row["fate"]) == ("left", "not_released")
-    mine = [f["text"] for f in api.maker(drop)["feed"] if f["who"] == "Alex"]
+    mine = [f["text"] for f in api.maker(drop)["feed"] if f["who"] == "Alex" and f["kind"] != "joined"]   # (his join is a line of its own)
     assert mine == ["left. PayPal would not release the hold"]                         # one line, never "Hold released" and then "would not"
 
 

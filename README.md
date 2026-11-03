@@ -146,37 +146,52 @@ python3 -I web/studio.py --maker-name Juniper       # prints the studio link wit
 ```
 
 Open the studio link. On the left is a chat with your assistant; on the right, the drop it is working on, live: the
-price, the ladder with your profit at each step, the buyers as they join, the activity, the outcome. Tell it your costs
-("clay and glaze are 9 dollars a mug, the firing is 260, I need 30 sold"); it asks the engine for a ladder, opens the
-drop and runs it. Each thing it does shows as a step in plain words ("Asked the engine for a price ladder from your
-costs", "Checked every charge with PayPal"); click a step to see the exact `togi` command and what it returned. On a
-phone the chat and the drop are two tabs. When the drop closes it asks to settle, and the panel shows exactly what will
-be charged, the lines `togi approve` would print, and a box for your approver passphrase. Approve there; the assistant
-settles, checks every charge with PayPal and explains the outcome.
+price, the ladder with your profit at each step and the profit now, the buyers as they join, the activity, the outcome.
+Tell it your costs ("clay and glaze are 9 dollars a mug, the firing is 260, I need 30 sold"); it asks the engine for a
+ladder, opens the drop and runs it. Each thing it does shows as a step in plain words ("Asked the engine for a price ladder
+from your costs", "Checked every charge with PayPal"); open a step for what it came to, and one click further for the exact
+tool call and Togi's reply. On a phone the chat and the drop are two tabs. When the drop closes it asks to settle, and the
+panel shows what Togi will sign: how many buyers are charged what, the total, what goes back of each hold, the drop the yes
+binds to, and how long the yes works; "Exactly what you sign" opens on those lines in plain words, with Togi's exact signed
+text behind "Show the signed text". Approve there with your approver passphrase (or "Not now": the request waits until it
+lapses, and nothing is charged); the assistant settles, checks every charge with PayPal and explains the outcome.
 
 How the approval stays yours:
 
 - **It is Togi's own check, not a shortcut around it.** The panel uses Togi's approval desk (`togi.desk`). Togi
   recomputes the request from the live repo exactly as `togi approve` does, fixes the expiry it will sign, and shows you
-  that; your yes is bound to what you were shown, and if the request, the plan or the locked code changed since, nothing
-  is approved. The passphrase is checked against the same approver (same record, the same five-wrong lock-out, shared
-  with the terminal), and the grant is the same signed, single-use, 15-minute one.
+  that; your yes is bound to what you were shown (the review), and if the request, the plan or the locked code changed
+  since, nothing is approved. The card is built from that signed review only. The drop's name is the assistant's words, so
+  the card shows it only quoted, cut short, with any character that could move or hide text shown as its code, and labelled
+  "your assistant's name for it". The terminal's typed confirmation word is not retyped: the card shows it (for a settle,
+  the drop the request binds to) and sends back the word it showed. The passphrase is checked against the same approver
+  (same record, the same five-wrong lock-out, shared with the terminal; a passphrase that cannot even be encoded counts as
+  a wrong one), and the grant is the same signed, single-use, 15-minute one.
 - **Only a server you started can approve.** The desk opens once, as the studio starts, and not under `TOGI_AGENT` or
   `togi run`, not in an interpreter that is not isolated (so use `python3 -I web/studio.py`; `python3 -m crowdweb` cannot
-  approve), not without an approver, and, for your own approver, only from a terminal. If it did not open, the panel
-  shows the `togi approve` command instead and says why.
+  approve), not without an approver, and, for your own approver, only from a terminal (a `TOGI_APPROVER_HOME` that is your
+  own approver by another path counts as your own). The launcher puts this repo and Togi after the standard library on the
+  import path, so nothing in them can stand in for a standard module, and imports only the Togi your `togi` launcher runs
+  (`TOGI_SRC`, if set, must be that one). If the desk did not open, the panel shows the `togi approve` command and says why.
 - **The passphrase goes from your browser to that check and nowhere else**: not to the assistant, its context, a log
   (the server logs request lines only) or the disk.
-- **The assistant cannot reach it.** It is the demo's `claude -p` (on your own Claude plan; `ANTHROPIC_API_KEY` is removed
-  from its environment, so never per-call API billing) with one tool, Bash, in Claude Code's restricted mode (your own
-  settings files are not read, so an allow-all rule there cannot widen it) with `dontAsk`, allowed only the `togi`
-  commands a maker needs, behind a `togi` shim that refuses the rest, with `TOGI_AGENT` set and without the studio's key.
-  Buyer names reach it inside command output; they are data, and nothing it can run moves money without you. Every studio
-  route needs the key, every POST must come from the studio page itself, and the server listens on 127.0.0.1 only.
+- **The assistant cannot reach it, and has nothing but the drop tools.** It is `claude -p` (on your own Claude plan;
+  `ANTHROPIC_API_KEY` is removed from its environment, so never per-call API billing) with no built-in tools at all
+  (`--tools ""`: no shell, no files, no web), in Claude Code's restricted mode (your own settings files are not read), with
+  one MCP server: the studio is an MCP client of `togi mcp serve crowd`, exactly what any MCP client gets. That server is
+  reached through a small gate the studio writes, which lists only the tools a maker needs and refuses any other call
+  itself; Claude Code's allow-list names the same tools, with `dontAsk`. The studio reads a step's result only from a call
+  that passed its own check, so nothing else can move the panel or announce an approval. `TOGI_AGENT` is set and the
+  studio's key is not in its environment. Buyer names and drop titles reach it inside tool replies; they are data, and
+  nothing it can call moves money without you. Every studio route needs the key, every POST must come from the studio page
+  itself, and the server listens on 127.0.0.1 only.
 
-Options: `--port` (8790), `--model` (sonnet), `--maker-key` or `CROWD_MAKER_KEY`, `--claude`, `--togi`; `TOGI_SRC` if
-Togi's source is not found from the `togi` on your PATH. With a throwaway test approver (`TOGI_APPROVER_HOME` set) the
-desk opens without a terminal, and Crowd honours its yes only on the pretend PayPal.
+Options: `--port` (8790), `--model` (sonnet), `--maker-key` or `CROWD_MAKER_KEY`, `--claude`, `--togi` (the launcher the
+assistant's tools run, and the Togi the desk uses). With a throwaway test approver (`TOGI_APPROVER_HOME` set) the desk opens
+without a terminal, and Crowd honours its yes only on the Pretend PayPal.
+
+Tests: `TOGI_SRC=<a Togi with togi/desk.py>/src python3 -m pytest -q web/tests` (the desk tests fail, never skip, without
+that Togi); `CROWD_STUDIO_REAL_CLAUDE=1` adds one run of the real `claude` with the studio's own flags.
 
 ### The same tools from any MCP client or the command line
 

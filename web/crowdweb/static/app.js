@@ -52,8 +52,8 @@ const CP = (() => {
 
   // Which PayPal this server runs on, said plainly in the header and the footer of every page.
   const MODE = {
-    fake: { env: "Pretend PayPal", more: " · no money moves", foot: "Every price and count here comes from the drop's engine. This copy runs on a pretend PayPal: no money moves." },
-    sandbox: { env: "PayPal sandbox", more: " · test money only", foot: "Every price and count here comes from the drop's engine. Holds are placed through PayPal's sandbox with test cards: no real money moves." },
+    fake: { env: "Pretend PayPal", more: " · no money moves", foot: "Every price and count here comes from the drop's engine. This copy runs on the Pretend PayPal: no money moves." },
+    sandbox: { env: "PayPal sandbox", more: " · test money only", foot: "Every price and count here comes from the drop's engine. Holds are placed in the PayPal sandbox with test cards: no real money moves." },
   };
   function showMode(mode) {
     const m = MODE[mode];

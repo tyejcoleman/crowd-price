@@ -38,7 +38,7 @@ from .api import Api, ApiError
 
 STATIC = Path(__file__).with_name("static")
 FILES = {"app.css": "text/css", "app.js": "text/javascript", "drop.js": "text/javascript", "maker.js": "text/javascript",
-         "index.js": "text/javascript", "mark.svg": "image/svg+xml"}
+         "panel.js": "text/javascript", "index.js": "text/javascript", "mark.svg": "image/svg+xml"}
 PAGES = {"drop": "drop.html", "maker": "maker.html", "index": "index.html"}
 DROP_ID = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 MAX_BODY = 4096

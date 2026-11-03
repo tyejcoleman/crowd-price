@@ -1,11 +1,14 @@
 // Crowd Price Studio: a chat with the maker's assistant, beside a live panel of the drop it is working on.
 // Everything the assistant says is shown as text (textContent), never as HTML. Every amount in the panel is a string the
-// server sent (the engine's, or Togi's recomputed approval); this file only lays it out. The passphrase is read from its
+// server sent (the engine's, or Togi's recomputed approval); this file only lays it out. The approval card is built from
+// Togi's signed review: what is charged, the drop it binds to, when the yes stops working. The drop's name is the
+// assistant's words, so it is shown only quoted, isolated and labelled as the assistant's. The passphrase is read from its
 // box when the person approves, sent once to this server's approval route (Togi's desk), and cleared; it is never kept in
-// the page's state, its storage or anything the assistant can see.
+// the page's state, its storage or anything the assistant can see. The panel's shared pieces are panel.js's.
 "use strict";
 (() => {
   const { el, api, showMode, money, plural, clockFrom, duration, hhmm, ladder, store } = CP;
+  const P = CPPanel;
   const KEYSTORE = "crowd-price:maker-key";
   const DROP_ID = /^[A-Za-z0-9_-]{1,64}$/;
   const AP_ID = /^ap_[0-9a-f]{6,32}$/;
@@ -16,11 +19,12 @@
   history.replaceState(null, "", location.pathname);
   const s = { key: store(KEYSTORE, undefined, sessionStorage) || "", info: null, epoch: 0, after: 0, busy: false, focus: null,
               items: [], byId: {}, d: null, dErr: null, review: null, reviewErr: null, approving: false, approveMsg: null,
-              approved: {}, checks: {}, busyCheck: {}, tab: "chat", keyErr: null, keys: {} };
+              approved: {}, later: {}, checks: {}, busyCheck: {}, tab: "chat", keyErr: null, keys: {} };
   const hdr = () => ({ "X-Maker-Key": s.key });
   const $ = id => document.getElementById(id);
   const log = $("log"), side = $("side"), say = $("say"), send = $("send");
   const narrow = () => window.matchMedia("(max-width: 860px)").matches;
+  const wherePanel = () => (narrow() ? "under the Drop tab" : "in the panel");
 
   // ---- the assistant's words, as text: paragraphs, lists, **bold** and `code`, all built with textContent -----------------
   function inline(line) {
@@ -59,8 +63,8 @@
   }
 
   // ---- the transcript ---------------------------------------------------------------------------------------------------
-  const MARK = { running: "", ok: "✓", needs_you: "●", refused: "×", error: "×" };
-  const STATE_WORDS = { running: "working", ok: "done", needs_you: "needs you", refused: "refused", error: "did not work" };
+  const MARK = { running: "", ok: "✓", needs_you: "●", refused: "×", error: "×", lapsed: "–" };
+  const STATE_WORDS = { running: "working", needs_you: "needs you", refused: "refused", error: "did not work", lapsed: "lapsed" };   // done: the ✓ says it
 
   function nearBottom() {
     const box = narrow() ? document.scrollingElement : log;
@@ -72,16 +76,21 @@
 
   function stepNode(it) {
     const open = it.node ? it.node.open : false;
-    const n = el("details", { class: "step s-" + it.state, open },
+    const rawOpen = it.node ? !!(it.node.querySelector(".raw") || {}).open : false;
+    const body = [];
+    if (it.state === "running") body.push(el("p", { class: "words muted", text: "Working on it…" }));
+    else body.push(el("p", { class: "words", text: it.words || it.outcome || "" }));
+    if (it.call || it.result !== undefined) {
+      body.push(el("details", { class: "raw", open: rawOpen }, el("summary", { text: "Show what Togi returned" }),
+        it.call ? [el("div", { class: "k", text: "The call" }), el("pre", { class: "cmdline", text: it.call })] : null,
+        it.result !== undefined && it.result !== null ? [el("div", { class: "k", text: "Togi's reply" }), el("pre", { text: it.result })] : null));
+    }
+    return el("details", { class: "step s-" + it.state, open },
       el("summary", {},
         el("span", { class: "mark", "aria-hidden": "true", text: MARK[it.state] || "" }),
         el("span", { class: "lbl", text: it.label }),
-        el("span", { class: "st", text: STATE_WORDS[it.state] || it.state })),
-      el("div", { class: "exact" },
-        el("div", { class: "k", text: "Command" }), el("pre", { class: "cmdline", text: it.command || "" }),
-        it.result !== undefined ? [el("div", { class: "k", text: it.state === "ok" ? "Result" : `Result · ${it.outcome || ""}` }),
-                                   el("pre", { text: it.result })] : el("div", { class: "k", text: "Running…" })));
-    return n;
+        el("span", { class: "st", text: STATE_WORDS[it.state] || "" })),
+      el("div", { class: "exact" }, body));
   }
   function itemNode(it) {
     if (it.kind === "user") return el("li", { class: "msg-user" }, el("div", { class: "bubble", text: it.text }));
@@ -95,7 +104,7 @@
     if (it.kind === "error") return el("li", { class: "msg-error", text: it.text });
     if (it.kind === "cta") return el("li", { class: "msg-cta" },
       el("button", { class: "btn quiet inline", type: "button", onclick: () => showApproval(), text: "Review the charge" }),
-      el("span", { class: "muted", text: narrow() ? " It is waiting under Drop." : " It is waiting in the panel." }));
+      el("span", { class: "muted", text: ` It is waiting ${wherePanel()}.` }));
     return el("li");
   }
   function draw(it) {
@@ -125,13 +134,29 @@
     if (e) return;
     log.append(el("li", { id: "empty", class: "msg-empty" },
       el("p", { class: "lead", text: "Tell your assistant what your next batch costs." }),
-      el("p", { text: "It asks the engine for a price ladder from your costs, opens the drop and runs it. The drop shows up beside this chat as it happens. Nothing is charged until you approve it, in the panel." }),
+      el("p", { text: `It asks the engine for a price ladder from your costs, opens the drop and runs it. You see the drop ${narrow() ? "under the Drop tab" : "beside this chat"} as it happens. Nothing is charged until you approve it there.` }),
       el("button", { class: "linkbtn", type: "button", onclick: () => { say.value = EXAMPLE; grow(); say.focus(); }, text: "Use Juniper's example" })));
+  }
+
+  // A step the person has answered no longer waits: the server says so when they approve in the panel; a request approved in
+  // the terminal is seen in the drop's own record (no request pending, one approved, or the drop settling or settled).
+  function answered(d) {
+    if (!d || d.draft) return;
+    const ap = d.approvals || [];
+    if (ap.some(a => a.status === "pending")) return;
+    const yes = ap.some(a => a.status === "approved" || a.status === "consumed") || ["settling", "settled"].includes(d.state);
+    const lapsed = !yes && ap.some(a => a.status === "expired" || a.status === "denied");
+    if (!yes && !lapsed) return;
+    for (const it of s.items) if (it.kind === "step" && it.state === "needs_you" && it.drop === d.drop) {
+      Object.assign(it, yes ? { state: "ok", outcome: "You approved it", words: "You approved it." }
+                            : { state: "lapsed", outcome: "Not approved", words: "Not approved: the request is no longer waiting, and nothing was charged. Your assistant can ask again." });
+      draw(it);
+    }
   }
 
   function apply(ev) {
     if (ev.seq) s.after = Math.max(s.after, ev.seq);
-    const it = ev.id ? s.byId[ev.id] : null;
+    let it = ev.id ? s.byId[ev.id] : null;
     switch (ev.t) {
       case "user": add({ kind: "user", text: ev.text }); break;
       case "text_start": if (!it) add({ kind: "text", id: ev.id, text: "", live: true }); break;
@@ -142,9 +167,20 @@
         if (it) { it.text = ev.text; it.live = false; draw(it); } else add({ kind: "text", id: ev.id, text: ev.text, live: false });
         break;
       case "text_end": if (it) { it.live = false; draw(it); } break;
-      case "step": add({ kind: "step", id: ev.id, label: ev.label, command: ev.command, state: "running" }); break;
+      case "step": {
+        const last = s.items[s.items.length - 1];
+        if (ev.tool === "crowd_skill" && last && last.kind === "step" && last.tool === "crowd_skill") {     // reading the guide: one step
+          s.byId[ev.id] = last; Object.assign(last, { state: "running", call: [last.call, ev.call].filter(Boolean).join("\n") }); draw(last);
+          break;
+        }
+        add({ kind: "step", id: ev.id, label: ev.label, tool: ev.tool, drop: ev.drop, call: ev.call, state: "running" });
+        break;
+      }
       case "step_done":
-        if (it) { Object.assign(it, { state: ev.state, outcome: ev.outcome, result: ev.result }); draw(it); }
+        if (it) {
+          const raw = it.tool === "crowd_skill" && it.result && ev.result ? it.result + "\n\n" + ev.result : ev.result;
+          Object.assign(it, { state: ev.state, outcome: ev.outcome, words: ev.words, result: raw === undefined ? it.result : raw }); draw(it);
+        }
         if (s.focus) refreshPanel();
         break;
       case "note": {
@@ -164,8 +200,8 @@
   }
 
   function clearChat() {
-    s.items = []; s.byId = {}; s.after = 0; s.focus = null; s.d = null; s.review = null; s.approveMsg = null;
-    log.replaceChildren(); drawEmpty(); renderPanel(true);
+    s.items = []; s.byId = {}; s.after = 0; s.focus = null; s.d = null; s.review = null; s.approveMsg = null; s.later = {};
+    log.replaceChildren(); drawEmpty(); drawComposer(); renderPanel(true);
   }
 
   // ---- the stream: NDJSON lines from /api/studio/events, asked again from the last line whenever it ends -----------------
@@ -209,7 +245,8 @@
     const ready = s.info && s.info.ready;
     send.disabled = s.busy || !ready;          // the label stays "Send" (the log says the assistant is working)
     $("reset").hidden = !s.items.length;
-    if (s.info && !ready) $("composefine").textContent = `The assistant cannot start here: ${s.info.why_not_ready}.`;
+    $("composefine").textContent = s.info && !ready ? `The assistant cannot start here: ${s.info.why_not_ready}.`
+      : `Never type your passphrase here. You approve charges ${wherePanel()}.`;
   }
   $("composer").addEventListener("submit", async e => {
     e.preventDefault();
@@ -233,44 +270,28 @@
     catch (e) { add({ kind: "error", text: e.message }); }
   });
 
-  // ---- the panel ----------------------------------------------------------------------------------------------------------
-  // the plan an approval is bound to: capture:45:37.00:1665.00, void:22, either +release:K. Read from Togi's recomputed args.
-  function plan(expect) {
-    const m = /^capture:(\d+):([\d.]+):([\d.]+)/.exec(expect || "");
-    const r = /\+release:(\d+)/.exec(expect || "");
-    const extra = r ? ` Also releases ${plural(+r[1], "failed hold")}.` : "";
-    if (m) return { what: `Charge ${plural(+m[1], "buyer")} ${money(m[2])} each`, total: `${money(m[3])} in total.${extra}` };
-    const v = /^void:(\d+)/.exec(expect || "");
-    if (v) return { what: `Release all ${plural(+v[1], "hold")}`, total: `Nobody pays.${extra}` };
-    return { what: "Settle this drop", total: "" };
-  }
-
-  function headline(d) {
-    const st = d.settlement, name = `Your ${d.title} drop`;
-    let claim = `${name} is ${d.state}.`, turn;
-    if (d.draft) { claim = `${name} is being set up.`; turn = "Buyers can join once it opens."; }
-    else if (d.blocked) { claim = `Settling ${d.title} stopped.`; turn = "It needs you."; }
-    else if (d.state === "live") turn = d.minimum_met ? `${d.buyers} joined. Everyone pays ${money(d.price)}.`
-                                                       : `${d.buyers} of ${d.minimum} joined. Everyone pays ${money(d.price)} once ${d.minimum} join.`;
-    else if (d.state === "ended") turn = d.minimum_met ? "Time is up. Your assistant closes it next." : "Time is up, and it missed its minimum.";
-    else if (d.state === "closed") turn = d.minimum_met ? `${d.buyers} joined. Everyone pays ${money(d.price)}.` : `${d.buyers} of ${d.minimum} joined. Every hold will be released.`;
-    else if (d.state === "settling") turn = st && st.outcome === "funded" ? `Charging everyone ${money(st.final_price)}.` : "Releasing every hold.";
-    else if (st && st.outcome === "funded") turn = `${plural(st.counts.captured, "buyer")} paid ${money(st.final_price)}.`;
-    else if (st) { claim = `${name} missed its minimum.`; turn = `${plural(st.counts.voided, "hold")} released. Nobody paid.`; }
-    return el("h1", { class: "two" }, el("span", { text: claim }), " ", el("span", { class: "turn", text: turn }));
-  }
-
+  // ---- the approval card: Togi's signed review, in plain words first, the exact signed text one click further ------------
   const pendingOf = d => (d.approvals || []).find(a => a.status === "pending");
+  const isDrop = rv => rv.confirm_word && rv.confirm_word === rv.drop;
+
+  function binding(rv) {
+    // the drop the yes binds to (Togi's confirmation word for a settle), and beside it, quoted and isolated, what the assistant calls it
+    return el("p", { class: "binds" },
+      el("span", { class: "k", text: isDrop(rv) ? "Drop " : "Confirmation word " }), el("span", { class: "mono", text: rv.confirm_word || "" }),
+      rv.named !== null && rv.named !== undefined ? [el("span", { class: "muted", text: " · your assistant's name for it: " }),
+        el("q", { class: "named" }, el("bdi", { text: rv.named }))] : null);
+  }
+  function rechecks(rv) { return /re-checks every hold|reads them again before any money moves/i.test(rv.summary || ""); }
 
   function approvalCard(d, pending) {
     const desk = (s.info && s.info.desk) || { open: false };
     const kids = [el("div", { class: "state ask", text: "Needs your approval" })];
     if (!desk.open) {
-      const p = plan(pending.expect);
-      kids.push(el("p", { class: "what", text: p.what }), el("p", { class: "muted", text: p.total }),
+      const p = P.plan(pending.expect);
+      kids.push(el("p", { class: "what", text: p.what }), el("p", { class: "muted", text: p.totalLine }),
         el("p", { text: "Your assistant asked to settle. Only you can approve it, in your own terminal:" }),
         el("div", { class: "cmd" }, el("span", { text: `togi approve ${pending.id}` })),
-        el("p", { class: "fine", text: `Approving in this panel is off: ${desk.why || "this server cannot approve"}.` }));
+        el("p", { class: "fine", text: `Approving here is off: ${desk.why || "this server cannot approve"}.` }));
       return kids;
     }
     const rv = s.review && s.review.id === pending.id ? s.review.data : null;
@@ -279,108 +300,49 @@
         s.reviewErr ? el("p", { class: "msg stop", text: s.reviewErr }) : null);
       return kids;
     }
-    const p = plan((rv.args || {}).expect);
-    kids.push(el("p", { class: "what", id: "approve-what", text: p.what }), el("p", { class: "muted", text: p.total }),
-      el("p", { text: `Your assistant asked to settle ${rv.title || "this drop"}. Only you can approve it; your assistant cannot.` }),
-      el("details", { class: "signed" }, el("summary", { text: "Exactly what you sign" }),
-        el("pre", { text: (rv.lines || []).join("\n") })));
+    const p = P.plan((rv.args || {}).expect);
+    const until = hhmm(rv.expires_if_approved);
+    const test = rv.scope === "test" ? "Signed by a test approver: it counts only on the Pretend PayPal." : null;
+    kids.push(el("p", { class: "what", id: "approve-what", text: p.what }), el("p", { class: "total", text: p.totalLine }),
+      p.kind === "capture" && rv.hold_each && rv.back_each !== null && rv.back_each !== undefined
+        ? el("p", { class: "holds", text: `Each buyer's ${money(rv.hold_each)} hold is charged ${money(p.price)}${rv.back_each !== "0.00" ? `, and the other ${money(rv.back_each)} goes back to them` : ""}.` }) : null,
+      binding(rv));
+    if (s.later[pending.id]) {
+      kids.push(el("p", { class: "later", text: `Not approved. The request waits until ${hhmm(pending.expires)}; if you do not approve it by then, it lapses: nothing is charged, and your assistant can ask again.` }),
+        el("button", { class: "btn quiet inline", type: "button", onclick: () => { s.later[pending.id] = false; renderPanel(); showApproval(); }, text: "Review it again" }));
+      return kids;
+    }
+    kids.push(el("details", { class: "signed" }, el("summary", { text: "Exactly what you sign" }),
+      el("ul", { class: "plain" },
+        el("li", {}, p.kind === "void" ? "Settle the drop: release every hold" : "Settle the drop: charge every hold at the final price"),
+        p.sum ? el("li", { class: "mono" }, p.sum) : null,
+        p.extra ? el("li", {}, p.extra.trim()) : null,
+        el("li", {}, `Works once, until ${until}`),
+        rechecks(rv) ? el("li", {}, "Every hold is checked again with PayPal before any money moves") : null),
+      el("details", { class: "exacttext" }, el("summary", { text: "Show the signed text" }),
+        el("pre", { text: (rv.lines || []).join("\n") }))));
     const input = el("input", { type: "password", id: "passphrase", name: "approver-passphrase", autocomplete: "off",
                                 spellcheck: "false", autocapitalize: "off", "aria-describedby": "approve-fine", required: true });
     kids.push(el("form", { class: "approve", onsubmit: e => approve(e, pending.id, input) },
       el("label", { class: "field" }, el("span", { text: "Approver passphrase" }), input),
-      el("button", { class: "btn", type: "submit", disabled: s.approving, text: s.approving ? "Checking…" : "Approve the charge" })),
+      el("div", { class: "actions" },
+        el("button", { class: "btn", type: "submit", disabled: s.approving, text: s.approving ? "Checking…" : "Approve the charge" }),
+        el("button", { class: "linkbtn notnow", type: "button", disabled: s.approving, onclick: () => { s.later[pending.id] = true; s.approveMsg = null; renderPanel(); }, text: "Not now" }))),
       s.approveMsg ? el("p", { class: "msg stop", role: "alert", text: s.approveMsg }) : null,
-      el("p", { class: "fine", id: "approve-fine", text: `Your passphrase goes only to Togi's approver check on this computer. Your assistant never sees it. If you approve, it can be used once, until ${hhmm(rv.expires_if_approved)}.${desk.scope === "test" ? " This is a test approver: it counts only on the pretend PayPal." : ""}` }));
+      el("p", { class: "fine", id: "approve-fine", text: `Your yes works once, until ${until}. Your passphrase goes only to Togi's approver check on this computer; your assistant never sees it.${test ? " " + test : ""}` }));
     return kids;
   }
 
-  function needs(d) {
-    const pending = d.state !== "settled" ? pendingOf(d) : null;
-    const approved = (d.approvals || []).find(a => a.status === "approved");
-    const st = d.settlement;
-    const kids = [];
-    const state = (text, cls) => el("div", { class: "state" + (cls ? " " + cls : ""), text });
-    if (d.draft) {
-      kids.push(state("Setting up"), el("p", { class: "what", text: "Not open yet" }), el("p", { text: "Your assistant opens the drop to buyers next." }));
-    } else if (d.blocked) {
-      kids.push(state("Settlement stopped", "bad"), el("p", { class: "what", text: `PayPal stopped it: ${d.blocked.words}` }),
-        el("p", { text: "Nothing more is charged until it is sorted out. Ask your assistant to explain the drop." }));
-    } else if (pending) {
-      kids.push(...approvalCard(d, pending));
-    } else if (approved && !st) {
-      kids.push(state("Approved"), el("p", { class: "what", text: plan(approved.expect).what }), el("p", { text: "You approved it. Your assistant settles next." }));
-    } else if (d.state === "settling") {
-      kids.push(state("Settling"), el("p", { class: "what", text: st && st.outcome === "funded" ? `Charging ${money(st.final_price)} each` : "Releasing every hold" }));
-    } else if (d.state === "settled") {
-      const t = st.totals || {}, c = st.counts || {};
-      const ok = s.info && s.info.paypal === "fake" ? "Every hold and capture matches the pretend PayPal." : "Every hold and capture matches PayPal.";
-      kids.push(state("Settled"),
-        el("p", { class: "what", text: st.outcome === "funded" ? `${plural(c.captured, "buyer")} paid ${money(st.final_price)}` : "Nobody paid" }),
-        el("dl", { class: "facts" },
-          st.outcome === "funded" ? [
-            el("div", {}, el("dt", { text: "Charged" }), el("dd", { class: "v", text: money(t.gross) })),
-            el("div", {}, el("dt", { text: "PayPal fees" }), el("dd", { class: "v", text: money(t.fees) })),
-            el("div", {}, el("dt", { text: "Paid to you, before your costs" }), el("dd", { class: "v", text: money(t.net) })),
-          ] : null,
-          el("div", {}, el("dt", { text: "Holds released" }), el("dd", { class: "v", text: String(c.voided || 0) })),
-          c.failed ? el("div", {}, el("dt", { class: "stop", text: "Charges failed" }), el("dd", { class: "v stop", text: String(c.failed) })) : null),
-        el("div", { class: "checks" },
-          el("button", { class: "btn quiet inline", disabled: s.busyCheck.verify, onclick: () => check("verify"), text: s.busyCheck.verify ? "Asking PayPal…" : "Check with PayPal" })),
-        resultVerify(ok));
-    } else if (d.state === "closed") {
-      kids.push(state("Closed"), el("p", { class: "what", text: d.minimum_met ? `Ready to charge ${plural(d.buyers, "buyer")} ${money(d.price)}` : `Ready to release ${plural(d.buyers, "hold")}` }),
-        el("p", { text: "Your assistant asks you to approve the settlement. The request shows up here." }));
-    } else if (d.state === "ended") {
-      kids.push(state("Time is up"), el("p", { class: "what", text: `${plural(d.buyers, "buyer")} joined` }), el("p", { text: "Your assistant closes the drop next. Nobody can join now." }));
-    } else {
-      kids.push(state("Nothing needs you"), el("p", { class: "what", text: `${plural(d.buyers, "buyer")} so far` }),
-        el("p", { text: "Your assistant runs the drop. When it closes, you approve the charge here. Nothing is charged before that." }));
-    }
-    return el("div", { class: "card needs" + (pending || d.blocked ? " urgent" : ""), id: "needs" }, kids);
-  }
-
-  function resultVerify(ok) {
-    const r = s.checks[s.focus];
-    if (!r) return null;
-    if (r.error) return el("div", { class: "result stop", text: r.error });
-    if (r.ok) return el("div", { class: "result" }, el("span", { class: "go", text: ok + " " }), el("span", { class: "muted", text: `Checked ${hhmm(r.checked_at)}.` }));
-    return el("div", { class: "result" }, el("span", { class: "stop", text: "PayPal disagrees with the record:" }),
-      el("ul", {}, ((r.report || {}).problems || []).slice(0, 6).map(p => el("li", { text: p }))));
-  }
   async function check(which) {
     const drop = s.focus;
     s.busyCheck[which] = true; renderPanel();
-    try { s.checks[drop] = await api(`/api/maker/drops/${encodeURIComponent(drop)}/${which}`, { method: "POST", headers: hdr(), body: {} }); }
-    catch (e) { s.checks[drop] = { error: e.message }; }
+    const got = s.checks[drop] || (s.checks[drop] = {});
+    try { got[which] = await api(`/api/maker/drops/${encodeURIComponent(drop)}/${which}`, { method: "POST", headers: hdr(), body: {} }); }
+    catch (e) { got[which] = { error: e.message }; }
     finally { s.busyCheck[which] = false; renderPanel(); }
   }
-
-  const STATUS = { held: "held", captured: "paid", left: "left", voided: "released", capture_failed: "charge failed",
-                   hold_failed: "declined", void_failed: "release failed", excluded: "taken out" };
-  const BAD = new Set(["capture_failed", "hold_failed", "void_failed"]);
-  function buyers(d) {
-    const counts = Object.entries(d.buyers_by_status || {}).map(([k, n]) => `${n} ${STATUS[k] || k}`);
-    if (d.simulated) counts.push(`${d.simulated} simulated`);
-    return el("div", { class: "panel buyers-panel" },
-      el("h3", {}, el("span", { text: "Buyers" }), el("span", { class: "counts", text: counts.join(" · ") })),
-      (d.buyers_list || []).length ? el("ul", { class: "buyers" }, d.buyers_list.map(b =>
-        el("li", {}, el("bdi", { text: b.name }),
-          el("span", { class: "st" + (BAD.has(b.status) ? " bad" : ""), text: `${STATUS[b.status] || b.status}${b.charged ? " " + money(b.charged) : (b.held ? " " + money(b.held) : "")}` }))))
-        : el("p", { class: "muted small", text: "Nobody yet." }));
-  }
-  function feed(d) {
-    return el("div", { class: "panel" }, el("h3", { text: "Activity" }),
-      (d.feed || []).length ? el("ul", { class: "feed" }, d.feed.map(f => el("li", { class: "k-" + f.kind },
-        el("time", { datetime: f.at, text: hhmm(f.at) }),
-        el("span", {}, f.who ? [el("bdi", { class: "who", text: f.who }), " "] : null, f.text))))
-        : el("p", { class: "muted small", text: "Nothing yet." }));
-  }
-  function profitRow(d) {
-    if (!d.profit || !d.profit.length) return null;
-    const now = d.locked_step === null || d.locked_step === undefined ? -1 : d.locked_step;
-    return el("p", { class: "profitrow" }, el("span", { class: "k", text: "Profit after your costs" }),
-      d.profit.map((r, i) => el("span", { class: i === now ? "now" : "" }, `${r.from_buyers} buyers `, el("span", { class: "v", text: money(r.profit) }))));
-  }
+  const needs = d => P.needs(d, { ask: approvalCard, where: "here", mode: s.info && s.info.paypal, checks: s.checks[d.drop] || {},
+                                  busy: s.busyCheck, check, tieout: false });
 
   // Each part of the panel is redrawn only when its own data changed: a poll never wipes a half-typed passphrase.
   const CLOCK = new Set(["server_time", "time_left", "time_left_seconds"]);
@@ -399,7 +361,7 @@
     if (force) s.keys = {};
     updateTab();
     if (!s.focus || !s.d) {
-      const k = keyOf(["empty", s.focus, s.dErr && s.dErr.message]);
+      const k = keyOf(["empty", s.focus, s.dErr && s.dErr.message, narrow()]);
       if (s.keys.root !== k) {
         s.keys = { root: k };
         side.replaceChildren(el("div", { class: "sideempty" },
@@ -414,32 +376,32 @@
       side.replaceChildren(el("div", { class: "mhead", id: "phead-host" }),
         el("div", { class: "panel ladder-panel", id: "ladder-panel" },
           el("h3", {}, el("span", { text: "Price ladder" }),
-            el("a", { class: "counts", href: `/d/${encodeURIComponent(d.drop)}`, target: "_blank", rel: "noopener", text: "buyer page ↗" })),
+            el("a", { class: "buyerlink", href: `/d/${encodeURIComponent(d.drop)}`, target: "_blank", rel: "noopener", text: "Buyer page ↗" })),
           el("div", { id: "ladder" }), el("div", { id: "caption-host" })),
         el("div", { class: "pgrid" }, el("div", { id: "colA" }), el("div", { id: "colB" })));
     }
-    document.title = `${d.title} · studio · Crowd Price`;
+    document.title = `${P.shown(d.title).slice(0, 60)} · studio · Crowd Price`;
     const clock = clockFrom(d);
     s.clock = clock;
     part("phead", keyOf([d.title, d.state, d.buyers, d.minimum, d.minimum_met, d.price, d.settlement, d.blocked, d.draft]), () =>
-      el("div", { class: "pheadin" }, headline(d),
+      el("div", { class: "pheadin" }, P.headline(d),
         d.state === "live" && clock ? el("div", { class: "clock" }, el("div", { class: "label", text: "Joining closes in" }),
           el("div", { class: "t", id: "clock", text: duration(clock()) })) : null), $("phead-host"));
     const final = d.settled && d.settled.outcome === "funded";
-    part("caption", keyOf([d.buyers, d.minimum, d.price, d.settled, d.profit, d.locked_step]), () => el("div", {},
+    part("caption", keyOf([d.buyers, d.minimum, d.price, d.settled, d.profit, d.profit_now]), () => el("div", {},
       el("p", { class: "caption" }, el("span", {}, el("span", { class: "n", text: String(d.buyers) }), " joined"),
         el("span", {}, "minimum ", el("span", { class: "n", text: String(d.minimum) })),
         el("span", {}, final ? "final price " : (d.settled ? "start price " : "price now "),
           el("span", { class: "n", text: money(final ? d.settled.final_price : (d.settled ? d.start_price : d.price)) }))),
-      profitRow(d)), $("caption-host"));
+      P.profitRow(d)), $("caption-host"));
     const lkey = keyOf([d.steps, d.buyers, d.minimum, d.minimum_met, d.locked_step, side.clientWidth]);
     if (s.keys.ladder !== lkey) { s.keys.ladder = lkey; const host = $("ladder"); requestAnimationFrame(() => ladder(host, d)); }
     const pending = pendingOf(d);
-    part("needs", keyOf([d.state, d.blocked, d.settlement, d.approvals, d.buyers, d.price, d.minimum_met, d.draft, s.info && s.info.desk,
+    part("needs", keyOf([d.state, d.blocked, d.settlement, d.profit_now, d.approvals, d.buyers, d.price, d.minimum_met, d.draft, s.info && s.info.desk,
                          pending && s.review && s.review.id === pending.id ? s.review.data.review : null, s.reviewErr, s.approving,
-                         s.approveMsg, s.checks[d.drop], s.busyCheck]), () => needs(d), $("colA"));
-    part("feed", keyOf([d.feed]), () => feed(d), $("colB"));
-    part("buyerlist", keyOf([d.buyers_list, d.buyers_by_status, d.simulated]), () => buyers(d), $("colB"));
+                         s.approveMsg, s.later, s.checks[d.drop], s.busyCheck, narrow()]), () => needs(d), $("colA"));
+    part("feed", keyOf([d.feed]), () => P.feed(d), $("colB"));
+    part("buyerlist", keyOf([d.buyers_list, d.buyers_by_status, d.simulated]), () => P.buyers(d), $("colB"));
     if (pending && s.info && s.info.desk && s.info.desk.open) wantReview(pending.id);
   }
 
@@ -450,6 +412,7 @@
       const d = await api(`/api/studio/drops/${encodeURIComponent(drop)}`, { headers: hdr() });
       if (drop !== s.focus) return;
       s.d = d; s.dErr = null;
+      answered(d);
     } catch (e) {
       if (e.code === "maker_key") return keyFailed(e);
       s.dErr = e;
@@ -479,7 +442,7 @@
     if (!rv || s.approving) return;
     if (!input.value) { s.approveMsg = "Type your approver passphrase."; renderPanel(); return; }
     s.approving = true; s.approveMsg = null;
-    const body = { review: rv.review, word: rv.confirm_word, passphrase: input.value };
+    const body = { review: rv.review, word: rv.confirm_word, passphrase: input.value };     // the word is the one the card shows
     input.value = "";
     renderPanel();
     try {
@@ -500,7 +463,7 @@
   function showApproval() {
     if (narrow()) setTab("drop");
     const n = $("needs");
-    if (n) n.scrollIntoView({ behavior: CP.calm() ? "auto" : "smooth", block: "center" });
+    if (n) n.scrollIntoView({ behavior: CP.calm() ? "auto" : "smooth", block: "start" });
     const p = $("passphrase");
     if (p) setTimeout(() => p.focus({ preventScroll: true }), 350);
   }
@@ -563,6 +526,15 @@
     }, 15000);                                          // busy flag is in the stream; this only keeps `info` honest
   }
   setInterval(() => { const c = $("clock"); if (c && s.d && s.d.state === "live" && s.clock) c.textContent = duration(s.clock()); }, 1000);
-  window.addEventListener("resize", () => { s.keys.ladder = null; if (s.d) renderPanel(); });
+  let wasNarrow = narrow();
+  window.addEventListener("resize", () => {
+    s.keys.ladder = null;
+    if (narrow() !== wasNarrow) {                        // the words that say where the drop is follow the layout
+      wasNarrow = narrow(); drawComposer();
+      const e = $("empty"); if (e) { e.remove(); drawEmpty(); }
+      for (const it of s.items) if (it.kind === "cta" && it.li) draw(it);
+    }
+    renderPanel();
+  });
   start();
 })();
