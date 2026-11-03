@@ -18,6 +18,7 @@
   POST /api/maker/drops/<drop>/tieout   header X-Maker-Key: the balance proof
 
 There is no route that settles, excludes or binds. Those move money, and only a person approves them, through Togi.
+A studio server (studio_main.py) adds the routes in studio_http.py: the chat, and a person's approval through Togi's desk.
 """
 from __future__ import annotations
 
@@ -30,6 +31,7 @@ from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+from . import studio_http
 from .api import Api, ApiError
 
 STATIC = Path(__file__).with_name("static")
@@ -210,6 +212,8 @@ def make_handler(api: Api, maker_key: str, quiet: bool = True, hosts: set[str] |
             if not self._host_ok():
                 return self._error(ApiError(421, "host", "Unknown host."))
             p = self._parts()
+            if getattr(api, "studio", None) is not None and studio_http.handle_get(self, api.studio, p):
+                return None
             try:
                 if not p:
                     return self._file(PAGES["index"], "text/html; charset=utf-8")
@@ -246,6 +250,8 @@ def make_handler(api: Api, maker_key: str, quiet: bool = True, hosts: set[str] |
             if not self._host_ok():
                 return self._error(ApiError(421, "host", "Unknown host."))
             p = self._parts()
+            if getattr(api, "studio", None) is not None and studio_http.handle_post(self, api.studio, p):
+                return None
             try:
                 if len(p) == 4 and p[:2] == ["api", "drops"]:
                     drop, action = self._drop_id(p[2]), p[3]

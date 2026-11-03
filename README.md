@@ -135,7 +135,72 @@ The **maker view** shows the ladder with the profit at each step, the activity, 
 for your `togi approve`; once settled, it checks every hold and capture with PayPal and runs the balance proof. Neither
 page can settle, exclude or bind: those move money, and only a person approves them, in Togi.
 
-### 6. The same in the PayPal sandbox
+### 6. The studio: run a drop from a chat, approve the charge in the panel
+
+The whole story in one page, from your own terminal:
+
+```bash
+export CROWD_ENV=test CROWD_PAYPAL=fake CROWD_DETAILS=web/demo/details.json
+python3 -I web/studio.py --maker-name Juniper       # prints the studio link with its key; this machine only
+```
+
+Open the studio link. On the left is a chat with your assistant; on the right, the drop it is working on, live: the
+price, the ladder with your profit at each step, the buyers as they join, the activity, the outcome. Tell it your costs
+("clay and glaze are 9 dollars a mug, the firing is 260, I need 30 sold"); it asks the engine for a ladder, opens the
+drop and runs it. Each thing it does shows as a step in plain words ("Asked the engine for a price ladder from your
+costs", "Checked every charge with PayPal"); click a step to see the exact `togi` command and what it returned. On a
+phone the chat and the drop are two tabs. When the drop closes it asks to settle, and the panel shows exactly what will
+be charged, the lines `togi approve` would print, and a box for your approver passphrase. Approve there; the assistant
+settles, checks every charge with PayPal and explains the outcome.
+
+How the approval stays yours:
+
+- **It is Togi's own check, not a shortcut around it.** The panel uses Togi's approval desk (`togi.desk`). Togi
+  recomputes the request from the live repo exactly as `togi approve` does, fixes the expiry it will sign, and shows you
+  that; your yes is bound to what you were shown, and if the request, the plan or the locked code changed since, nothing
+  is approved. The passphrase is checked against the same approver (same record, the same five-wrong lock-out, shared
+  with the terminal), and the grant is the same signed, single-use, 15-minute one.
+- **Only a server you started can approve.** The desk opens once, as the studio starts, and not under `TOGI_AGENT` or
+  `togi run`, not in an interpreter that is not isolated (so use `python3 -I web/studio.py`; `python3 -m crowdweb` cannot
+  approve), not without an approver, and, for your own approver, only from a terminal. If it did not open, the panel
+  shows the `togi approve` command instead and says why.
+- **The passphrase goes from your browser to that check and nowhere else**: not to the assistant, its context, a log
+  (the server logs request lines only) or the disk.
+- **The assistant cannot reach it.** It is the demo's `claude -p` (on your own Claude plan; `ANTHROPIC_API_KEY` is removed
+  from its environment, so never per-call API billing) with one tool, Bash, in Claude Code's restricted mode (your own
+  settings files are not read, so an allow-all rule there cannot widen it) with `dontAsk`, allowed only the `togi`
+  commands a maker needs, behind a `togi` shim that refuses the rest, with `TOGI_AGENT` set and without the studio's key.
+  Buyer names reach it inside command output; they are data, and nothing it can run moves money without you. Every studio
+  route needs the key, every POST must come from the studio page itself, and the server listens on 127.0.0.1 only.
+
+Options: `--port` (8790), `--model` (sonnet), `--maker-key` or `CROWD_MAKER_KEY`, `--claude`, `--togi`; `TOGI_SRC` if
+Togi's source is not found from the `togi` on your PATH. With a throwaway test approver (`TOGI_APPROVER_HOME` set) the
+desk opens without a terminal, and Crowd honours its yes only on the pretend PayPal.
+
+### The same tools from any MCP client or the command line
+
+The studio is one client of Crowd Price; the engine does not know or care which agent drives it. Any agent can use the
+same commands, with the same rule that money waits for a person:
+
+```bash
+togi skill crowd                  # what an agent reads first: the commands, the rules, the next step
+togi tools crowd --json           # the same commands as a JSON tool list
+togi crowd drop status --drop d_...   # the CLI: compact JSON, an exact `next` command on every refusal
+togi mcp serve crowd              # an MCP server over stdio (pip install mcp): crowd_skill, crowd_drop_create, ...
+```
+
+For an MCP client (Claude Desktop, an IDE, your own), the server entry is:
+
+```json
+{"mcpServers": {"crowd": {"command": "togi", "args": ["mcp", "serve", "crowd"],
+                          "env": {"TOGI_AGENT": "my-agent", "CROWD_ENV": "test", "CROWD_PAYPAL": "fake"}}}}
+```
+
+A money tool (`crowd_drop_settle`) returns `needs_approval` with an approval id; a person grants it with `togi approve`
+in their terminal or in the studio's panel, then the agent calls the tool again with `approval`. No MCP tool, CLI command
+or flag can grant one.
+
+### 7. The same in the PayPal sandbox
 
 Create a free sandbox app at [developer.paypal.com](https://developer.paypal.com/) (Apps & Credentials, Sandbox), then:
 
@@ -166,8 +231,8 @@ The live tests: `CROWD_LIVE=1 PYTHONPATH=../togi/src python3 -m pytest -q tests/
 ## AI tools used
 
 - **In the product:** Claude, through Claude Code (`claude -p`, Sonnet or Haiku), is the maker's assistant in
-  `demo/maker_agent.py`. It learns Crowd Price from `togi skill crowd` ([skills/](skills/)) and acts only through
-  `togi crowd ...` commands. Togi serves the same commands as a JSON tool list, a code-mode API (`togi run`) and MCP
+  `demo/maker_agent.py` and in the studio (`web/studio.py`), where it streams its words and steps beside the live drop.
+  It learns Crowd Price from `togi skill crowd` ([skills/](skills/)) and acts only through `togi crowd ...` commands. Togi serves the same commands as a JSON tool list, a code-mode API (`togi run`) and MCP
   tools (`togi mcp serve`), so any agent can drive it.
 - **Machine-checked agent tasks:** [stone/tasks](stone/tasks) holds 7 tasks (2 held out) that an agent must complete
   against the pretend PayPal: open a drop, report the price after joins, request settlement, handle a missed minimum,
@@ -202,7 +267,8 @@ The live tests: `CROWD_LIVE=1 PYTHONPATH=../togi/src python3 -m pytest -q tests/
 - `src/crowd/`: the engine (`engine.py`), price ladder (`ladder.py`), PayPal holds client and pretend PayPal
   (`paypal_holds.py`), store, settlement check (`verify.py`), Togi bundle (`togi_bundle.py`)
 - `src/closure/`: the balance certifier used by `drop tieout` ([docs/closure.md](docs/closure.md))
-- `web/crowdweb/`: the drop page and the maker view (standard library server, plain HTML, CSS and JavaScript); `web/tests/`
+- `web/crowdweb/`: the drop page, the maker view and the studio (standard library server, plain HTML, CSS and JavaScript;
+  `studio.py`, `studio_http.py`, `studio_main.py`, launched by `web/studio.py`); `web/tests/`
 - `skills/`: what the assistant reads; `stone/tasks/`: the agent tasks; `togi.toml`: tiers, locks and policy
 - `demo/`: the assistant; `tests/`: the test suite; `harness/`: sandbox seeder and checks; `eval/`: the certifier's
   scorecard
