@@ -153,22 +153,43 @@
   }
 
   const STATUS = { held: "held", captured: "paid", left: "left", voided: "released", capture_failed: "charge failed",
-                   hold_failed: "declined", void_failed: "release failed", excluded: "taken out" };
-  const BAD = new Set(["capture_failed", "hold_failed", "void_failed"]);
+                   hold_failed: "declined", void_failed: "release failed", excluded: "taken out",
+                   release_stuck: "a hold may still be open", not_confirmed: "never confirmed, nothing held",
+                   left_open: "left, hold not released", excluded_open: "taken out, hold not released",
+                   lapsed: "hold ran out", gone: "hold gone at PayPal", taken_outside: "charged outside the drop",
+                   excluded_taken: "taken out, charged outside" };
+  const BAD = new Set(["capture_failed", "hold_failed", "void_failed", "release_stuck", "left_open", "excluded_open", "taken_outside", "excluded_taken"]);
+  // The engine files three different things under "hold_failed" and says which in `error`: a card or PayPal refusing the join (declined);
+  // a join nobody confirmed that PayPal holds nothing for, or that was released (never confirmed: nothing is held and nobody was refused);
+  // and a join whose hold PayPal would not release or describe (a hold may be open on the buyer's card: the maker has to look; the server
+  // says so in `hold_may_be_open`). A buyer who is out of the crowd has a `fate`, what became of the hold, from the engine's log: a leave
+  // or a removal PayPal would not release is not "left" or "taken out", and a hold that was charged outside the drop is not "released".
+  const BY_FATE = { "left:not_released": "left_open", "excluded:not_released": "excluded_open", "excluded:taken_outside": "excluded_taken",
+                    "voided:lapsed": "lapsed", "voided:gone": "gone", "voided:taken_outside": "taken_outside" };
+  function kind(b) {
+    if (b.status !== "hold_failed") return BY_FATE[b.status + ":" + b.fate] || b.status;
+    if (b.hold_may_be_open) return "release_stuck";
+    if (!b.error || b.error === "join_unconfirmed") return "not_confirmed";
+    return "hold_failed";
+  }
 
   function buyers(d) {
-    const counts = Object.entries(d.buyers_by_status || {}).map(([k, n]) => `${n} ${STATUS[k] || k}`);
+    const tally = {};
+    for (const b of d.buyers_list || []) tally[kind(b)] = (tally[kind(b)] || 0) + 1;
+    const counts = Object.entries(tally).map(([k, n]) => `${n} ${STATUS[k] || k}`);
     if (d.simulated) counts.push(`${d.simulated} simulated`);
     return el("div", { class: "panel buyers-panel" },
       el("h3", {}, el("span", { text: "Buyers" }), el("span", { class: "counts", text: counts.join(" · ") })),
       el("ul", { class: "buyers" }, (d.buyers_list || []).map(b =>
         el("li", {}, el("bdi", { text: b.name }),
-          el("span", { class: "st" + (BAD.has(b.status) ? " bad" : ""), text: `${STATUS[b.status] || b.status}${b.charged ? " " + money(b.charged) : (b.held ? " " + money(b.held) : "")}` })))));
+          el("span", { class: "st" + (BAD.has(kind(b)) ? " bad" : ""), text: `${STATUS[kind(b)] || kind(b)}${b.charged ? " " + money(b.charged) : (b.held ? " " + money(b.held) : "")}` })))));
   }
 
+  // Lines that say a hold may still be open, or was charged outside the drop, are drawn like any hold PayPal would not release.
+  const ATTENTION = new Set(["left_held", "taken_outside"]);
   function feed(d) {
     return el("div", { class: "panel" }, el("h3", { text: "Activity" }),
-      el("ul", { class: "feed" }, (d.feed || []).map(f => el("li", { class: "k-" + f.kind },
+      el("ul", { class: "feed" }, (d.feed || []).map(f => el("li", { class: "k-" + f.kind + (ATTENTION.has(f.kind) ? " k-void_failed" : "") },
         el("time", { datetime: f.at, text: hhmm(f.at) }),
         el("span", {}, f.who ? [el("bdi", { class: "who", text: f.who }), " "] : null, f.text)))));
   }

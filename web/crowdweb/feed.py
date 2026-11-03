@@ -16,7 +16,37 @@ KINDS = {
     "hold_captured": "captured", "capture_failed": "capture_failed", "hold_voided": "released", "void_failed": "void_failed",
     "buyer_excluded": "excluded", "settle_blocked": "blocked", "drop_settled": "settled",
 }
-GROUPED = {"joined", "declined", "left", "captured", "capture_failed", "released", "void_failed"}
+GROUPED = {"joined", "declined", "left", "left_held", "captured", "capture_failed", "released", "void_failed", "unconfirmed",
+           "lapsed", "gone", "taken_outside"}
+LEFT_HELD = "left_held"      # a buyer left and PayPal would not release the hold: one line, not "released" and then "would not release"
+# What the engine writes as the code of a `hold_failed` that is not a decline: a join nobody confirmed that was then looked into.
+# `join_unconfirmed`: PayPal holds nothing for it (or would not say). The two below: a hold exists (or money moved) and PayPal would
+# not release it: the same line as any hold PayPal would not release. Anything else is PayPal (or the card) refusing the join.
+UNCONFIRMED = "join_unconfirmed"
+STUCK_RELEASE = {"orphan_void_failed", "orphan_unexpected_status"}
+UNREADABLE = "PayPal would not say"          # how the engine's message starts when PayPal would not say whether a join left a hold
+
+
+def how_released(p: dict, event: str = "hold_voided") -> str:
+    """What a `hold_voided` (or `failed_hold_released`) event says became of the hold: `released` (a leave, a removal, a failed
+    capture's hold voided), `missed_minimum`, `lapsed` (ran out at PayPal), `gone` (PayPal no longer shows it), or `taken_outside`
+    (money was taken from it outside the engine: it is out of the crowd, and it was NOT released)."""
+    reason = str(p.get("reason") or "")
+    if p.get("taken_outside_engine") or reason == "taken_outside_engine":
+        return "taken_outside"
+    if reason in ("left", "excluded") or p.get("released_by_void") or (event == "failed_hold_released" and reason == "voided"):
+        return "released"           # (`released_by_void`: PayPal showed a status nobody has a rule for, and the engine voided it)
+    if reason == "not_funded":
+        return "missed_minimum"
+    if p.get("expired") or "expired" in reason:
+        return "lapsed"
+    return "released" if event == "failed_hold_released" else "gone"
+
+
+def may_be_open(p: dict) -> bool:
+    """Does this `hold_failed` leave a hold that may still be open at PayPal: one PayPal would not release, or one it would not describe?
+    (A decline, and a join PayPal holds nothing for, leave none.)"""
+    return p.get("code") in STUCK_RELEASE or (p.get("code") == UNCONFIRMED and str(p.get("message") or "").startswith(UNREADABLE))
 GROUP_GAP_SECONDS = 60
 
 
@@ -51,12 +81,16 @@ def _line(kind: str, items: list[dict], title: str) -> tuple[str | None, str]:
         return who, (f"joined. ${p.get('amount')} held each" if n > 1 else f"joined. ${p.get('amount')} held")
     if kind == "declined":
         return who, "card declined, nothing held"
+    if kind == "unconfirmed":
+        return who, "join never confirmed, nothing held"
     if kind == "step":
         if p.get("step") == 0:
             return None, f"Minimum reached with {p.get('count')} buyers: everyone pays ${p.get('price')}"
         return None, f"{p.get('count')} buyers: everyone now pays ${p.get('price')}"
     if kind == "left":
         return who, "left. Hold released"
+    if kind == LEFT_HELD:
+        return who, "left. PayPal would not release the hold"
     if kind == "closed":
         how = "Time ran out" if p.get("reason") == "expired" else "Closed"
         met = "minimum met" if p.get("funded") else "minimum missed"
@@ -72,9 +106,15 @@ def _line(kind: str, items: list[dict], title: str) -> tuple[str | None, str]:
     if kind == "released":
         return (None, f"{n} holds released") if n > 1 else (who, "hold released")
     if kind == "void_failed":
-        return who, "PayPal would not release the hold"
+        return who, ("PayPal would not say whether a hold exists" if p.get("code") == UNCONFIRMED else "PayPal would not release the hold")
     if kind == "excluded":
         return who, "taken out of the drop"
+    if kind == "lapsed":
+        return who, "hold ran out at PayPal, so out of the drop"
+    if kind == "gone":
+        return who, "hold no longer at PayPal, so out of the drop"
+    if kind == "taken_outside":
+        return who, "hold was charged outside the drop, so out of the drop. It was not released: refund it at PayPal"
     if kind == "blocked":
         return None, "Settlement stopped: it needs you"
     if kind == "settled":
@@ -85,12 +125,32 @@ def _line(kind: str, items: list[dict], title: str) -> tuple[str | None, str]:
     return None, kind
 
 
+def _left_held(events: list[dict]) -> set:
+    """The positions (in `events`) of a leave PayPal would not release: a `void_failed{reason: left}` and the `buyer_left` before it."""
+    out: set = set()
+    last_left: dict = {}
+    for i, e in enumerate(events):
+        p = e["payload"]
+        if e["type"] == "buyer_left":
+            last_left[p.get("buyer")] = i
+        elif e["type"] == "void_failed" and p.get("reason") == "left" and not p.get("orphan") and p.get("buyer") in last_left:
+            out.update({i, last_left[p["buyer"]]})
+    return out
+
+
 def feed(events: list[dict], buyers: dict, title: str, limit: int = 60) -> list[dict]:
     """[{at, kind, who, text, count}] newest first; `who` is the buyer names or None. `buyers` maps id -> name."""
     groups: list[dict] = []
-    for e in events:
+    held_after_leaving = _left_held(events)
+    for at, e in enumerate(events):
         kind = KINDS.get(e["type"])
         p = e["payload"]
+        if e["type"] == "hold_failed":              # not every failed hold is a decline: say what the engine recorded
+            kind = "void_failed" if may_be_open(p) else ("unconfirmed" if p.get("code") == UNCONFIRMED else "declined")
+        if at in held_after_leaving:           # the leave stands, the hold was not released: said once, in the leave's line
+            kind = LEFT_HELD if e["type"] == "buyer_left" else None
+        if e["type"] == "hold_voided":          # a hold that ran out, or was charged outside the drop, is not "released"
+            kind = {"lapsed": "lapsed", "gone": "gone", "taken_outside": "taken_outside"}.get(how_released(p), "released")
         if kind is None or (e["type"] == "hold_voided" and p.get("reason") == "left"):   # a leave says so in its own line
             continue
         item = {"ts": e["ts"], "payload": p, "name": p.get("name") or buyers.get(p.get("buyer"), p.get("buyer") or "")}

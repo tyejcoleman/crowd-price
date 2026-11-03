@@ -133,7 +133,8 @@ beside it. On the **drop page** a buyer joins with a sandbox test card and
 watches the price step down as the crowd grows; they can leave until the drop closes, and afterwards see what they paid.
 The **maker view** shows the ladder with the profit at each step, the activity, the buyers, and the settlement waiting
 for your `togi approve`; once settled, it checks every hold and capture with PayPal and runs the balance proof. Neither
-page can settle, exclude or bind: those move money, and only a person approves them, in Togi.
+page can settle, exclude or bind: those move money, and only a person approves them, in Togi. How to host it behind a proxy, what
+it limits, and the rare cases it does not close: [web/SECURITY.md](web/SECURITY.md).
 
 ### 6. The studio: run a drop from a chat, approve the charge in the panel
 
