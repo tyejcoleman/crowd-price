@@ -73,7 +73,7 @@ python3 -m pip install pytest
 
 ```bash
 cd crowd-price
-PYTHONPATH=../togi/src python3 -m pytest -q      # 641 passed, 5 skipped (the 5 live sandbox tests)
+PYTHONPATH=../togi/src python3 -m pytest -q      # 671 passed, 5 skipped (the 5 live sandbox tests)
 ```
 
 The tests run against a pretend PayPal built from what the sandbox actually answered (docs/DECISIONS.md F-08 to F-17).
@@ -119,7 +119,21 @@ python3 demo/maker_agent.py --fake --scenario missed        # a drop that misses
 The assistant runs in an empty folder with one tool, Bash limited to `togi ...` commands. See
 [demo/README.md](demo/README.md).
 
-### 5. The same in the PayPal sandbox
+### 5. The pages: the buyer's drop page and the maker's view
+
+In a second terminal, with the same settings as the assistant (so both see the same drops):
+
+```bash
+CROWD_ENV=test CROWD_PAYPAL=fake PYTHONPATH=src:web python3 -m crowdweb --maker-name Juniper
+```
+
+It prints a link per drop and a maker link with its key. On the **drop page** a buyer joins with a sandbox test card and
+watches the price step down as the crowd grows; they can leave until the drop closes, and afterwards see what they paid.
+The **maker view** shows the ladder with the profit at each step, the activity, the buyers, and the settlement waiting
+for your `togi approve`; once settled, it checks every hold and capture with PayPal and runs the balance proof. Neither
+page can settle, exclude or bind: those move money, and only a person approves them, in Togi.
+
+### 6. The same in the PayPal sandbox
 
 Create a free sandbox app at [developer.paypal.com](https://developer.paypal.com/) (Apps & Credentials, Sandbox), then:
 
@@ -163,7 +177,8 @@ The live tests: `CROWD_LIVE=1 PYTHONPATH=../togi/src python3 -m pytest -q tests/
 
 ## How it was checked
 
-- 641 tests against the pretend PayPal, including real threads racing on the store's file lock.
+- 641 engine tests against the pretend PayPal, including real threads racing on the store's file lock, and 30 for the
+  pages (only the engine's numbers shown; only your own hold can be released; no route that settles).
 - 5 live sandbox tests, run after every review round: a funded drop, a missed minimum, a leave after a step locked,
   a capture made to fail, and the report (docs/DECISIONS.md F-10, F-14).
 - What the sandbox actually answered, and where it differs from the docs, is recorded in docs/DECISIONS.md (F-08 to
@@ -173,8 +188,8 @@ The live tests: `CROWD_LIVE=1 PYTHONPATH=../togi/src python3 -m pytest -q tests/
 
 - PayPal honours a hold's full amount for 3 days (the authorisation lasts 29), so drops should be 72 hours or less.
   Reauthorising after day 3 is untested.
-- In this build, test buyers are placed by the engine with sandbox test cards (`sim join`, `drop join`). There is no
-  buyer-facing checkout page yet.
+- Buyers pay with PayPal's sandbox test cards, which the server sends to PayPal (Orders v2 with a card payment source).
+  There is no PayPal wallet checkout yet.
 - One product and one currency (USD) per drop. No shipping or tax.
 - Togi's guarantees hold when the agent reaches tools only through Togi (a shell restricted to `togi`, code mode or
   MCP). An agent with an unrestricted shell as the same user could edit Togi itself.
@@ -184,6 +199,7 @@ The live tests: `CROWD_LIVE=1 PYTHONPATH=../togi/src python3 -m pytest -q tests/
 - `src/crowd/`: the engine (`engine.py`), price ladder (`ladder.py`), PayPal holds client and pretend PayPal
   (`paypal_holds.py`), store, settlement check (`verify.py`), Togi bundle (`togi_bundle.py`)
 - `src/closure/`: the balance certifier used by `drop tieout` ([docs/closure.md](docs/closure.md))
+- `web/crowdweb/`: the drop page and the maker view (standard library server, plain HTML, CSS and JavaScript); `web/tests/`
 - `skills/`: what the assistant reads; `stone/tasks/`: the agent tasks; `togi.toml`: tiers, locks and policy
 - `demo/`: the assistant; `tests/`: the test suite; `harness/`: sandbox seeder and checks; `eval/`: the certifier's
   scorecard

@@ -13,8 +13,8 @@ build-backend = "setuptools.build_meta"
 where = ["src"]
 
 [tool.pytest.ini_options]
-pythonpath = ["src"]
-testpaths = ["tests"]
+pythonpath = ["src", "web"]
+testpaths = ["tests", "web/tests"]
 
 [tool.pyright]
-extraPaths = ["src"]
+extraPaths = ["src", "web"]

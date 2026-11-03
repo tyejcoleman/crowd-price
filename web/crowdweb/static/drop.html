@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin><link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Schibsted+Grotesk:wght@400;500;600;700;800&family=Spline+Sans+Mono:wght@400;500&display=swap"><link rel="stylesheet" href="/static/app.css"><link rel="icon" href="/static/mark.svg">
+<title>Crowd Price</title>
+</head>
+<body>
+<header class="bar">
+  <a class="brand" href="/"><svg width="24" height="22" viewBox="0 0 24 22" aria-hidden="true"><path d="M3 5h6v5h5v5" fill="none" stroke="#16201a" stroke-width="2.6"/><path d="M14 15h7" fill="none" stroke="#1d7a44" stroke-width="2.6"/></svg><span>Crowd Price</span></a>
+  <span class="env" id="env">Sandbox · test money only</span>
+</header>
+<main class="wrap">
+  <section class="hero">
+    <div>
+      <p class="by" id="by"></p>
+      <h1 class="two"><span id="title"></span> <span class="turn" id="turn">The more people join, the lower the price, for everyone.</span></h1>
+      <div class="pricebox">
+        <div class="label" id="pricelabel">Everyone pays</div>
+        <div class="price" id="price" aria-live="polite"></div>
+        <p class="next" id="next"></p>
+      </div>
+    </div>
+    <aside class="card join" id="join" aria-live="polite"></aside>
+  </section>
+  <section class="ladder-wrap">
+    <div class="ladder-head"><h3>The price ladder</h3><span class="label">buyers along the bottom</span></div>
+    <div id="ladder"></div>
+    <p class="caption" id="caption"></p>
+  </section>
+  <footer class="foot">Every price and count on this page comes from the drop's engine. Holds are placed through PayPal's sandbox with test cards: no real money moves.</footer>
+</main>
+<script src="/static/app.js"></script>
+<script src="/static/drop.js"></script>
+</body>
+</html>
