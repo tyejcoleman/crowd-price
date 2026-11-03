@@ -148,6 +148,8 @@ svg.ladder .crowd text { font-family: var(--sans); font-size: 13px; font-weight:
 .cmd button { flex: none; background: transparent; border: 1px solid #3d4a41; color: var(--paper); border-radius: 8px; padding: 6px 10px; font: 12px var(--mono); cursor: pointer; }
 .checks { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 16px; }
 .needs .checks .btn.inline { flex: 1 1 100%; }
+.needs .reqid { font-size: 12px; color: var(--muted); align-self: center; }
+.needs .checks + .fine { margin-top: 12px; }
 .result { margin-top: 12px; font-size: 14px; }
 .result ul { margin: 6px 0 0; padding-left: 18px; }
 .buyers { list-style: none; margin: 0; padding: 0; border-top: 1px solid var(--line); max-height: 420px; overflow: auto; }

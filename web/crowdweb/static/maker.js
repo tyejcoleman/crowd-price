@@ -1,5 +1,5 @@
 // The maker's view: the drop as the engine sees it, what needs the maker, and the read-only checks against PayPal.
-// It cannot approve or settle anything: approval is the maker's own `togi approve`, in their terminal.
+// It cannot approve or settle anything: approval is the maker's own, in their terminal, with their passphrase.
 "use strict";
 (() => {
   const { el, api, showMode, money, plural, clockFrom, duration, hhmm, ladder, store } = CP;
@@ -79,11 +79,12 @@
       const p = plan(pending.expect);
       kids.push(state("Needs your approval", "ask"), el("p", { class: "what", text: p.what }), el("p", { class: "muted", text: p.total }),
         el("p", { text: "Your assistant asked to settle. Only you can approve it, in your own terminal; your assistant cannot." }),
-        el("div", { class: "cmd" }, el("span", { text: `togi approve ${pending.id}` }),
-          el("button", { onclick: () => copy(`togi approve ${pending.id}`, pending.id), text: s.copied === pending.id ? "copied" : "copy" })),
-        el("p", { class: "fine", text: `Togi is the command-line tool your assistant works through. Approving asks for your passphrase, which the assistant never sees.${pending.expires ? ` The request lapses at ${hhmm(pending.expires)}.` : ""} If the drop changes first, settling refuses and your assistant asks again.` }));
+        el("div", { class: "checks" },
+          el("button", { class: "btn inline copycmd", onclick: () => copy(`togi approve ${pending.id}`, pending.id), text: s.copied === pending.id ? "Copied" : "Copy the approval command" }),
+          el("span", { class: "reqid mono", text: `request ${pending.id}` })),
+        el("p", { class: "fine", text: `Paste it in your terminal. It asks for your passphrase, which the assistant never sees.${pending.expires ? ` The request lapses at ${hhmm(pending.expires)}.` : ""} If the drop changes first, settling refuses and your assistant asks again.` }));
     } else if (approved && !st) {
-      kids.push(state("Approved"), el("p", { class: "what", text: plan(approved.expect).what }), el("p", { text: "Togi shows it approved. Your assistant settles next." }));
+      kids.push(state("Approved"), el("p", { class: "what", text: plan(approved.expect).what }), el("p", { text: "You approved it. Your assistant settles next." }));
     } else if (d.state === "settling") {
       kids.push(state("Settling"), el("p", { class: "what", text: st && st.outcome === "funded" ? `Charging ${money(st.final_price)} each` : "Releasing every hold" }));
     } else if (d.state === "settled") {
