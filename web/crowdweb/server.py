@@ -43,7 +43,7 @@ MAX_BODY = 4096
 JOINS_PER_MINUTE = 12          # per client address: holds are real sandbox calls, so a page cannot be used to flood them
 JOINS_PER_DROP_MINUTE = 120    # per drop, whoever asks: the ceiling still holds behind a proxy that hides addresses
 MAX_CONNECTIONS = 64           # open connections at once; a client that opens many slow ones cannot exhaust the threads
-MAX_CONNECTIONS_PER_ADDRESS = 16   # of those, one address's share (not applied behind --trust-proxy, where every client is the proxy)
+MAX_CONNECTIONS_PER_ADDRESS = 16   # of those, one address's share WHILE ITS REQUEST IS STILL ARRIVING (off behind --trust-proxy)
 READ_TIMEOUT = 10              # seconds a connection may sit without sending anything
 REQUEST_DEADLINE = 15          # seconds for a whole request to arrive, however slowly (READ_TIMEOUT alone is reset by every byte)
 MIN_MAKER_KEY = 16
@@ -82,14 +82,17 @@ class RateLimit:
 
 class CappedServer(ThreadingHTTPServer):
     """A threading server that turns a connection away (closes it) when MAX_CONNECTIONS are already being served, or when one
-    address already holds `per_address` of them (0: no per-address cap). Together with the request deadline, a few slow clients
-    can neither keep every slot nor keep one for long."""
+    address already has `per_address` requests still ARRIVING (0: no per-address cap). A connection counts toward its address only
+    until its request has been read in full (`arrived`): one that is merely waiting for the drop's turn, or for PayPal, is the
+    server's own queue and must not shut that address (a whole venue behind one router) out of everything else. Together with the
+    request deadline, a few slow clients can neither keep every slot nor keep one for long."""
     daemon_threads = True
 
     def __init__(self, *a, per_address: int | None = None, **kw):
         self._slots = threading.BoundedSemaphore(MAX_CONNECTIONS)
         self._per_address = MAX_CONNECTIONS_PER_ADDRESS if per_address is None else per_address
-        self._open: dict[str, int] = {}
+        self._arriving: dict[int, str] = {}         # id(connection) -> address, while its request is still arriving
+        self._open: dict[str, int] = {}             # address -> how many of its connections are in that state
         self._open_lock = threading.Lock()
         super().__init__(*a, **kw)
 
@@ -101,6 +104,7 @@ class CappedServer(ThreadingHTTPServer):
                 taken = False
             else:
                 taken = True
+                self._arriving[id(request)] = who
                 self._open[who] = self._open.get(who, 0) + 1
         if not taken:
             self.shutdown_request(request)
@@ -108,23 +112,28 @@ class CappedServer(ThreadingHTTPServer):
         try:
             super().process_request(request, client_address)
         except BaseException:
-            self._release(who)
+            self.arrived(request)
+            self._slots.release()
             raise
 
     def process_request_thread(self, request, client_address):
         try:
             super().process_request_thread(request, client_address)
         finally:
-            self._release(client_address[0])
+            self.arrived(request)
+            self._slots.release()
 
-    def _release(self, who: str) -> None:
+    def arrived(self, request) -> None:
+        """This connection's request has been read in full (or it is over): its address no longer pays for it."""
         with self._open_lock:
+            who = self._arriving.pop(id(request), None)
+            if who is None:
+                return
             left = self._open.get(who, 0) - 1
             if left > 0:
                 self._open[who] = left
             else:
                 self._open.pop(who, None)
-        self._slots.release()
 
 
 class _Deadline(io.RawIOBase):
@@ -227,7 +236,20 @@ def make_handler(api: Api, maker_key: str, quiet: bool = True, hosts: set[str] |
             self._error(ApiError(404, "not_found", "Nothing here."))
 
         # ---- requests
+        def _arrived(self):
+            """The request has been read in full: from here on the server's own work (a queue for the drop, a slow PayPal call) is
+            not the client's doing, and does not count against its address's share of connections."""
+            done = getattr(self.server, "arrived", None)
+            if done is not None:
+                done(self.request)
+
         def _body(self) -> dict:
+            try:
+                return self._read_body()
+            finally:
+                self._arrived()
+
+        def _read_body(self) -> dict:
             if (self.headers.get("Content-Type") or "").split(";")[0].strip().lower() != "application/json":
                 raise ApiError(415, "json_only", "Send JSON.")
             try:
@@ -269,14 +291,17 @@ def make_handler(api: Api, maker_key: str, quiet: bool = True, hosts: set[str] |
             return s
 
         def _refuse_method(self):
+            self._arrived()
             self._error(ApiError(405, "method", "Not here."))
 
         do_PUT = do_DELETE = do_PATCH = do_OPTIONS = _refuse_method
 
         def do_HEAD(self):
+            self._arrived()
             self._headers(405, "application/json; charset=utf-8", 0)
 
         def do_GET(self):
+            self._arrived()
             if not self._host_ok():
                 return self._error(ApiError(421, "host", "Unknown host."))
             p = self._parts()
@@ -313,9 +338,12 @@ def make_handler(api: Api, maker_key: str, quiet: bool = True, hosts: set[str] |
                 return self._error(ApiError(500, "internal", "Something went wrong on our side."))
 
         def do_POST(self):
-            if not self._host_ok():
-                return self._error(ApiError(421, "host", "Unknown host."))
             p = self._parts()
+            if not (len(p) == 4 and p[:2] == ["api", "drops"]):         # only these read a body; the others are read in full already
+                self._arrived()
+            if not self._host_ok():
+                self._arrived()
+                return self._error(ApiError(421, "host", "Unknown host."))
             try:
                 if len(p) == 4 and p[:2] == ["api", "drops"]:
                     drop, action = self._drop_id(p[2]), p[3]

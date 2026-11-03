@@ -8,6 +8,7 @@ import json
 import re
 import shutil
 import socket
+import sqlite3
 import subprocess
 import threading
 import time
@@ -25,7 +26,7 @@ from crowd.store import Store
 from crowdweb.api import Api, ApiError
 from crowdweb.feed import feed
 from crowdweb.server import JOINS_PER_MINUTE, serve
-from crowdweb.tokens import Tokens
+from crowdweb.tokens import Tokens, digest
 
 WEB = Path(__file__).resolve().parents[1] / "crowdweb"
 KEY = "maker-key-for-tests"
@@ -902,7 +903,8 @@ def test_the_maker_key_is_printed_only_when_it_was_made_here(monkeypatch, capsys
 # ---- drop.js itself: what the buyer's page does with its secret (run for real, in node, against a scripted server) ---------
 
 # The page's own code runs unchanged in a node `vm` with a fake document and a scripted API: no browser, no network.
-# A scenario is {store, persist, join: [answers], steps: [...]}; steps are ["tick"], ["advance", ms], ["submit", name], ["tab", record].
+# A scenario is {store, persist, drop_life, join: [answers], steps: [...]}; steps are ["tick"], ["advance", ms], ["submit", name],
+# ["start", name] (a submit left waiting) with ["finish"], and ["tab", record]. An answer may carry a `delay` in ms.
 DROP_JS_HARNESS = r'''
 const fs = require("fs"), vm = require("vm");
 const sc = JSON.parse(fs.readFileSync(0, "utf8"));
@@ -916,7 +918,7 @@ const calls = [], forms = {}, joinQ = [...(sc.join || [])];
 const DROP = { drop: "d_test", title: "Mugs", state: "live", joinable: true, price: "40.00", start_price: "40.00", minimum: 3,
   minimum_met: false, buyers: 0, steps: [{ step: 0, from_buyers: 3, price: "40.00" }], locked_step: null, next_step: null,
   next_message: null, details: null, paypal: "fake", maker_name: "Juniper", settled: null, saved_each: null, next_saving: null,
-  ends_at: "2999-01-01T00:00:00Z", time_left_seconds: 100, server_time: "2026-11-01T12:00:00Z" };
+  ends_at: "2999-01-01T00:00:00Z", time_left_seconds: 100, server_time: "2026-11-01T12:00:00Z", life: sc.drop_life || "L1" };
 const ME = { buyer: "alex", name: "Alex", status: "held", card: "Test card ending 4444", held: "40.00", charged: null, saved: null,
   start_price: "40.00", can_leave: true, leaving: false };
 
@@ -926,6 +928,7 @@ async function api(path, opts = {}) {
   calls.push({ act, body: opts.body });
   if (act === "join") {
     const r = joinQ.shift();
+    if (r && r.delay) await new Promise(done => setTimeout(done, r.delay));
     if (!r) throw { code: "offline", message: "The drop could not be reached." };
     if (r.error) throw r.error;
     return { buyer: "alex", me: ME, drop: DROP, ...r.ok };
@@ -966,12 +969,16 @@ vm.runInContext(src, ctx);
 (async () => {
   while (!ticker) await new Promise(r => setTimeout(r, 1));
   const trace = [];
+  let waiting = null;
   for (const [op, arg] of sc.steps) {
     if (op === "tick") await ticker();
     else if (op === "advance") now += arg;
     else if (op === "tab") mem.set(KEY, JSON.stringify(arg));
     else if (op === "submit") { forms.name.oninput({ target: { value: arg } }); await forms.submit({ preventDefault() {} }); }
-    trace.push({ op, store: persist ? JSON.parse(mem.get(KEY) || "null") : null, said: lastCard.flatMap(words) });
+    else if (op === "start") { forms.name.oninput({ target: { value: arg } }); waiting = forms.submit({ preventDefault() {} }); }
+    else if (op === "finish") await waiting;
+    trace.push({ op, store: persist ? JSON.parse(mem.get(KEY) || "null") : null, said: lastCard.flatMap(words),
+      joins: calls.filter(c => c.act === "join").length });
   }
   console.log(JSON.stringify({ trace, calls }));
 })();
@@ -997,17 +1004,20 @@ def err(code, message="Words from the server.", **extra):
 
 @needs_node
 @pytest.mark.parametrize("code", ["slow_down", "internal", "offline", "paypal_unavailable", "earlier_attempt_unresolved", "join_unconfirmed",
-                                  "not_recorded_held", "paypal_error", "error", "http_502", "join_in_progress", "already_joined"])
+                                  "not_recorded_held", "paypal_error", "error", "http_502", "join_in_progress", "already_joined", "busy",
+                                  "drop_closed", "drop_ended"])
 def test_the_page_keeps_its_secret_on_every_answer_that_does_not_prove_nothing_was_held(tmp_path, code):
     out = drop_js(tmp_path, store=PENDING, join=[err(code)], steps=[["tick"]])
     last = out["trace"][-1]
     assert last["store"] == PENDING, code                                  # still the same secret, still pending
-    assert any("Confirming your join" in w for w in last["said"]) and not any("Join the drop" in w for w in last["said"])
+    assert not any("Join the drop" in w for w in last["said"])             # and no form to type another name into
 
 
 @needs_node
-@pytest.mark.parametrize("answer", [err("bad_card"), err("bad_buyer"), err("join_declined"), err("hold_not_open"), err("drop_closed"),
-                                    err("drop_ended"), err("not_recorded"), err("paypal_error", nothing_held=True)])
+@pytest.mark.parametrize("answer", [err("bad_card"), err("bad_buyer"), err("join_declined"), err("hold_not_open"), err("not_recorded"),
+                                    err("paypal_error", nothing_held=True), err("drop_closed", nothing_held=True),
+                                    err("drop_ended", nothing_held=True), err("already_joined", nothing_held=True),
+                                    err("join_stale", nothing_held=True)])
 def test_the_page_forgets_its_secret_only_when_nothing_was_held(tmp_path, answer):
     out = drop_js(tmp_path, store=PENDING, join=[answer], steps=[["tick"]])
     assert out["trace"][-1]["store"] is None
@@ -1072,3 +1082,252 @@ def test_a_browser_that_will_not_keep_the_record_still_keeps_the_secret_while_th
     joins = [c["body"] for c in out["calls"] if c["act"] == "join"]
     assert len(joins) == 2 and joins[0]["secret"] == joins[1]["secret"]
     assert any("Confirming your join" in w for w in out["trace"][1]["said"])                          # no form to type another name into
+
+
+# ---- round 3: narrower paths to the same two failures (two holds from one intent; a hold released by someone who did not place it) ----
+
+def die_after_the_hold(api, monkeypatch):
+    def die(*a, **k):
+        raise Died("killed after the hold, before the bind")
+    monkeypatch.setattr(api.tokens, "bind", die)
+
+
+def charge(engine, drop):
+    from crowd.engine import plan_token
+    engine.settle(drop, plan_token(engine.plan(drop)))
+
+
+def test_r3_s2_a_buyer_charged_after_a_crash_is_told_so_never_that_they_were_not_in(api, engine, fake, drop, tmp_path, monkeypatch):
+    die_after_the_hold(api, monkeypatch)
+    with pytest.raises(Died):
+        api.join(drop, "Bea", 0, sec("a"))
+    api2 = restarted(api, tmp_path)
+    sim(engine, drop, 3)
+    engine.close(drop)
+    with pytest.raises(ApiError) as e:                                       # closed, the hold still there
+        api2.join(drop, "Bea", 0, sec("a"))
+    assert e.value.code == "join_unconfirmed" and "nothing_held" not in e.value.extra
+    charge(engine, drop)
+    assert engine.get(drop).buyers["bea"].status == "captured"
+    with pytest.raises(ApiError) as e:                                       # settled: she was charged
+        api2.join(drop, "Bea", 0, sec("a"))
+    assert e.value.code == "join_unconfirmed" and "nothing_held" not in e.value.extra
+    assert "$40.00" in e.value.message and "charged" in e.value.message and "refund" in e.value.message
+    for call in (api2.me, api2.leave):
+        with pytest.raises(ApiError) as e:
+            call(drop, "bea", sec("a"))
+        assert e.value.code == "not_yours"
+
+
+def test_r3_s2_a_hold_the_assistant_adopted_and_settlement_charged_is_still_told_to_the_page(api, engine, fake, drop):
+    fake.lose_reply("authorize")
+    with pytest.raises(ApiError):
+        api.join(drop, "Alex", 0, sec("a"))
+    engine.join(drop, "Alex", 0)                                             # the assistant's join replays A's request
+    sim(engine, drop, 3)
+    engine.close(drop)
+    charge(engine, drop)
+    with pytest.raises(ApiError) as e:
+        api.join(drop, "Alex", 0, sec("a"))
+    assert e.value.code == "join_unconfirmed" and "charged" in e.value.message
+
+
+def test_r3_s2_the_maker_view_marks_a_hold_that_sits_beside_an_unbound_claim(api, engine, drop, monkeypatch):
+    api.join(drop, "Ada", 0, sec("a"))                                       # an ordinary join, bound
+    die_after_the_hold(api, monkeypatch)
+    with pytest.raises(Died):
+        api.join(drop, "Bea", 0, sec("b"))
+    rows = {r["name"]: r for r in api.maker(drop)["buyers_list"]}
+    assert rows["Ada"]["unconfirmed_web_join"] is False
+    assert rows["Bea (unconfirmed web join)"]["unconfirmed_web_join"] is True and rows["Bea (unconfirmed web join)"]["status"] == "held"
+
+
+# S3 through the assistant: the join the claim started is not the join that is open now
+
+def test_r3_s3_a_join_the_assistant_opens_after_a_claim_is_not_the_claims_to_inherit(api, engine, fake, drop):
+    fake.lose_reply("authorize")
+    with pytest.raises(ApiError):
+        api.join(drop, "Alex", 0, sec("a"))                                  # intent 1 open; A's claim unbound, for attempt 1
+    engine.join(drop, "Alex", 0)                                             # replays intent 1 and adopts its hold
+    engine.leave(drop, "alex")
+    fake.lose_reply("authorize")
+    with pytest.raises(CrowdError):
+        engine.join(drop, "Alex", 0)                                         # the assistant's OWN new join, its reply lost (attempt 2)
+    mine = api.tokens.row(drop, "alex")
+    assert mine["attempt"] == 1 and [j["attempt"] for j in engine.get(drop).unresolved.values()] == [2]
+    for who in ("a", "b"):
+        with pytest.raises(ApiError) as e:
+            api.join(drop, "Alex", 0, sec(who))
+        assert e.value.code == "join_in_progress"
+    assert api.tokens.row(drop, "alex") == mine and len(open_auths(fake)) == 1        # only the assistant's hold; nobody inherited it
+    for call in (api.me, api.leave):
+        with pytest.raises(ApiError) as e:
+            call(drop, "alex", sec("a"))
+        assert e.value.code == "not_yours"
+    engine.reconcile(drop)                                                   # the maker sorts the assistant's join out: released
+    got = api.join(drop, "Alex", 0, sec("a"))                                # now A may ask for her own
+    assert got["buyer"] == "alex" and len(open_auths(fake)) == 1 and api.leave(drop, "alex", sec("a"))["me"]["status"] == "left"
+
+
+def test_r3_s3_a_claim_from_before_attempts_were_recorded_cannot_pass_the_guard(api, engine, fake, drop):
+    fake.lose_reply("authorize")
+    with pytest.raises(ApiError):
+        api.join(drop, "Alex", 0, sec("a"))
+    with contextlib.closing(sqlite3.connect(api.tokens.path)) as c:
+        c.execute("UPDATE buyer_secrets SET attempt = NULL")
+        c.commit()
+    with pytest.raises(ApiError) as e:
+        api.join(drop, "Alex", 0, sec("a"))
+    assert e.value.code == "join_in_progress" and len(open_auths(fake)) == 1
+
+
+def test_r3_a_claims_table_from_before_the_attempt_column_is_upgraded(tmp_path):
+    path = str(tmp_path / "old.web.db")
+    with contextlib.closing(sqlite3.connect(path)) as c:
+        c.execute("CREATE TABLE buyer_secrets (drop_id TEXT NOT NULL, buyer TEXT NOT NULL, secret_sha256 TEXT NOT NULL, "
+                  "drop_created TEXT NOT NULL, auth_id TEXT, created TEXT NOT NULL, PRIMARY KEY (drop_id, buyer))")
+        c.execute("INSERT INTO buyer_secrets VALUES ('d', 'ada', ?, 'c1', 'AUTH1', 'now')", (digest(sec("a")),))
+        c.commit()
+    t = Tokens(path)
+    assert t.owns("d", "ada", sec("a"), "c1", "AUTH1") and t.row("d", "ada")["attempt"] is None
+    assert t.claim("d", "bo", sec("b"), "c1", "now", attempt=2) and t.claim_of("d", "bo", sec("b"), "c1")["attempt"] == 2
+
+
+# R2: a secret that never had anything is told so
+
+def test_r3_r2_a_secret_with_no_claim_is_told_nothing_was_held_when_the_name_is_taken(api, engine, drop):
+    def full():
+        raise ApiError(429, "slow_down", "Too many joins right now. Wait a minute.")
+    with pytest.raises(ApiError) as e:                                       # A's first ask is turned away by the limit
+        api.join(drop, "Alex", 0, sec("a"), full)
+    assert e.value.code == "slow_down" and api.tokens.row(drop, "alex") is None
+    api.join(drop, "Alex", 2, sec("b"))                                      # B takes the name
+    for _ in range(2):
+        with pytest.raises(ApiError) as e:                                   # A's retries: let go, say it is taken
+            api.join(drop, "Alex", 0, sec("a"))
+        assert e.value.code == "already_joined" and e.value.extra["nothing_held"] is True and "taken" in e.value.message
+
+
+def test_r3_r2_a_refusal_beside_this_secrets_own_open_join_does_not_say_nothing_was_held(api, engine, fake, drop, clock):
+    fake.lose_reply("authorize")
+    with pytest.raises(ApiError):
+        api.join(drop, "Alex", 0, sec("a"))                                  # A's claim, and a join PayPal may have acted on
+    with pytest.raises(ApiError) as e:                                       # someone else's secret: that one holds nothing
+        api.join(drop, "Alex", 0, sec("b"))
+    assert e.value.code == "join_in_progress" and e.value.extra["nothing_held"] is True
+    clock.advance(minutes=61)                                                # the deadline passes with A's join still open
+    with pytest.raises(ApiError) as e:
+        api.join(drop, "Alex", 0, sec("a"))
+    assert e.value.code == "drop_ended" and "will be released" in e.value.message and "nothing_held" not in e.value.extra
+    assert len(open_auths(fake)) == 1
+    engine.close(drop)                                                       # the maker closes: every unconfirmed join is released (D-11)
+    with pytest.raises(ApiError) as e:
+        api.join(drop, "Alex", 0, sec("a"))
+    assert e.value.code == "drop_closed" and e.value.extra["nothing_held"] is True and open_auths(fake) == []
+
+
+# R3: a secret from an earlier life of the drop id
+
+def test_r3_r3_a_secret_from_an_earlier_life_of_the_drop_is_told_it_is_stale(tmp_path, clock):
+    db, fake = str(tmp_path / "c.db"), FakePayPal(str(tmp_path / "pp3.json"))
+    e1 = Engine(Store(db), fake, clock)
+    e1.create_drop("Vases", lad.parse("3:50"), 3, 60, drop_id="d_same")
+    e1.publish("d_same")
+    a1 = Api(e1, togi_home=str(tmp_path / "togi"))
+    life1 = a1.drop("d_same")["life"]
+    fake.lose_reply("authorize")
+    with pytest.raises(ApiError):
+        a1.join("d_same", "Linus", 0, sec())                                 # the page keeps {pending, secret}
+    Store(db).reset()                                                        # what `togi crowd test reset` does; the web db stays
+    clock.advance(minutes=1)
+    e2 = Engine(Store(db), fake, clock)
+    e2.create_drop("Vases", lad.parse("3:50"), 3, 60, drop_id="d_same")
+    e2.publish("d_same")
+    a2 = Api(e2, togi_home=str(tmp_path / "togi"))
+    assert a2.drop("d_same")["life"] != life1                                # the page can tell the two lives apart
+    with pytest.raises(ApiError) as e:
+        a2.join("d_same", "Linus", 0, sec())
+    assert e.value.code == "join_stale" and e.value.extra["nothing_held"] is True
+    assert not e2.get("d_same").buyers and not e2.store.events("d_same")[2:]       # nothing was joined in the new life
+
+
+# the server: waiting for a turn is the server's queue, not the client's connection
+
+def test_r3_requests_waiting_for_the_drops_turn_do_not_use_up_their_addresses_share(api, drop, monkeypatch):
+    import crowdweb.server as srv
+    monkeypatch.setattr(srv, "MAX_CONNECTIONS_PER_ADDRESS", 3)
+    lock, results = api._lock(drop), []
+    with running(api) as call:
+        def joiner(i):
+            results.append(call(f"/api/drops/{drop}/join", body=join_body(f"Venue {i}", str(i)))[0])
+        lock.acquire()                                                       # stands in for a slow PayPal call, a close, a sim join
+        threads = [threading.Thread(target=joiner, args=(i,)) for i in range(6)]
+        for t in threads:
+            t.start()
+        try:
+            time.sleep(0.6)                                                  # six joins have arrived in full and are waiting
+            assert call("/api/info")[0] == 200 and call(f"/d/{drop}")[0] == 200        # the venue's other visitors are not shut out
+        finally:
+            lock.release()
+        for t in threads:
+            t.join(10)
+    assert sorted(results) == [200] * 6
+
+
+def test_r3_a_join_waiting_too_long_for_the_drops_turn_answers_503_and_writes_nothing(api, drop, monkeypatch):
+    import crowdweb.api as capi
+    monkeypatch.setattr(capi, "LOCK_WAIT", 0.3)
+    lock = api._lock(drop)
+    lock.acquire()
+    try:
+        t0 = time.monotonic()
+        with pytest.raises(ApiError) as e:
+            api.join(drop, "Zed", 0, sec("z"))
+        assert e.value.status == 503 and e.value.code == "busy" and time.monotonic() - t0 < 3
+        with pytest.raises(ApiError) as e:
+            api.leave(drop, "zed", sec("z"))
+        assert e.value.status == 503 and e.value.code == "busy"
+    finally:
+        lock.release()
+    assert api.tokens.row(drop, "zed") is None
+
+
+# drop.js: the narrow paths
+
+@needs_node
+def test_r3_the_poll_does_not_send_a_second_join_while_the_first_is_waiting(tmp_path):
+    out = drop_js(tmp_path, join=[{"ok": {}, "delay": 300}], steps=[["tick"], ["start", "Alex"], ["tick"], ["finish"]])
+    assert out["trace"][2]["joins"] == 1 and out["trace"][-1]["joins"] == 1          # the poll waited for the click's own ask
+    assert out["trace"][-1]["store"]["buyer"] == "alex"
+
+
+@needs_node
+@pytest.mark.parametrize("code", ["join_unconfirmed", "join_in_progress", "already_joined"])
+def test_r3_a_stuck_page_asks_again_about_once_a_minute(tmp_path, code):
+    out = drop_js(tmp_path, store=PENDING, join=[err(code), err(code)],
+                  steps=[["tick"], ["advance", 30000], ["tick"], ["advance", 31000], ["tick"]])
+    assert [t["joins"] for t in out["trace"] if t["op"] == "tick"] == [1, 1, 2]
+    assert out["trace"][-1]["store"] == PENDING
+
+
+@needs_node
+def test_r3_a_pending_record_from_another_life_of_the_drop_is_dropped_not_joined(tmp_path):
+    out = drop_js(tmp_path, store={**PENDING, "life": "L0"}, drop_life="L1", join=[{"ok": {}}], steps=[["tick"]])
+    assert out["trace"][-1]["store"] is None and out["trace"][-1]["joins"] == 0
+    out = drop_js(tmp_path, store={**PENDING, "life": "L1"}, drop_life="L1", join=[{"ok": {}}], steps=[["tick"]])
+    assert out["trace"][-1]["joins"] == 1                                    # the same life carries on
+    out = drop_js(tmp_path, join=[err("offline")], drop_life="L7", steps=[["tick"], ["submit", "Alex"]])
+    assert out["trace"][-1]["store"]["life"] == "L7"                         # and a new ask remembers which life it was made in
+
+
+@needs_node
+def test_r3_a_join_that_may_be_charged_or_held_is_never_wrapped_in_nothing_was_held(tmp_path):
+    charged = "Your earlier try may have been charged $40.00. This page never confirmed it. The maker can see the charge and refund it."
+    out = drop_js(tmp_path, store=PENDING, join=[err("join_unconfirmed", charged)], steps=[["tick"]])
+    said = " ".join(out["trace"][-1]["said"])
+    assert charged in said and "We could not confirm your join" in said and "nothing was held" not in said
+    assert out["trace"][-1]["store"] == PENDING
+    ended = "Joining has closed. If a hold was placed it will be released, and you will not be charged."
+    out = drop_js(tmp_path, store=PENDING, join=[err("drop_ended", ended)], steps=[["tick"]])
+    said = " ".join(out["trace"][-1]["said"])
+    assert ended in said and "nothing was held" not in said and out["trace"][-1]["store"] == PENDING

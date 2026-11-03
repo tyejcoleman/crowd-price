@@ -3,7 +3,7 @@
 (() => {
   const { el, api, secret, showMode, money, short, splitMoney, plural, clockFrom, duration, ladder, poll, store } = CP;
   const dropId = location.pathname.split("/")[2];
-  const KEY = "crowd-price:" + dropId;      // {name, card, secret, pending} until the join is confirmed, then {buyer, secret}
+  const KEY = "crowd-price:" + dropId;      // {name, card, secret, life, pending} until the join is confirmed, then {buyer, secret}
   const $ = id => document.getElementById(id);
 
   // The record is the only thing that links this browser to its hold, so it is kept where the browser keeps things; a browser that
@@ -15,16 +15,22 @@
   const keepsPending = () => !!(kept() || {}).pending;
 
   const s = { drop: null, me: null, cards: [], busy: false, error: null, clock: null, lastPrice: null, lastLadder: "",
-              lastCard: "", confirmLeave: false, copied: false, form: { name: "", card: 0 }, gone: false, tries: 0, retryAt: 0 };
+              lastCard: "", confirmLeave: false, copied: false, form: { name: "", card: 0 }, gone: false, tries: 0, retryAt: 0, joining: false, note: null };
 
-  // What a join's refusal can prove. Only these answers show that NOTHING was held under this secret, so only they let the page
-  // forget it. Every other answer (too many requests, a server error, no answer at all, PayPal trouble, a join still being
-  // sorted out, one that could not be confirmed) keeps the secret and asks again: the first ask may have placed a hold whose
-  // answer was lost, and a new secret under another name would place a second one.
-  const NOTHING_HELD = new Set(["bad_card", "bad_buyer", "bad_secret", "join_declined", "hold_not_open", "drop_closed", "drop_ended",
+  // What a join's refusal can prove. Only these answers, and any answer the server marks `nothing_held`, show that NOTHING was held
+  // under this secret, so only they let the page forget it. Every other answer (too many requests, busy, a server error, no answer at
+  // all, PayPal trouble, a join still being sorted out, one that could not be confirmed, a drop that closed beside a join that may
+  // still hold something) keeps the secret and asks again: the first ask may have placed a hold whose answer was lost, and a new
+  // secret under another name would place a second one. A closed drop is NOT on this list: the server says when it is safe.
+  const NOTHING_HELD = new Set(["bad_card", "bad_buyer", "bad_secret", "join_declined", "hold_not_open",
     "drop_not_found", "drop_not_published", "wrong_paypal", "drop_unbound", "not_recorded"]);
   // Only for the very first ask, which no earlier ask of this secret can have preceded: "taken" then means taken by someone else.
   const ONLY_IF_FIRST = new Set(["already_joined", "buyer_excluded", "join_in_progress"]);
+  // Answers that will not change in seconds: the page asks again about once a minute, not every few seconds.
+  const SLOW = new Set(["join_unconfirmed", "not_recorded_held", "join_in_progress", "already_joined", "buyer_excluded", "drop_closed", "drop_ended"]);
+  // The server's own words are the right ones, and the page must not wrap them in "if not, nothing was held": they say what may be held.
+  const SAYS_SO = { join_unconfirmed: "We could not confirm your join", not_recorded_held: "We could not confirm your join",
+    drop_closed: "Joining has closed", drop_ended: "Joining has closed" };
   const ASKING_AGAIN = "We could not confirm your join yet. Checking again…";
   const MAY_BE_IN = "Your earlier try may have gone through, so please don't join again under another name. This page keeps checking.";
 
@@ -42,8 +48,13 @@
           s.drop = await api(`/api/drops/${dropId}`);
         }
       } else if (mine && mine.pending) {
-        if (Date.now() >= s.retryAt) await finishJoin(mine, false);      // a join whose answer never came: ask again, same secret
-        else s.drop = await api(`/api/drops/${dropId}`);                 // not yet: keep the page's numbers fresh meanwhile
+        s.drop = await api(`/api/drops/${dropId}`);
+        if (mine.life && s.drop.life && mine.life !== s.drop.life) {     // asked in an earlier life of this drop id (it was reset since):
+          keep(null);                                                    // that ask is not this drop's, and must not join this one
+          s.error = null; s.note = null;
+        } else if (!s.joining && Date.now() >= s.retryAt) {
+          await finishJoin(mine, false);                                 // a join whose answer never came: ask again, same secret
+        }
       } else {
         s.drop = await api(`/api/drops/${dropId}`);
       }
@@ -58,21 +69,27 @@
   // Ask to join with a secret already written down. Asked again (same secret) after a lost answer, the server hands back
   // the same join; it never places a second hold. `first` is true only for the ask the buyer has just made.
   async function finishJoin(mine, first) {
+    if (s.joining) return;                       // one ask at a time: the poll must not send a second while a slow PayPal call is answering
+    s.joining = true;
     try {
       const r = await api(`/api/drops/${dropId}/join`, { body: { name: mine.name, card: mine.card, secret: mine.secret } });
       keep({ buyer: r.buyer, secret: mine.secret });
-      s.me = r.me; s.drop = r.drop; s.error = null; s.tries = 0;
+      s.me = r.me; s.drop = r.drop; s.error = null; s.tries = 0; s.note = null;
     } catch (e) {
+      s.note = null;
       if (NOTHING_HELD.has(e.code) || e.nothing_held === true || (first && ONLY_IF_FIRST.has(e.code))) {
         keep(null); s.tries = 0;
         s.error = e.message;
       } else {
-        s.tries += 1;                                                    // wait a little longer each time, up to 20 s
-        s.retryAt = Date.now() + Math.min(20000, 1500 * 2 ** s.tries);
-        s.error = (e.code === "join_unconfirmed" || e.code === "not_recorded_held") ? e.message
+        s.tries += 1;                                                    // wait a little longer each time, up to 20 s ...
+        s.retryAt = Date.now() + (SLOW.has(e.code) ? 60000 : Math.min(20000, 1500 * 2 ** s.tries));     // ... or a minute for a stuck answer
+        s.error = SAYS_SO[e.code] ? e.message
           : (e.code === "already_joined" || e.code === "join_in_progress" || e.code === "buyer_excluded") ? MAY_BE_IN : ASKING_AGAIN;
+        if (SAYS_SO[e.code]) s.note = { title: SAYS_SO[e.code], text: e.message };
       }
       try { if (!keepsPending() || !s.drop) s.drop = await api(`/api/drops/${dropId}`); } catch (e2) { /* the next tick tries again */ }
+    } finally {
+      s.joining = false;
     }
   }
 
@@ -88,7 +105,7 @@
       await tick();
       return;
     }
-    const mine = { name, card: s.form.card, secret: secret(), pending: true };
+    const mine = { name, card: s.form.card, secret: secret(), life: (s.drop || {}).life || null, pending: true };
     keep(mine);                              // written down before asking, so a lost answer can be asked again
     s.busy = true; render();
     try { await finishJoin(mine, true); if (s.me) s.form.name = ""; } finally { s.busy = false; render(); }
@@ -261,6 +278,7 @@
   }
 
   function cardPending() {
+    if (s.note) return [el("h2", { text: s.note.title }), el("p", { class: "msg", text: s.note.text })];
     return [el("h2", { text: "Confirming your join…" }),
       el("p", { text: "If PayPal placed your hold, you are in. If not, nothing was held. This page checks again by itself." }),
       s.error ? el("p", { class: "msg", text: s.error }) : null];
@@ -288,7 +306,7 @@
     renderLadder(d);
     const pending = !s.me && keepsPending();
     const cardKey = JSON.stringify([s.me, pending, d.joinable, d.state, d.price, d.start_price, d.minimum, d.minimum_met, !!d.next_step,
-                                    d.settled, d.others, s.error, s.busy, s.confirmLeave, s.copied, s.cards.length]);
+                                    d.settled, d.others, s.error, s.note, s.busy, s.confirmLeave, s.copied, s.cards.length]);
     const join = $("join");
     const typing = document.activeElement && join.contains(document.activeElement) && ["INPUT", "SELECT"].includes(document.activeElement.tagName);
     if (cardKey !== s.lastCard && !(typing && !s.me && d.joinable && !s.error && !s.busy)) {

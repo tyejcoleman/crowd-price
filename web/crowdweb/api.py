@@ -12,6 +12,7 @@ The only other arithmetic is counting buyers by status.
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import mimetypes
 import os
@@ -36,6 +37,7 @@ from .tokens import Tokens, well_formed
 WEB_CARDS = list(range(8))
 PUBLIC_STATES = {"live", "ended", "closed", "settling", "settled"}
 HOLDING = {"held", "captured", "capture_failed", "void_failed"}     # a buyer in one of these still has a hold (or a charge) on record
+LOCK_WAIT = 10        # seconds a join or leave waits for the drop's turn (a slow PayPal call can hold it) before it answers 503, busy
 MEDIA_TYPES = {"image/jpeg", "image/png", "image/webp"}
 
 # What PayPal said when settlement stopped, in words a maker can act on. The code is shown beside it, for searching.
@@ -115,6 +117,8 @@ MESSAGES = {
                               "Try again in a minute."),
     "join_unconfirmed": (409, "Your earlier try may have placed a hold on your card, but it was never confirmed here, so this page "
                               "cannot show or release it. Please do not join again. The maker can see the hold and can release it."),
+    "join_stale": (409, "This drop was reset since this page last asked to join. Reload the page and join again."),
+    "busy": (503, "This drop is busy with other joins right now. Try again in a moment."),
     "not_recorded": (503, "Your join could not be recorded, so the hold was released. Try again."),
     "not_recorded_held": (503, "Your join could not be recorded, and we could not release the hold just now. The maker can see it "
                                "and will release it. Please do not join again."),
@@ -137,9 +141,14 @@ def from_engine(e: Exception) -> ApiError:
     return ApiError(status, code, message)
 
 
-def _refusal(code: str) -> ApiError:
-    status, message = MESSAGES[code]
-    return ApiError(status, code, message)
+def _refusal(code: str, message: str | None = None, **extra) -> ApiError:
+    status, text = MESSAGES[code]
+    return ApiError(status, code, message or text, **{k: v for k, v in extra.items() if v is not False})
+
+
+# A drop that takes no joins, said to a buyer whose earlier try (this secret's claim) may still hold something at PayPal. Closing
+# the drop releases every join nobody confirmed (D-11), so this is a promise the engine keeps.
+UNSURE_CLOSED = "Joining has closed. If a hold was placed it will be released, and you will not be charged."
 
 
 def _card_label(i) -> str | None:
@@ -181,6 +190,18 @@ class Api:
         """One web request at a time per drop for joins and leaves, so two browsers can never interleave a claim and a join."""
         with self._locks_guard:
             return self._locks.setdefault(drop, threading.Lock())
+
+    @contextlib.contextmanager
+    def _turn(self, drop: str):
+        """Wait for the drop's turn, but not for ever: a request queued behind a slow PayPal call answers 503 (busy) and the page,
+        which keeps its secret on a 503, asks again. Nothing has been written when it gives up."""
+        lock = self._lock(drop)
+        if not lock.acquire(timeout=LOCK_WAIT):
+            raise _refusal("busy")
+        try:
+            yield
+        finally:
+            lock.release()
 
     def info(self) -> dict:
         return {"paypal": self.mode, "maker_name": self.maker_name}
@@ -234,6 +255,7 @@ class Api:
                               else None)
         out["steps"] = [{"step": i, "from_buyers": s.min_buyers, "price": m(s.price)} for i, s in enumerate(d.ladder.steps)]
         out["joinable"] = v["state"] == "live"
+        out["life"] = d.created_at                  # which life of this drop id it is: a page that asked in an earlier life must not join this one
         if d.settled:
             s = d.settled
             out["settled"] = {"outcome": s["outcome"], "final_price": s["final_price"],
@@ -304,14 +326,19 @@ class Api:
         it (tokens.py has the other half):
           * A retry whose secret already proves the buyer's hold is handed back whatever state that hold is in now, before anything
             else is looked at: never refused, never counted against a limit, never able to touch its own proof.
-          * `admit` (the server's rate limit) is asked only once the request is valid and is not such a hand-back, so junk cannot
-            use up a buyer's allowance and a retry can never be turned away by it.
-          * A buyer held with no proof is someone else's, unless this secret's own unbound claim sits on it: then an earlier try of
-            THIS secret may have placed that hold and died before it was bound. Nothing guesses (`join_unconfirmed`); the maker
-            sees the hold.
+          * A buyer with a hold or a charge on record and no proof is someone else's, unless this secret's own unbound claim sits on
+            it: then an earlier try of THIS secret may have placed it and died before it was bound. Nothing guesses
+            (`join_unconfirmed`, worded by what is on record: held, charged ...); the maker sees it. This comes before every other
+            refusal, the drop's closing included, so a buyer who may have been charged is never told they were not in.
           * Another secret cannot join a name while the engine has a join for it that PayPal may have acted on and nobody has
-            confirmed: it would be handed that earlier request's hold (`join_in_progress`).
-          * A drop that takes no joins is refused before any claim is written, and a refused join forgets only its own claim."""
+            confirmed: it would be handed that earlier request's hold. Nor can this secret, unless every such join is the one
+            ITS claim started (the claim records the engine's attempt number): the assistant may have started another on the name
+            since (`join_in_progress`).
+          * A drop that takes no joins is refused before any claim is written, and a refused join forgets only its own claim.
+          * `admit` (the server's rate limit) is asked last, only for a request that will really reach PayPal: junk, hand-backs and
+            refusals made from our own records never use up a buyer's allowance.
+        A refusal that shows this secret holds nothing says so (`nothing_held`), so the page can let go of the secret; one that cannot
+        (this secret's claim sits beside an open join) does not."""
         d = self._drop(drop)
         if not isinstance(card, int) or isinstance(card, bool) or card not in WEB_CARDS:
             raise ApiError(400, "bad_card", "Pick one of the test cards.")
@@ -319,24 +346,35 @@ class Api:
             raise ApiError(400, "bad_secret", "Reload the page and try again.")
         name = clean_name(name)
         bid = slug(name)
-        with self._lock(d.id):
+        with self._turn(d.id):
             d = self.engine.get(d.id)
             b = d.buyers.get(bid)
             if b is not None and self.tokens.owns(d.id, bid, secret, d.created_at, b.auth_id):    # a retry of a join that went through
                 return {"buyer": bid, "me": self._mine(d, bid), "drop": self._public(d), "again": True}
+            theirs = self.tokens.own(d.id, bid, secret)
+            if theirs is not None and theirs["drop_created"] != d.created_at:      # asked in an earlier life of this drop id (a reset)
+                raise _refusal("join_stale", nothing_held=True)
+            claim = self.tokens.claim_of(d.id, bid, secret, d.created_at)
+            mine = claim is not None
+            intents = [j for j in d.unresolved.values() if j.get("buyer") == bid]
+            ours = [j for j in intents if mine and claim["attempt"] is not None and int(j.get("attempt") or 0) == claim["attempt"]]
+            unsure = mine and bool(intents)           # this secret's claim sits beside a join PayPal may have acted on
+            if b is not None and mine and b.status in HOLDING:
+                raise self._unconfirmed(b)
+            if b is not None and b.status == "held":
+                raise _refusal("already_joined", nothing_held=True)
+            state = self.engine.display_state(d)
+            if state != "live":
+                code = "drop_ended" if state == "ended" else "drop_closed"
+                raise _refusal(code, UNSURE_CLOSED) if unsure else _refusal(code, nothing_held=True)
+            if len(ours) != len(intents):
+                raise _refusal("join_in_progress", nothing_held=not mine)
             if admit is not None:
                 admit()
-            mine = self.tokens.claimed(d.id, bid, secret, d.created_at)
-            if b is not None and b.status == "held":
-                if mine:
-                    raise _refusal("join_unconfirmed")
-                raise _refusal("already_joined")
-            self._require_open(d)
-            if not mine and self._open_intent(d, bid):
-                raise _refusal("join_in_progress")
             still_there = b.auth_id if b is not None and b.status in HOLDING else None
-            if not self.tokens.claim(d.id, bid, secret, d.created_at, self.engine.now().isoformat(), still_there):
-                raise _refusal("already_joined")
+            attempt = (b.attempts if b is not None else 0) + 1
+            if not self.tokens.claim(d.id, bid, secret, d.created_at, self.engine.now().isoformat(), still_there, attempt):
+                raise _refusal("already_joined", nothing_held=True)
             try:
                 out = self.engine.join(d.id, name, card)
             except (CrowdError, StoreError, HoldError) as e:
@@ -360,10 +398,19 @@ class Api:
         """Has the engine a join for this buyer that PayPal may have acted on and nobody has confirmed or released?"""
         return any(j.get("buyer") == bid for j in d.unresolved.values())
 
-    def _require_open(self, d) -> None:
-        state = self.engine.display_state(d)
-        if state != "live":
-            raise _refusal("drop_ended" if state == "ended" else "drop_closed")
+    @staticmethod
+    def _unconfirmed(b) -> ApiError:
+        """The web cannot say what an earlier try of this secret came to, but the engine has money on record for the buyer: say what
+        it is, and that the maker can see it."""
+        if b.status == "captured":
+            what = (f"Your earlier try may have been charged ${m(b.captured)}. This page never confirmed it, so it cannot "
+                    "show or release it. The maker can see the charge and refund it. Please do not join again.")
+        elif b.status in ("capture_failed", "void_failed"):
+            what = ("Your earlier try left a hold on your card that could not be charged or released as planned. This page never "
+                    "confirmed it. The maker can see it and will sort it out. Please do not join again.")
+        else:
+            what = MESSAGES["join_unconfirmed"][1]
+        return _refusal("join_unconfirmed", what)
 
     def _release(self, drop: str, buyer: str) -> str:
         """Ask the engine to release a hold the web cannot prove: 'released', 'pending' (the leave is on record, PayPal has not
@@ -383,7 +430,7 @@ class Api:
 
     def leave(self, drop: str, buyer, secret) -> dict:
         d = self._drop(drop)
-        with self._lock(d.id):
+        with self._turn(d.id):
             d = self.engine.get(d.id)
             self._owned(d, buyer, secret)
             try:
@@ -426,8 +473,10 @@ class Api:
         d = self._drop(drop)
         out = self._public(d)
         rows = self.engine.buyers(d.id)
-        out["buyers_list"] = [{"name": display_name(r["name"]), "status": r["status"], "held": r["held"],
-                               "charged": r["charged"], "card": _card_label(r["card"])} for r in rows]
+        unsure = self.tokens.unbound(d.id, d.created_at)       # a web join whose hold was never bound to its browser: only the maker can see it
+        out["buyers_list"] = [{"name": display_name(r["name"]) + (" (unconfirmed web join)" if r["buyer"] in unsure and r["status"] in HOLDING else ""),
+                               "status": r["status"], "held": r["held"], "charged": r["charged"], "card": _card_label(r["card"]),
+                               "unconfirmed_web_join": r["buyer"] in unsure and r["status"] in HOLDING} for r in rows]
         out["simulated"] = sum(1 for r in rows if display_name(r["name"]) != r["name"])
         counts: dict = {}
         for r in rows:
