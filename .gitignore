@@ -14,3 +14,5 @@ __pycache__/
 video/captures/
 video/out/
 video/build/
+video/music/
+video/vo/
