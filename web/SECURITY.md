@@ -25,6 +25,15 @@ reviewed for real money.
 - A tunnel or proxy **without** `--trust-proxy` makes every visitor one address. They then share one 16-connection allowance, one
   join allowance and one wrong-key budget, and one visitor's flood shuts all the others out. Do not host that way.
 
+## The studio's approval desk: one limit to know
+
+Togi tells your own approver from a test one by where its files are: the same directory by another path, a link to it, or its files
+linked in. **A plain copy of your approver's files (not a link), used as a test approver (`TOGI_APPROVER_HOME`), is not detected.** The
+desk then opens for it without a terminal, as it does for any test approver. What it signs is test scope, and Crowd honours test-scope
+grants only on the Pretend PayPal, where no money moves; on the PayPal sandbox only your own approver's yes counts. Anything that
+can read your files can already make a test approver of its own, so the copy adds nothing to that. It does mean "the desk opened
+without a terminal" does not prove the approver is not yours.
+
 ## Known limits
 
 These are real, rare, and not fixed. Each needs a coincidence that a demo does not make by itself, and the engine's own numbers stay

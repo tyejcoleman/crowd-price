@@ -39,7 +39,6 @@ import sys
 import tempfile
 import threading
 import time
-import unicodedata
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -48,9 +47,23 @@ from crowd.engine import CrowdError
 from crowd.store import StoreError
 
 from .api import Api, ApiError, from_engine
+from .text import visible       # (also `st.visible`: what the assistant's words look like on the page)
 
 DROP_ID = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 APPROVAL_ID = re.compile(r"^ap_[0-9a-f]{6,32}$")
+# What a settle request's `expect` token is, exactly (the engine's own form: capture:45:37.00:1665.00 or void:22, either with
+# +release:K). Togi files the token as the assistant gave it and the engine strips spaces around it, so a padded one settles
+# the real plan while a card that reads it loosely would lose its numbers: only the exact form is shown or approved here.
+PLAN = re.compile(r"(capture:\d+:\d+\.\d{2}:\d+\.\d{2}|void:\d+)(\+release:\d+)?", re.ASCII)
+
+
+def readable_plan(expect) -> bool:
+    return isinstance(expect, str) and PLAN.fullmatch(expect) is not None
+
+
+def unreadable() -> ApiError:
+    return ApiError(422, "request_unreadable", "This request cannot be read, so it cannot be approved here. Nothing was charged. "
+                                               "Ask your assistant to ask again.")
 MAX_MESSAGE = 2000
 MAX_RESULT = 6000          # what a step's raw output shows of a tool's reply
 MAX_EVENTS = 4000
@@ -146,7 +159,7 @@ def down():
             lists.discard(key(msg.get("id")))
             res = msg.get("result")
             if isinstance(res, dict) and isinstance(res.get("tools"), list):
-                res["tools"] = [t for t in res["tools"] if isinstance(t, dict) and t.get("name") in ALLOWED]
+                res["tools"] = [t for t in res["tools"] if isinstance(t, dict) and isinstance(t.get("name"), str) and t["name"] in ALLOWED]
         send(msg)
     os._exit(0)
 
@@ -166,7 +179,7 @@ for line in sys.stdin.buffer:
             continue
         if method == "tools/call":
             p = msg.get("params")
-            if not (isinstance(p, dict) and p.get("name") in ALLOWED):
+            if not (isinstance(p, dict) and isinstance(p.get("name"), str) and p["name"] in ALLOWED):
                 if "id" in msg:
                     send({{"jsonrpc": "2.0", "id": msg["id"], "result": {{"content": [{{"type": "text", "text": REFUSED}}], "isError": True}}}})
                 continue
@@ -418,20 +431,6 @@ def result_text(block: dict) -> str:
     if isinstance(c, list):
         return "".join(x.get("text", "") for x in c if isinstance(x, dict) and x.get("type", "text") == "text")
     return c if isinstance(c, str) else ""
-
-
-# Characters that can move or hide text: controls, format characters (bidi overrides and isolates, zero-width), line and
-# paragraph separators. In a name the assistant chose they are shown as what they are, never applied.
-def visible(s: str, cap: int = 120) -> str:
-    out = []
-    for ch in str(s)[:cap * 2]:
-        cat = unicodedata.category(ch)
-        if cat in ("Cc", "Cf", "Zl", "Zp", "Cs", "Co", "Cn"):
-            out.append(f"\\u{ord(ch):04x}")
-        else:
-            out.append(ch)
-    t = "".join(out)
-    return t if len(t) <= cap else t[:cap - 1] + "…"
 
 
 # ---- the studio ------------------------------------------------------------------------------------------------------------
@@ -737,6 +736,8 @@ class Studio:
             raise ApiError(404, "approval_not_found", "There is no such approval.")
         rv = self._togi(lambda: self.desk.review(aid))
         args = rv.get("args") or {}
+        if not readable_plan(args.get("expect")):           # no card, no form: the person cannot be shown what they would sign
+            raise unreadable()
         drop = args.get("drop") if isinstance(args.get("drop"), str) else None
         out = {k: rv[k] for k in ("review", "approval", "bundle", "command", "args", "summary", "confirm_word", "scope",
                                   "expires_if_approved", "review_seconds", "lines", "lock") if k in rv}
@@ -747,7 +748,7 @@ class Studio:
             d = self.api.engine.get(str(drop))
             out["named"] = visible(d.title, 60)
             start = d.ladder.start_price.quantize(Decimal("0.01"))
-            m = re.match(r"^capture:\d+:(\d+\.\d{2}):", str(args.get("expect") or ""))
+            m = re.match(r"^capture:\d+:(\d+\.\d{2}):", args["expect"])
             out["hold_each"] = str(start)
             if m and Decimal(m.group(1)) <= start:
                 out["back_each"] = str(start - Decimal(m.group(1)))
@@ -761,6 +762,14 @@ class Studio:
         self._desk_or_refuse()
         if not APPROVAL_ID.match(aid or ""):
             raise ApiError(404, "approval_not_found", "There is no such approval.")
+        try:
+            from togi import approvals as tap
+            filed = tap.load(aid).get("args")
+            filed = filed if isinstance(filed, dict) else {}
+        except Exception:  # noqa: BLE001 - a request Togi cannot load is Togi's to refuse, in its own words
+            filed = None
+        if filed is not None and not readable_plan(filed.get("expect")):     # whatever review the caller holds: not a request nobody could read
+            raise unreadable()
         try:
             out = self._togi(lambda: self.desk.approve(aid, review, passphrase, word))
         finally:

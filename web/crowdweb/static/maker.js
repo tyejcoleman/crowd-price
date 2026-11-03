@@ -43,6 +43,10 @@
   // ---- what needs the maker: a waiting approval is theirs to give, in their own terminal (the rest is the shared panel, panel.js)
   function ask(d, pending) {
     const p = P.plan(pending.expect);
+    if (p.kind === "other") {          // not a plan the engine writes (a space around it, say): nothing to say about money, nothing to copy
+      return [el("div", { class: "state ask", text: "Needs your approval" }), el("p", { class: "what", text: p.what }),
+        el("p", { text: "Nothing is charged. Ask your assistant to ask again." })];
+    }
     return [el("div", { class: "state ask", text: "Needs your approval" }), el("p", { class: "what", text: p.what }), el("p", { class: "muted", text: p.totalLine }),
       el("p", { text: "Your assistant asked to settle. Only you can approve it, in your own terminal; your assistant cannot." }),
       el("div", { class: "checks" },

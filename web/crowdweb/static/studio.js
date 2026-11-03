@@ -18,7 +18,7 @@
   if (fromLink) store(KEYSTORE, fromLink, sessionStorage);
   history.replaceState(null, "", location.pathname);
   const s = { key: store(KEYSTORE, undefined, sessionStorage) || "", info: null, epoch: 0, after: 0, busy: false, focus: null,
-              items: [], byId: {}, d: null, dErr: null, review: null, reviewErr: null, approving: false, approveMsg: null,
+              items: [], byId: {}, d: null, dErr: null, review: null, reviewErr: null, unreadable: {}, approving: false, approveMsg: null,
               approved: {}, later: {}, checks: {}, busyCheck: {}, tab: "chat", keyErr: null, keys: {} };
   const hdr = () => ({ "X-Maker-Key": s.key });
   const $ = id => document.getElementById(id);
@@ -283,9 +283,18 @@
   }
   function rechecks(rv) { return /re-checks every hold|reads them again before any money moves/i.test(rv.summary || ""); }
 
+  // a request whose plan is not exactly a plan token (a space around it, say) is not shown or approved here: the server refuses to
+  // review it (`request_unreadable`), and this page does not even ask. Nothing about money is said of it.
+  const unreadable = pending => P.plan(pending.expect).kind === "other" || !!s.unreadable[pending.id];
+
   function approvalCard(d, pending) {
     const desk = (s.info && s.info.desk) || { open: false };
     const kids = [el("div", { class: "state ask", text: "Needs your approval" })];
+    if (unreadable(pending)) {
+      kids.push(el("p", { class: "what", id: "approve-what", text: "This request cannot be read" }),
+        el("p", { text: "Nothing is charged, and it cannot be approved here. Ask your assistant to ask again." }));
+      return kids;
+    }
     if (!desk.open) {
       const p = P.plan(pending.expect);
       kids.push(el("p", { class: "what", text: p.what }), el("p", { class: "muted", text: p.totalLine }),
@@ -314,7 +323,7 @@
     }
     kids.push(el("details", { class: "signed" }, el("summary", { text: "Exactly what you sign" }),
       el("ul", { class: "plain" },
-        el("li", {}, p.kind === "void" ? "Settle the drop: release every hold" : "Settle the drop: charge every hold at the final price"),
+        p.signed ? el("li", {}, p.signed) : null,
         p.sum ? el("li", { class: "mono" }, p.sum) : null,
         p.extra ? el("li", {}, p.extra.trim()) : null,
         el("li", {}, `Works once, until ${until}`),
@@ -383,7 +392,7 @@
     document.title = `${P.shown(d.title).slice(0, 60)} · studio · Crowd Price`;
     const clock = clockFrom(d);
     s.clock = clock;
-    part("phead", keyOf([d.title, d.state, d.buyers, d.minimum, d.minimum_met, d.price, d.settlement, d.blocked, d.draft]), () =>
+    part("phead", keyOf([d.title, d.state, d.buyers, d.minimum, d.minimum_met, d.price, d.settlement, d.blocked, d.draft, P.waiting(d)]), () =>
       el("div", { class: "pheadin" }, P.headline(d),
         d.state === "live" && clock ? el("div", { class: "clock" }, el("div", { class: "label", text: "Joining closes in" }),
           el("div", { class: "t", id: "clock", text: duration(clock()) })) : null), $("phead-host"));
@@ -398,11 +407,11 @@
     if (s.keys.ladder !== lkey) { s.keys.ladder = lkey; const host = $("ladder"); requestAnimationFrame(() => ladder(host, d)); }
     const pending = pendingOf(d);
     part("needs", keyOf([d.state, d.blocked, d.settlement, d.profit_now, d.approvals, d.buyers, d.price, d.minimum_met, d.draft, s.info && s.info.desk,
-                         pending && s.review && s.review.id === pending.id ? s.review.data.review : null, s.reviewErr, s.approving,
+                         pending && s.review && s.review.id === pending.id ? s.review.data.review : null, s.reviewErr, pending && s.unreadable[pending.id], s.approving,
                          s.approveMsg, s.later, s.checks[d.drop], s.busyCheck, narrow()]), () => needs(d), $("colA"));
     part("feed", keyOf([d.feed]), () => P.feed(d), $("colB"));
     part("buyerlist", keyOf([d.buyers_list, d.buyers_by_status, d.simulated]), () => P.buyers(d), $("colB"));
-    if (pending && s.info && s.info.desk && s.info.desk.open) wantReview(pending.id);
+    if (pending && s.info && s.info.desk && s.info.desk.open && !unreadable(pending)) wantReview(pending.id);
   }
 
   async function refreshPanel() {
@@ -433,6 +442,7 @@
       s.review = { id, data, at: Date.now() }; s.reviewErr = null;
     } catch (e) {
       s.review = null; s.reviewErr = e.message || "The request could not be checked.";
+      if (e.code === "request_unreadable") s.unreadable[id] = true;          // asked once: the server will not show it
     } finally { reviewing = null; renderPanel(); }
   }
 

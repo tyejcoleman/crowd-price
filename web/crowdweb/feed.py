@@ -10,6 +10,8 @@ from __future__ import annotations
 import re
 from datetime import datetime
 
+from .text import visible
+
 # event type -> the kind of line it makes; consecutive events of the same kind are grouped into one line
 KINDS = {
     "drop_created": "created", "drop_published": "published", "hold_placed": "joined", "hold_failed": "declined",
@@ -75,7 +77,7 @@ def _line(kind: str, items: list[dict], title: str) -> tuple[str | None, str]:
     n = len(items)
     who = _names(items)
     if kind == "created":
-        return None, f"Drop created: {title}, minimum {p.get('minimum')}"
+        return None, f"Drop created: {visible(title, 60)}, minimum {p.get('minimum')}"       # the assistant's words: escaped, cut short
     if kind == "published":
         return None, "Published. Buyers can join"
     if kind == "joined" and items[0].get("sim"):        # a batch of the assistant's test buyers: said as one, never with a real name in it

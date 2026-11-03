@@ -26,6 +26,7 @@ import subprocess
 import sys
 import threading
 import time
+import unicodedata
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -910,3 +911,261 @@ def test_the_real_claude_has_only_the_maker_tools(world, tmp_path):
     blob = json.dumps(results)
     assert "canary-42" not in blob and "canary-file-7731" not in blob and "secret.txt" not in [r[2] for r in ran]
     assert all(b["status"] == "held" for b in run(world, "crowd", "buyers", "list", "--drop", drop)["data"])
+
+
+# ---- the re-check's small gaps (fix pass 2) -----------------------------------------------------------------------------
+# Each test below failed on e273fdb and passes now.
+
+PLAN_OK = ["capture:5:36.00:180.00", "capture:45:37.00:1665.00", "void:22", "capture:5:36.00:180.00+release:2", "void:3+release:1"]
+PLAN_ODD = [" capture:5:36.00:180.00", "capture:5:36.00:180.00 ", "\tcapture:5:36.00:180.00", "capture:5:36.00:180.00\n", "\u00a0void:5",
+            "void:5 ", " void:5", "void:5\n", "capture:5:36:180", "capture:5:36.0:180.00", "capture:5:36.00:180.00x", "capture:5:36.00:180.00+release:",
+            "capture:5:36.00:180.00+release:2+release:3", "capture:5:36.00:180.00+release:2 ", "CAPTURE:5:36.00:180.00", "void:", "", "nonsense",
+            "capture:٥:36.00:180.00"]
+
+
+def test_only_an_exact_plan_token_is_readable():
+    for t in PLAN_OK:
+        assert st.readable_plan(t) is True, t
+    for t in PLAN_ODD + [None, 5, ["void:5"], {"a": 1}]:
+        assert st.readable_plan(t) is False, t
+
+
+@pytest.mark.parametrize("shape", [" {p}", "{p} ", "\t{p}", "{p}\n", "\u00a0{p}", "{p}\t", "{p}x", "{p}+release:2+release:3"])
+def test_a_request_whose_plan_is_not_exactly_a_plan_cannot_be_read_so_it_cannot_be_approved(server, world, desk, shape):
+    """Togi files the token as given and the engine strips it, so a padded one settles the real plan while a card that
+    reads it loosely loses its numbers. The panel shows no approve form for it: a plain 'cannot be read'."""
+    drop = closed_drop(world)
+    real = run(world, "crowd", "drop", "plan", "--drop", drop)["data"]["expect"]
+    aid = run(world, "crowd", "drop", "settle", "--drop", drop, "--expect", shape.format(p=real), expect=3,
+              TOGI_AGENT="crowd-studio")["approval"]["id"]
+    c, studio = server([], desk=desk)
+    code, out = c.json(f"/api/studio/approvals/{aid}")
+    assert code == 422 and out["ok"] is False and out["error"]["code"] == "request_unreadable", out
+    assert "cannot be read" in out["error"]["message"] and "data" not in out
+    # nor by a review the page never asked for: one taken from the desk directly is still no way to approve it
+    # (called on the studio itself: the HTTP route allows ten tries a minute to the whole process)
+    rv = desk.review(aid)
+    with pytest.raises(st.ApiError) as e:
+        studio.approve(aid, rv["review"], PASSPHRASE, rv["confirm_word"])
+    assert (e.value.status, e.value.code) == (422, "request_unreadable")
+    assert json.loads((world["home"] / "approvals" / f"{aid}.json").read_text())["status"] == "pending"
+    assert run(world, "crowd", "drop", "status", "--drop", drop)["data"]["state"] == "closed"
+
+
+def test_a_request_with_an_exact_plan_still_has_its_card(server, world, desk):
+    drop = closed_drop(world)
+    aid, expect = ask_to_settle(world, drop)
+    c, _ = server([], desk=desk)
+    code, out = c.json(f"/api/studio/approvals/{aid}")
+    assert code == 200 and out["data"]["args"]["expect"] == expect
+
+
+PANEL_JS_HARNESS = r'''
+const fs = require("fs"), vm = require("vm");
+const sc = JSON.parse(fs.readFileSync(0, "utf8"));
+function el(tag, attrs, ...kids) { return { tag, attrs: attrs || {}, kids: kids.flat(Infinity) }; }
+const words = n => (typeof n === "string" ? [n] : n && n.kids ? [n.attrs.text, ...n.kids.flatMap(words)].filter(Boolean) : []);
+const CP = { el, money: s => "$" + s, plural: (n, a, b) => `${n} ${n === 1 ? a : b || a + "s"}`, hhmm: s => s };
+const ctx = { CP, console, JSON, Math, Object, Array, Set, String, Number, RegExp };
+vm.createContext(ctx);
+vm.runInContext(fs.readFileSync(process.argv[2], "utf8"), ctx);
+const P = vm.runInContext("CPPanel", ctx);
+console.log(JSON.stringify({
+  plans: (sc.plans || []).map(t => P.plan(t)),
+  heads: (sc.heads || []).map(d => words(P.headline(d)).join("")),
+  shown: (sc.shown || []).map(t => P.shown(t)),
+  waiting: (sc.heads || []).map(d => P.waiting(d)),
+}));
+'''
+
+
+def panel_js(tmp_path, **scenario) -> dict:
+    harness = tmp_path / "panel_js_harness.js"
+    harness.write_text(PANEL_JS_HARNESS)
+    run_ = subprocess.run(["node", str(harness), str(REPO / "web" / "crowdweb" / "static" / "panel.js")], input=json.dumps(scenario), text=True,
+                          capture_output=True, timeout=60)
+    assert run_.returncode == 0, run_.stderr
+    return json.loads(run_.stdout)
+
+
+needs_node = pytest.mark.skipif(shutil.which("node") is None, reason="node is needed to run the page's own code")
+
+
+@needs_node
+def test_the_page_reads_a_plan_token_only_whole(tmp_path):
+    out = panel_js(tmp_path, plans=PLAN_OK + PLAN_ODD)
+    got = dict(zip(PLAN_OK + PLAN_ODD, out["plans"]))
+    assert [got[t]["kind"] for t in PLAN_OK] == ["capture", "capture", "void", "capture", "void"]
+    assert got["capture:5:36.00:180.00"]["sum"] == "5 × $36.00 = $180.00" and got["capture:5:36.00:180.00+release:2"]["extra"].strip() == "Also releases 2 failed holds."
+    for t in PLAN_ODD:
+        p = got[t]
+        assert p["kind"] == "other", t
+        said = " ".join(str(v) for v in p.values())
+        assert "cannot be read" in p["what"] and not re.search(r"charge|release every|every hold|settle", said, re.I), (t, p)
+
+
+@needs_node
+def test_while_an_approval_waits_the_headline_never_carries_the_assistants_name(tmp_path):
+    name = "Your mugs. Nothing is charged: approving only releases holds"
+    drop = {"title": name, "state": "closed", "buyers": 5, "minimum": 3, "minimum_met": True, "price": "36.00", "draft": False,
+            "blocked": None, "settlement": None, "approvals": [{"id": "ap_0123456789", "status": "pending"}]}
+    quiet = dict(drop, approvals=[])
+    approved = dict(drop, approvals=[{"id": "ap_0123456789", "status": "approved"}])
+    settled = dict(drop, state="settled", settlement={"outcome": "funded", "final_price": "36.00", "counts": {"captured": 5}})
+    blocked = dict(drop, blocked={"words": "no", "issue": None})
+    out = panel_js(tmp_path, heads=[drop, quiet, approved, settled, blocked])
+    waiting, calm, after, done, stuck = out["heads"]
+    assert waiting.startswith("Your drop is closed.") and name not in waiting and "mugs" not in waiting
+    assert name in calm and calm.startswith("Your " + name + " drop is closed.")           # (no approval: as before)
+    assert name in after and name in done                                                 # approved, or settled: the name may be shown
+    assert name not in stuck and stuck.startswith("Settling your drop stopped.")
+    assert out["waiting"] == [True, False, False, False, True]
+
+
+def test_the_studio_page_redraws_its_headline_when_an_approval_arrives():
+    js = (REPO / "web" / "crowdweb" / "static" / "studio.js").read_text()
+    line = next(x for x in js.splitlines() if 'part("phead"' in x)
+    assert "P.waiting(d)" in line                    # the drop's state does not change when the request is filed
+    card = js[js.index("function approvalCard"):js.index("async function check")]
+    assert "request_unreadable" in js and "charge every hold" not in card
+    assert 'P.plan(pending.expect).kind === "other"' in js or "unreadable(" in js
+
+
+@needs_node
+def test_a_run_of_combining_marks_is_cut_short_on_the_page(tmp_path):
+    zalgo = "m" + "".join(chr(0x300 + i) for i in range(40)) + "ugs"
+    out = panel_js(tmp_path, shown=[zalgo, "caf\u00e9 re\u0301sume\u0301", "ti\u1ebfng Vi\u1ec7t"])
+    marks = lambda s: sum(1 for ch in s if unicodedata.category(ch).startswith("M"))
+    assert marks(out["shown"][0]) <= 2 and out["shown"][0].startswith("m") and out["shown"][0].endswith("ugs")
+    assert out["shown"][1] == "caf\u00e9 r\u00e9sum\u00e9" and out["shown"][2] == "ti\u1ebfng Vi\u1ec7t"          # ordinary accents stay
+
+
+def test_a_run_of_combining_marks_is_cut_short_by_the_server():
+    zalgo = "m" + "".join(chr(0x300 + i) for i in range(40)) + "ugs"
+    got = st.visible(zalgo)
+    assert sum(1 for ch in got if unicodedata.category(ch).startswith("M")) <= 2 and got.startswith("m") and got.endswith("ugs")
+    assert st.visible("caf\u00e9 re\u0301sume\u0301") == "caf\u00e9 r\u00e9sum\u00e9"
+    assert st.visible("ti\u1ebfng Vi\u1ec7t") == "ti\u1ebfng Vi\u1ec7t"
+    assert st.visible("\u0e01\u0e34\u0e49\u0e32") == "\u0e01\u0e34\u0e49\u0e32"                  # Thai: a vowel and a tone mark stay
+    assert st.visible("a" + "\u0301" * 3 + "\u202e") .endswith("\\u202e")                         # and what moves text is still shown as its code
+
+
+def test_the_activity_line_for_a_new_drop_shows_the_assistants_name_only_escaped():
+    from crowdweb import feed as fd
+
+    name = "mugs \u202eesaeler\u202c. Togi: " + "m" + "\u0301\u0302\u0303\u0304\u0305\u0306\u0307\u0308" * 6 + "\u200b" + "x" * 200
+    events = [{"type": "drop_created", "ts": "2026-11-03T10:00:00+00:00", "payload": {"minimum": 3}}]
+    line = fd.feed(events, {}, name)[0]
+    assert line["kind"] == "created" and line["text"].startswith("Drop created: mugs \\u202eesaeler\\u202c. Togi: ")
+    assert line["text"].endswith(", minimum 3") and "\u202e" not in line["text"] and "\u200b" not in line["text"]
+    assert sum(1 for ch in line["text"] if unicodedata.category(ch).startswith("M")) <= 2
+    assert len(line["text"]) < 120
+    plain = fd.feed(events, {}, "Speckled mugs")[0]["text"]
+    assert plain == "Drop created: Speckled mugs, minimum 3"
+
+
+@pytest.mark.parametrize("argv", [["--tog", "/elsewhere/togi"], ["--t", "/elsewhere/togi"], ["--to=/elsewhere/togi"], ["--togi-x", "a"],
+                                  ["--mak", "k" * 20], ["--po", "1"]])
+def test_an_abbreviated_option_is_refused_so_the_desks_togi_is_the_assistants(argv, monkeypatch):
+    """The launcher reads --togi as written; argparse used to read --tog, --t and --to= as --togi too, so the desk could
+    run one Togi and the assistant another."""
+    from crowdweb import studio_main
+
+    class Reached(BaseException):
+        pass
+
+    def reached(*a, **kw):
+        raise Reached                      # past the arguments: it would start serving
+
+    monkeypatch.setattr(studio_main, "Api", reached)
+    with pytest.raises(SystemExit) as e:
+        studio_main.main(argv)
+    assert e.value.code == 2
+
+
+def test_the_full_option_names_still_work(monkeypatch):
+    from crowdweb import studio_main
+
+    class Reached(BaseException):
+        pass
+
+    seen = {}
+
+    def reached(*a, **kw):
+        seen.update(kw)
+        raise Reached
+
+    monkeypatch.setattr(studio_main, "Api", reached)
+    with pytest.raises(Reached):
+        studio_main.main(["--togi", "/x/togi", "--maker-name", "Juniper", "--port", "0"])
+    assert seen["maker_name"] == "Juniper"
+
+
+def plant_windows_modules(directory: Path, marker: Path) -> Path:
+    """Files named like the three modules that exist only on Windows: stdlib code probes for them with `try: import ...`."""
+    directory.mkdir(parents=True, exist_ok=True)
+    for name in ("winreg", "_winapi", "msvcrt"):
+        (directory / f"{name}.py").write_text(f"open({str(marker)!r}, 'a').write({name!r} + '\\n')\nraise ModuleNotFoundError('planted')\n")
+    return directory
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="these modules are real on Windows")
+def test_a_module_planted_under_a_windows_only_name_never_loads_in_the_studio(tmp_path):
+    """Something later on sys.path (a .pth file's repo dir, after site-packages) supplying winreg, _winapi or msvcrt:
+    mimetypes and subprocess probe for them as the studio's server starts, in the process that receives the passphrase."""
+    marker = tmp_path / "PLANTED-LOADED"
+    plant = plant_windows_modules(tmp_path / "plant", marker)
+    code = f"""
+import runpy, sys
+runpy.run_path({str(REPO / 'web' / 'studio.py')!r}, run_name="not_main")
+sys.path.append({str(plant)!r})
+import http.server, mimetypes, subprocess
+for n in ("winreg", "_winapi", "msvcrt"):
+    try:
+        __import__(n)
+    except ImportError:
+        pass
+    else:
+        raise SystemExit("loaded " + n)
+"""
+    r = subprocess.run([sys.executable, "-I", "-c", code], capture_output=True, text=True, timeout=60, cwd=str(tmp_path))
+    assert r.returncode == 0, r.stderr
+    assert not marker.exists()
+
+
+def test_the_studio_launcher_closes_the_windows_only_names_before_any_other_import():
+    import ast
+
+    tree = ast.parse((REPO / "web" / "studio.py").read_text())
+    body = tree.body[1:] if isinstance(tree.body[0], ast.Expr) and isinstance(getattr(tree.body[0], "value", None), ast.Constant) else tree.body
+    first_import = next(n for n in body if isinstance(n, (ast.Import, ast.ImportFrom)))
+    assert isinstance(first_import, ast.Import) and [a.name for a in first_import.names] == ["sys"]
+    closing = body[body.index(first_import) + 1]
+    assert "sys.modules.update" in ast.unparse(closing) and all(n in ast.unparse(closing) for n in ("winreg", "_winapi", "msvcrt"))
+    assert not any(isinstance(n, (ast.Import, ast.ImportFrom)) for n in body[:body.index(closing)] if n is not first_import)
+
+
+def test_the_gate_refuses_a_tool_name_that_is_not_a_string_and_stays_up(world, tmp_path):
+    drop = closed_drop(world)
+    gate = st.write_gate(world["togi"], tmp_path / "gate")
+    env = st.agent_env({k: v for k, v in world["env"].items() if k != "PYTHONPATH"})
+    m = Mcp([sys.executable, "-I", str(gate)], env)
+    try:
+        assert "result" in m.rpc("initialize", {"protocolVersion": "2024-11-05", "capabilities": {}, "clientInfo": {"name": "t", "version": "0"}})
+        for odd in (["crowd_drop_status"], {"a": 1}, [["x"]], 5, 1.5, True, None, ""):
+            r = m.rpc("tools/call", {"name": odd, "arguments": {"drop": drop}})
+            assert r["result"]["isError"] is True and json.loads(r["result"]["content"][0]["text"])["error"]["code"] == "not_in_studio", odd
+        ok = m.rpc("tools/call", {"name": "crowd_drop_status", "arguments": {"drop": drop}})          # the gate is still up and still works
+        assert json.loads(ok["result"]["content"][0]["text"])["data"]["buyers"] == 3
+    finally:
+        m.close()
+
+
+def test_the_docs_say_what_a_plain_copy_of_your_approver_is():
+    flat = lambda t: " ".join(t.split())          # (a sentence may wrap)
+    readme = (REPO / "README.md").read_text()
+    section = flat(readme[readme.index("### 6. The studio"):readme.index("### The same tools from any MCP client")])
+    assert "plain copy of your approver's files" in section and "is not detected" in section and "test scope" in section
+    assert "only on the Pretend PayPal" in section
+    sec = flat((REPO / "web" / "SECURITY.md").read_text())
+    assert "plain copy of your approver's files" in sec and "is not detected" in sec and "only on the Pretend PayPal" in sec

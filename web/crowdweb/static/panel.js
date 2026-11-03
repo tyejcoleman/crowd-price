@@ -8,9 +8,11 @@ const CPPanel = (() => {
   const TITLE_MAX = 60;
 
   // the drop's title, as text in its own bidi-isolated element, cut at TITLE_MAX characters; a character that moves or hides
-  // text (a control, a bidi override or isolate, a zero-width one) is shown as its code, never applied
+  // text (a control, a bidi override or isolate, a zero-width one) is shown as its code, never applied, and a run of combining
+  // marks is cut to two (a stack of forty draws over the lines around it)
   const HIDDEN = /[\u0000-\u001f\u007f-\u009f\u00ad\u061c\u180e\u200b-\u200f\u2028-\u202e\u2060-\u206f\ufeff\ufff9-\ufffb]/g;
-  const shown = t => String(t || "").replace(HIDDEN, c => "\\u" + c.charCodeAt(0).toString(16).padStart(4, "0"));
+  const MARKS = /(\p{M}{2})\p{M}+/gu;
+  const shown = t => String(t || "").normalize("NFC").replace(HIDDEN, c => "\\u" + c.charCodeAt(0).toString(16).padStart(4, "0")).replace(MARKS, "$1");
   function title(d, max) {
     const t = shown(d.title);
     const n = max || TITLE_MAX;
@@ -18,27 +20,36 @@ const CPPanel = (() => {
   }
 
   // what an approval asks for: capture:45:37.00:1665.00, void:22, either +release:K. This is the plan the approval is bound
-  // to; settle checks it against the drop again and refuses if it changed.
+  // to; settle checks it against the drop again and refuses if it changed. Only that exact form is read: anything else (a
+  // space around it, a second +release) is "cannot be read" and says nothing about money. (The studio server refuses to show
+  // such a request at all; this is the page's own guard.)
+  const PLAN = /^(?:capture:(\d+):(\d+\.\d{2}):(\d+\.\d{2})|void:(\d+))(?:\+release:(\d+))?$/;
   function plan(expect) {
-    const m = /^capture:(\d+):([\d.]+):([\d.]+)/.exec(expect || "");
-    const r = /\+release:(\d+)/.exec(expect || "");
-    const extra = r ? ` Also releases ${plural(+r[1], "failed hold")}.` : "";
-    if (m) return { kind: "capture", n: +m[1], price: m[2], total: m[3], what: `Charge ${plural(+m[1], "buyer")} ${money(m[2])} each`,
-                    sum: `${m[1]} × ${money(m[2])} = ${money(m[3])}`, totalLine: `${money(m[3])} in total.${extra}`, extra };
-    const v = /^void:(\d+)/.exec(expect || "");
-    if (v) return { kind: "void", n: +v[1], what: `Release all ${plural(+v[1], "hold")}`, sum: `${plural(+v[1], "hold")} released, nobody pays`,
-                    totalLine: `Nobody pays.${extra}`, extra };
-    return { kind: "other", what: "Settle this drop", sum: "", totalLine: "", extra: "" };
+    const m = PLAN.exec(typeof expect === "string" ? expect : "");
+    if (!m) return { kind: "other", what: "This request cannot be read", sum: "", totalLine: "", extra: "", signed: "" };
+    const extra = m[5] !== undefined ? ` Also releases ${plural(+m[5], "failed hold")}.` : "";
+    if (m[1] !== undefined) return { kind: "capture", n: +m[1], price: m[2], total: m[3], what: `Charge ${plural(+m[1], "buyer")} ${money(m[2])} each`,
+                    sum: `${m[1]} × ${money(m[2])} = ${money(m[3])}`, totalLine: `${money(m[3])} in total.${extra}`, extra,
+                    signed: "Settle the drop: charge every hold at the final price" };
+    return { kind: "void", n: +m[4], what: `Release all ${plural(+m[4], "hold")}`, sum: `${plural(+m[4], "hold")} released, nobody pays`,
+             totalLine: `Nobody pays.${extra}`, extra, signed: "Settle the drop: release every hold" };
   }
+
+  // a request for money is waiting for the person (the drop is not settled and an approval is pending)
+  const waiting = d => d.state !== "settled" && (d.approvals || []).some(a => a.status === "pending");
 
   // the headline: what the drop is doing (the claim), and what that means now (the turn, on a line of its own whose height
   // is kept, so the headline does not jump when the minimum is reached)
+  // While a request is waiting, the headline does not carry the assistant's name for the drop: it is the assistant's words in the
+  // largest type on the page, beside the request, and could read as a sentence about the money. The name is on the card, quoted
+  // and labelled as the assistant's.
   function headline(d) {
     const st = d.settlement;
-    const name = () => ["Your ", title(d), " drop"];
+    const hide = waiting(d);
+    const name = () => hide ? ["Your drop"] : ["Your ", title(d), " drop"];
     let claim = [...name(), ` is ${d.state}.`], turn = "";
     if (d.draft) { claim = [...name(), " is being set up."]; turn = "Buyers can join once it opens."; }
-    else if (d.blocked) { claim = ["Settling ", title(d), " stopped."]; turn = "It needs you."; }
+    else if (d.blocked) { claim = hide ? ["Settling your drop stopped."] : ["Settling ", title(d), " stopped."]; turn = "It needs you."; }
     else if (d.state === "live") turn = d.minimum_met ? `${d.buyers} joined. Everyone pays ${money(d.price)}.`
                                                        : `${d.buyers} of ${d.minimum} joined. Everyone pays ${money(d.price)} once ${d.minimum} join.`;
     else if (d.state === "ended") turn = d.minimum_met ? "Time is up. Your assistant closes it next." : "Time is up, and it missed its minimum.";
@@ -181,5 +192,5 @@ const CPPanel = (() => {
         d.profit.map(r => el("span", {}, `${r.from_buyers} buyers `, el("span", { class: "v", text: money(r.profit) })))));
   }
 
-  return { title, shown, plan, headline, needs, resultVerify, resultTieout, STATUS, BAD, kind, buyers, feed, profitRow };
+  return { title, shown, plan, waiting, headline, needs, resultVerify, resultTieout, STATUS, BAD, kind, buyers, feed, profitRow };
 })();

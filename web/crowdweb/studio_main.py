@@ -41,7 +41,10 @@ def open_desk():
 
 
 def main(argv=None) -> int:
-    ap = argparse.ArgumentParser(prog="studio", description="Crowd Price Studio: run a drop from a chat with your assistant.")
+    # allow_abbrev=False: the launcher (web/studio.py) reads --togi exactly as written to choose the desk's Togi; argparse used to
+    # read --tog, --t and --to= as --togi too, which could give the assistant a different Togi from the desk's
+    ap = argparse.ArgumentParser(prog="studio", description="Crowd Price Studio: run a drop from a chat with your assistant.",
+                                 allow_abbrev=False)
     ap.add_argument("--port", type=int, default=8790)
     ap.add_argument("--maker-name", default=os.environ.get("CROWD_MAKER_NAME"), help="shown on the buyer page, e.g. Juniper")
     ap.add_argument("--maker-key", default=os.environ.get("CROWD_MAKER_KEY"),

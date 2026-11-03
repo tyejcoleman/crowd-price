@@ -9,9 +9,17 @@ otherwise see the passphrase). Togi's source is the one the `togi` launcher runs
 that is the Togi the assistant's tools run, and the desk must be the same Togi. TOGI_SRC, if set, is accepted only when it
 is that same directory; otherwise it is ignored and the panel says why approving there is off.
 """
-import os
-import re
 import sys
+
+# The three modules that exist only on Windows are closed before anything else is imported: the standard library probes for them
+# (`subprocess` and `mimetypes` do `try: import msvcrt, winreg`) and carries on without, so on every other system the probe walks
+# all of sys.path, past site-packages to wherever a .pth file put another project's source. A file of that name there would
+# run in the process that receives the approver's passphrase. A `None` in sys.modules makes the import fail where it stands.
+if sys.platform != "win32":
+    sys.modules.update(dict.fromkeys(("winreg", "_winapi", "msvcrt"), None))
+
+import os  # noqa: E402
+import re  # noqa: E402
 
 
 def _launcher(argv):

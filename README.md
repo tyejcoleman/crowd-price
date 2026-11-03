@@ -171,8 +171,15 @@ How the approval stays yours:
   `togi run`, not in an interpreter that is not isolated (so use `python3 -I web/studio.py`; `python3 -m crowdweb` cannot
   approve), not without an approver, and, for your own approver, only from a terminal (a `TOGI_APPROVER_HOME` that is your
   own approver by another path counts as your own). The launcher puts this repo and Togi after the standard library on the
-  import path, so nothing in them can stand in for a standard module, and imports only the Togi your `togi` launcher runs
-  (`TOGI_SRC`, if set, must be that one). If the desk did not open, the panel shows the `togi approve` command and says why.
+  import path, so nothing in them can stand in for a standard module (nor for the three modules that exist only on Windows,
+  which it closes first), and imports only the Togi your `togi` launcher runs (`TOGI_SRC`, if set, must be that one; the options
+  are read exactly as written, never abbreviated, so `--tog` cannot name a different Togi for the assistant). If the desk did
+  not open, the panel shows the `togi approve` command and says why.
+- **A request it cannot read is not shown or approved.** The card is built from the plan token Togi signed
+  (`capture:45:37.00:1665.00` or `void:22`, with `+release:K`). A token that is anything else, even with a space around it
+  (Togi files it as given and the engine strips the space, so it would settle the real plan), gets no approve form: the panel
+  says "This request cannot be read" and the assistant has to ask again. While a request waits, the headline says "Your drop"
+  and the assistant's name for it appears only on the card, quoted and labelled.
 - **The passphrase goes from your browser to that check and nowhere else**: not to the assistant, its context, a log
   (the server logs request lines only) or the disk.
 - **The assistant cannot reach it, and has nothing but the drop tools.** It is `claude -p` (on your own Claude plan;
@@ -189,6 +196,13 @@ How the approval stays yours:
 Options: `--port` (8790), `--model` (sonnet), `--maker-key` or `CROWD_MAKER_KEY`, `--claude`, `--togi` (the launcher the
 assistant's tools run, and the Togi the desk uses). With a throwaway test approver (`TOGI_APPROVER_HOME` set) the desk opens
 without a terminal, and Crowd honours its yes only on the Pretend PayPal.
+
+Threat model, one limit to know: Togi tells your own approver from a test one by where its files are (the same directory by
+another path, a link, or its files linked in). **A plain copy of your approver's files, used as a test approver, is not
+detected.** The desk then opens for it without a terminal, as it does for any test approver. What it signs is test scope, and
+Crowd honours test-scope grants only on the Pretend PayPal, where no money moves; on the PayPal sandbox only your own
+approver's yes counts. Anything that can read your files can already make a test approver of its own; the copy adds nothing to
+that, but do not treat "the desk opened without a terminal" as proof that the approver is not yours.
 
 Tests: `TOGI_SRC=<a Togi with togi/desk.py>/src python3 -m pytest -q web/tests` (the desk tests fail, never skip, without
 that Togi); `CROWD_STUDIO_REAL_CLAUDE=1` adds one run of the real `claude` with the studio's own flags.
