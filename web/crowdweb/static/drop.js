@@ -103,14 +103,14 @@
     $("turn").textContent = turn;
 
     const det = d.details || {};
-    const what = [det.what, det.ships].filter(Boolean).join(" · ");
+    const what = (missed(d) ? [det.what] : [det.what, det.ships]).filter(Boolean).join(" · ");
     $("what").textContent = what; $("what").hidden = !what;
     const photo = $("photo");
     if (det.photo) { if (photo.getAttribute("src") !== det.photo) photo.src = det.photo; photo.alt = d.title; photo.hidden = false; }
     else photo.hidden = true;
 
     const price = $("price"), was = $("was");
-    let label, next, saved = null;
+    let label, next, saved = null, soon = false;
     if (missed(d)) {
       label = "Missed its minimum";
       price.className = "price words";
@@ -136,6 +136,7 @@
         label = d.minimum_met ? "Everyone pays" : `Everyone pays, once ${d.minimum} join`;
         next = d.next_message ? d.next_message.replace(/^./, c => c.toUpperCase()) + "." : "This is the lowest price on the ladder.";
         if (d.saved_each && lockedFrom(d)) saved = `Down from ${short(d.start_price)} because the crowd reached ${lockedFrom(d)}: ${money(d.saved_each)} less for everyone.`;
+        else if (d.next_saving && d.next_step) { saved = `At ${d.next_step.at_buyers} buyers, everyone saves ${money(d.next_saving)}.`; soon = true; }
       } else {
         label = "Everyone pays";
         next = d.state === "settling" ? `Charging everyone ${money(d.price)} now.` : `Joining has closed. Each hold is charged ${money(d.price)} once, when the maker settles.`;
@@ -144,7 +145,8 @@
     }
     $("pricelabel").textContent = label;
     $("next").textContent = next;
-    $("saved").textContent = saved || ""; $("saved").hidden = !saved;
+    $("saved").textContent = saved || ""; $("saved").classList.toggle("soon", soon);
+    $("saved").hidden = !saved && d.state !== "live";        // live: the line keeps its room, so a first drop never shifts the page
   }
 
   function renderLadder(d) {
@@ -237,9 +239,8 @@
   }
 
   function cardClosed(d) {
-    if (d.settled) return [el("h2", { text: "This drop is settled" }),
-      el("p", { text: funded(d) ? `${plural(d.settled.paid, "person", "people")} paid ${money(d.settled.final_price)} each.` : "It missed its minimum. Every hold was released; nobody paid." }),
-      others(d)];
+    if (d.settled) return [el("h2", { text: "You weren't in this one" }),
+      el("p", { text: "This drop is settled." }), others(d)];
     return [el("h2", { text: "Joining has closed" }),
       el("p", { text: d.minimum_met ? `${d.buyers} joined. Everyone pays ${money(d.price)}.` : `${d.buyers} of ${d.minimum} joined, so every hold will be released.` })];
   }
@@ -269,10 +270,12 @@
     sticky(d);
   }
 
-  // on a phone, the join button follows you down the page until the card is in view
-  let cardVisible = true;
+  // on a phone, a join button sits at the bottom of the screen while the card's own button is off screen
   function sticky(d) {
-    const want = d.joinable && !s.me && !cardVisible && window.innerWidth <= 860;
+    const b = document.querySelector("#join form .btn");
+    const r = b ? b.getBoundingClientRect() : null;
+    const offscreen = !r || r.top > window.innerHeight - 8 || r.bottom < 0;
+    const want = d.joinable && !s.me && !(store(KEY) || {}).pending && offscreen && window.innerWidth <= 860;
     $("sticky").hidden = !want;
     $("stickybtn").textContent = `Hold ${money(d.start_price)} and join`;
   }
@@ -280,7 +283,7 @@
   (async () => {
     try { s.cards = await api("/api/cards"); } catch (e) { s.cards = []; }
     $("stickybtn").addEventListener("click", () => { $("join").scrollIntoView({ behavior: CP.calm() ? "auto" : "smooth", block: "center" }); setTimeout(() => $("name") && $("name").focus(), 400); });
-    if ("IntersectionObserver" in window) new IntersectionObserver(es => { cardVisible = es[0].isIntersecting; if (s.drop) sticky(s.drop); }).observe($("join"));
+    window.addEventListener("scroll", () => { if (s.drop) sticky(s.drop); }, { passive: true });
     poll(tick, 2000);
     setInterval(renderClock, 1000);
     let w = window.innerWidth;

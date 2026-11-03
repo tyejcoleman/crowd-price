@@ -211,7 +211,8 @@
         ladderHost,
         el("p", { class: "caption" }, el("span", {}, el("span", { class: "n", text: String(d.buyers) }), " joined"),
           el("span", {}, "minimum ", el("span", { class: "n", text: String(d.minimum) })),
-          el("span", {}, final ? "final price " : "price now ", el("span", { class: "n", text: money(final ? d.settled.final_price : d.price) }))),
+          el("span", {}, final ? "final price " : (d.settled ? "start price " : "price now "),
+            el("span", { class: "n", text: money(final ? d.settled.final_price : (d.settled ? d.start_price : d.price)) }))),
         profitRow(d)),
       feed(d));
     const right = el("div", {}, needs(d), buyers(d));

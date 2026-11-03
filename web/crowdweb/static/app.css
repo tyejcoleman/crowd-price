@@ -35,6 +35,7 @@ bdi.who { font-weight: 600; color: var(--ink); }
 .brand .where { font-weight: 500; color: var(--muted); padding-left: 10px; border-left: 1px solid var(--line-2); }
 .env { font: 12px/1.3 var(--mono); color: var(--muted); display: flex; align-items: center; gap: 8px; text-align: right; }
 .env::before { content: ""; flex: none; width: 7px; height: 7px; border-radius: 50%; background: var(--faint); }
+.env:empty::before { display: none; }
 
 .wrap { max-width: 1240px; margin: 0 auto; padding: 0 40px; }
 .status { padding-top: 60px; color: var(--muted); }
@@ -57,7 +58,8 @@ h1.two .turn { color: var(--turn); font-weight: 600; }
 .was { margin-top: 18px; font: 600 26px/1 var(--sans); color: var(--muted); text-decoration: line-through; text-decoration-thickness: 2px; transition: opacity 0.8s ease; }
 .was.gone { opacity: 0; }
 .next { margin: 12px 0 0; font-size: 17px; color: var(--ink-2); max-width: 40ch; }
-.saved { margin: 6px 0 0; font-size: 16px; font-weight: 600; color: var(--go); max-width: 44ch; }
+.saved { margin: 6px 0 0; font-size: 16px; font-weight: 600; color: var(--go); max-width: 44ch; min-height: 3em; }
+.saved.soon { color: var(--muted); font-weight: 500; }
 .ladder-box { margin-top: 22px; }
 
 /* the right-hand side: the product and the card */
@@ -145,6 +147,7 @@ svg.ladder .crowd text { font-family: var(--sans); font-size: 13px; font-weight:
 .cmd { display: flex; align-items: center; justify-content: space-between; gap: 10px; background: var(--ink); color: var(--paper); border-radius: 10px; padding: 12px 12px 12px 16px; font: 14px/1.4 var(--mono); overflow-wrap: anywhere; margin-bottom: 12px; }
 .cmd button { flex: none; background: transparent; border: 1px solid #3d4a41; color: var(--paper); border-radius: 8px; padding: 6px 10px; font: 12px var(--mono); cursor: pointer; }
 .checks { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 16px; }
+.needs .checks .btn.inline { flex: 1 1 100%; }
 .result { margin-top: 12px; font-size: 14px; }
 .result ul { margin: 6px 0 0; padding-left: 18px; }
 .buyers { list-style: none; margin: 0; padding: 0; border-top: 1px solid var(--line); max-height: 420px; overflow: auto; }
@@ -163,13 +166,13 @@ svg.ladder .crowd text { font-family: var(--sans); font-size: 13px; font-weight:
 @media (max-width: 860px) {
   .bar { padding: 14px 20px; }
   .wrap { padding: 0 20px; }
-  .hero { display: flex; flex-direction: column; gap: 0; padding: 12px 0 8px; }
+  .hero { display: flex; flex-direction: column; align-items: stretch; gap: 0; padding: 12px 0 8px; }
   .hero .lead, .hero .side { display: contents; }     /* phone: the product, the price, the card, then the ladder */
   .hero .by { order: 0; }
   .hero h1.two { order: 1; }
   .hero .what { order: 2; }
-  .hero .photo { order: 3; margin: 16px 0 0; }
-  .hero .pricebox { order: 4; margin-top: 22px; }
+  .hero .pricebox { order: 3; margin-top: 22px; }
+  .hero .photo { order: 4; margin: 18px 0 0; }
   .hero .join { order: 5; margin-top: 22px; position: static; }
   .hero .ladder-box { order: 6; margin-top: 26px; }
   .next { font-size: 16px; }

@@ -203,6 +203,9 @@ class Api:
         final = lad.D(d.settled["final_price"]) if d.settled and d.settled.get("outcome") == "funded" else None
         now = final if final is not None else (d.price() if d.count >= d.minimum else start)
         out["saved_each"] = m(start - now) if now < start else None
+        nxt = v.get("next_step")                     # what the next step will save everyone (same subtraction, engine numbers)
+        out["next_saving"] = (m(start - lad.D(nxt["price"])) if nxt and d.count >= d.minimum and lad.D(nxt["price"]) < start
+                              else None)
         out["steps"] = [{"step": i, "from_buyers": s.min_buyers, "price": m(s.price)} for i, s in enumerate(d.ladder.steps)]
         out["joinable"] = v["state"] == "live"
         if d.settled:

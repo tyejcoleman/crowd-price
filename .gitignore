@@ -9,3 +9,8 @@ __pycache__/
 .venv/
 *.log
 .DS_Store
+
+# the film: captured frames and renders are large and rebuildable
+video/captures/
+video/out/
+video/build/

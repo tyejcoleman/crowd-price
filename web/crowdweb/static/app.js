@@ -56,8 +56,9 @@ const CP = (() => {
     sandbox: { env: "PayPal sandbox", more: " · test money only", foot: "Every price and count here comes from the drop's engine. Holds are placed through PayPal's sandbox with test cards: no real money moves." },
   };
   function showMode(mode) {
-    const m = MODE[mode] || MODE.sandbox;
+    const m = MODE[mode];
     const env = document.getElementById("env"), foot = document.getElementById("foot");
+    if (!m) { if (env) env.replaceChildren(); if (foot) foot.textContent = ""; return; }     // unknown: make no claim
     if (env) env.replaceChildren(m.env, el("span", { class: "more", text: m.more }));
     if (foot) foot.textContent = m.foot;
   }
@@ -180,7 +181,7 @@ const CP = (() => {
 
     // motion: the marker slides along, the dot springs down a step, newly reached ground is drawn in. The starting position is
     // set before the chart is attached, so the first draw never animates from the left edge.
-    const move = prev && !calm();
+    const move = prev && prev.W === W && !calm();      // a redraw at a new width places the marker; it never slides
     g.style.transform = `translateX(${move ? prev.cx : cx}px)`;
     circle.style.cy = `${move ? prev.cy : cy}px`;
     host.append(s);
@@ -189,7 +190,7 @@ const CP = (() => {
       donePath.style.strokeDasharray = `${doneLen}`;
       donePath.style.strokeDashoffset = `${doneLen - prev.doneLen}`;
     }
-    host._prev = { cx, cy, doneLen };
+    host._prev = { cx, cy, doneLen, W };
     if (move) requestAnimationFrame(() => requestAnimationFrame(() => {
       g.style.transform = `translateX(${cx}px)`;
       circle.style.cy = `${cy}px`;
