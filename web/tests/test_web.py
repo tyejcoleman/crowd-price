@@ -3,8 +3,12 @@
 What must hold: a page shows only the engine's numbers; a buyer can join and leave only their own hold (a token proves it);
 nothing on the web can settle, exclude or bind (no route, no call); the maker's view needs the maker key.
 """
+import contextlib
 import json
 import re
+import shutil
+import socket
+import subprocess
 import threading
 import time
 import urllib.error
@@ -15,12 +19,13 @@ from pathlib import Path
 import pytest
 
 from crowd import ladder as lad
-from crowd.engine import Engine
+from crowd.engine import CrowdError, Engine
 from crowd.paypal_holds import FakePayPal
 from crowd.store import Store
 from crowdweb.api import Api, ApiError
 from crowdweb.feed import feed
 from crowdweb.server import JOINS_PER_MINUTE, serve
+from crowdweb.tokens import Tokens
 
 WEB = Path(__file__).resolve().parents[1] / "crowdweb"
 KEY = "maker-key-for-tests"
@@ -260,9 +265,10 @@ def test_the_web_never_calls_settle_exclude_bind_or_close():
 
 # ---- over HTTP ------------------------------------------------------------------------------------------------------
 
-@pytest.fixture
-def http(api):
-    httpd = serve(api, KEY, "127.0.0.1", 0)
+@contextlib.contextmanager
+def running(api, **kw):
+    """The server on a free port, and a `call` that talks to it (status, headers, body)."""
+    httpd = serve(api, KEY, "127.0.0.1", 0, **kw)
     port = httpd.server_address[1]
     t = threading.Thread(target=httpd.serve_forever, daemon=True)
     t.start()
@@ -281,9 +287,17 @@ def http(api):
         except urllib.error.HTTPError as e:
             return e.code, dict(e.headers), e.read()
     call.port = port
-    yield call
-    httpd.shutdown()
-    httpd.server_close()
+    try:
+        yield call
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+@pytest.fixture
+def http(api):
+    with running(api) as call:
+        yield call
 
 
 def test_pages_and_files_are_served_with_a_strict_policy(http, drop):
@@ -503,7 +517,8 @@ def test_wrong_keys_are_slowed_then_stopped(http, drop, monkeypatch):
     monkeypatch.setattr(srv.time, "sleep", lambda s: None)
     codes = [http(f"/api/maker/drops/{drop}", headers={"X-Maker-Key": f"wrong-key-{i:08d}"})[0] for i in range(22)]
     assert codes[:20] == [401] * 20 and codes[-1] == 429
-    assert http(f"/api/maker/drops/{drop}", headers={"X-Maker-Key": KEY})[0] == 429      # from this address, for a minute
+    assert http(f"/api/maker/drops/{drop}", headers={"X-Maker-Key": "wrong-key-again-1234"})[0] == 429   # wrong keys stay stopped
+    assert http(f"/api/maker/drops/{drop}", headers={"X-Maker-Key": KEY})[0] == 200      # the right key always works
 
 
 def test_an_unknown_host_is_refused(http, drop):
@@ -537,3 +552,523 @@ def test_a_stalled_request_is_cut_off(api, monkeypatch):
     finally:
         httpd.shutdown()
         httpd.server_close()
+
+
+# ---- the refuter's breaks, round 2: one join intent never becomes two holds; nobody releases a hold they did not place -----
+
+class Died(BaseException):
+    """What a killed process looks like to the code that was running: nothing catches it, nothing after it runs."""
+
+
+def open_auths(fake) -> list[str]:
+    """The holds PayPal (the fake) still has open, read from its own file."""
+    st = json.loads(Path(fake.path).read_text())
+    return sorted(k for k, a in st["auths"].items() if a["status"] in ("CREATED", "AUTHORIZED", "PENDING"))
+
+
+def join_body(name, tag, card=0):
+    return {"name": name, "card": card, "secret": sec(tag)}
+
+
+def restarted(api, tmp_path):
+    """The web server started again over the same stores."""
+    return Api(api.engine, maker_name="Juniper", togi_home=str(tmp_path / "togi"))
+
+
+# S1: a retry after a lost reply must come back as the same join, whatever the limiter or a 500 did meanwhile
+
+def test_s1_a_retry_after_a_lost_reply_is_not_turned_away_by_the_join_limit(http, engine, fake, drop):
+    st, _, _ = http(f"/api/drops/{drop}/join", body=join_body("Alex", "a"))          # the hold is placed, the reply is lost
+    assert st == 200
+    for _ in range(JOINS_PER_MINUTE * 2):                                             # invalid requests from this address ...
+        assert http(f"/api/drops/{drop}/join", body={"name": "x", "card": 99, "secret": sec("z")})[0] == 400
+    fill = [http(f"/api/drops/{drop}/join", body=join_body(f"Fill {i}", "f"))[0] for i in range(JOINS_PER_MINUTE)]
+    assert fill[:JOINS_PER_MINUTE - 1] == [200] * (JOINS_PER_MINUTE - 1) and fill[-1] == 429     # ... never used the budget up
+    st, _, body = http(f"/api/drops/{drop}/join", body=join_body("Alex", "a"))        # the page asks again, limit full
+    assert st == 200 and json.loads(body)["data"]["again"] is True
+    assert http(f"/api/drops/{drop}/join", body=join_body("Someone", "s"))[0] == 429  # a stranger is still held back
+    assert engine.get(drop).count == JOINS_PER_MINUTE and len(open_auths(fake)) == JOINS_PER_MINUTE
+
+
+def test_s1_the_limit_is_taken_only_by_a_request_that_is_valid_and_not_a_hand_back(api, engine, drop):
+    asked = []
+    admit = lambda: asked.append(1)                                                  # noqa: E731
+    for name, card, secret in (("Bo", 99, sec("b")), ("Bo", 0, "short"), ("", 0, sec("b")), ("‮Bo", 0, sec("b"))):
+        with pytest.raises(ApiError):
+            api.join(drop, name, card, secret, admit)
+    assert asked == []                                                                # an invalid request never counts
+    api.join(drop, "Bo", 0, sec("b"), admit)
+    assert asked == [1]
+    assert api.join(drop, "Bo", 0, sec("b"), admit)["again"] is True
+    assert asked == [1]                                                               # a hand-back never counts
+
+
+def test_s1_a_reply_that_fails_after_the_hold_is_handed_back_on_the_retry(http, api, engine, fake, drop, monkeypatch):
+    real, seen = api._mine, []
+
+    def flaky(d, bid):
+        if not seen:
+            seen.append(1)
+            raise RuntimeError("fails after the hold is placed and bound")
+        return real(d, bid)
+    monkeypatch.setattr(api, "_mine", flaky)
+    assert http(f"/api/drops/{drop}/join", body=join_body("Alex", "a"))[0] == 500
+    st, _, body = http(f"/api/drops/{drop}/join", body=join_body("Alex", "a"))
+    assert st == 200 and json.loads(body)["data"]["again"] is True
+    assert engine.get(drop).count == 1 and len(open_auths(fake)) == 1
+    st, _, body = http(f"/api/drops/{drop}/join", body=join_body("Alex", "b"))      # another browser: refused, no second hold
+    assert st == 409 and json.loads(body)["error"]["code"] == "already_joined" and len(open_auths(fake)) == 1
+
+
+# S2: a crash between the hold and its binding
+
+def test_s2_a_crash_between_the_hold_and_the_binding_is_never_guessed_into_a_proof(api, engine, fake, drop, tmp_path, monkeypatch):
+    def die(*a, **k):
+        raise Died("killed after the hold, before the bind")
+    monkeypatch.setattr(api.tokens, "bind", die)
+    with pytest.raises(Died):
+        api.join(drop, "Bea", 0, sec("a"))
+    api2 = restarted(api, tmp_path)
+    assert api2.tokens.row(drop, "bea")["auth_id"] is None and engine.get(drop).buyers["bea"].status == "held"
+    with pytest.raises(ApiError) as e:                                                # the page's retry, same secret
+        api2.join(drop, "Bea", 0, sec("a"))
+    assert e.value.status == 409 and e.value.code == "join_unconfirmed"
+    assert "maker" in e.value.message and "another name" not in e.value.message
+    for call in (api2.me, api2.leave):                                                # no proof, so no seeing and no releasing
+        with pytest.raises(ApiError) as e:
+            call(drop, "bea", sec("a"))
+        assert e.value.code == "not_yours"
+    with pytest.raises(ApiError) as e:                                                # someone else's secret: the name is taken
+        api2.join(drop, "Bea", 0, sec("b"))
+    assert e.value.code == "already_joined"
+    assert engine.get(drop).count == 1 and len(open_auths(fake)) == 1                 # one hold, left for the maker to see
+
+
+def test_s2_a_failed_binding_that_cannot_release_does_not_say_released(api, engine, fake, drop, monkeypatch):
+    def broken(*a, **k):
+        raise RuntimeError("disk full")
+    monkeypatch.setattr(api.tokens, "bind", broken)
+    fake.unavailable("void")                                                          # PayPal cannot release it right now
+    with pytest.raises(ApiError) as e:
+        api.join(drop, "Ada", 0, sec())
+    assert e.value.code == "not_recorded_held" and "was released" not in e.value.message and "maker" in e.value.message
+    assert "ada" in engine.get(drop).leaving                                          # the leave is on record for close and settle
+    monkeypatch.setattr(api.engine, "leave", lambda *a, **k: (_ for _ in ()).throw(CrowdError("drop_ended", drop=drop)))
+    with pytest.raises(ApiError) as e:                                                # the release is refused outright (too late)
+        api.join(drop, "Bo", 0, sec("b"))
+    assert e.value.code == "not_recorded_held" and "was released" not in e.value.message and "maker" in e.value.message
+
+
+# S3: a second browser must not inherit a hold an unconfirmed join may have placed
+
+def test_s3_a_second_browser_cannot_inherit_the_hold_of_an_unconfirmed_join(api, engine, fake, drop):
+    fake.lose_reply("authorize")
+    with pytest.raises(ApiError) as e:
+        api.join(drop, "Alex", 0, sec("a"))
+    assert e.value.code == "paypal_unavailable"
+    mine = api.tokens.row(drop, "alex")
+    assert mine["auth_id"] is None and len(open_auths(fake)) == 1                     # PayPal placed it; nobody wrote it down
+    with pytest.raises(ApiError) as e:                                                # browser B, same name
+        api.join(drop, "Alex", 0, sec("b"))
+    assert e.value.status == 409 and e.value.code == "join_in_progress"
+    assert api.tokens.row(drop, "alex") == mine                                       # A's claim is not overwritten
+    got = api.join(drop, "Alex", 0, sec("a"))                                         # A's own retry completes it
+    assert got["buyer"] == "alex" and engine.get(drop).count == 1 and len(open_auths(fake)) == 1
+    for call in (api.me, api.leave):
+        with pytest.raises(ApiError) as e:
+            call(drop, "alex", sec("b"))
+        assert e.value.code == "not_yours"
+    assert api.leave(drop, "alex", sec("a"))["me"]["status"] == "left"
+
+
+def test_s3_a_hold_the_assistant_replays_is_not_the_web_buyers_to_release(api, engine, fake, drop):
+    fake.lose_reply("authorize")
+    with pytest.raises(ApiError):
+        api.join(drop, "Alex", 0, sec("a"))
+    engine.join(drop, "Alex", 0)                                                      # the assistant joins by name: a replay
+    with pytest.raises(ApiError) as e:
+        api.join(drop, "Alex", 0, sec("a"))
+    assert e.value.code == "join_unconfirmed"
+    for call in (api.me, api.leave):
+        with pytest.raises(ApiError) as e:
+            call(drop, "alex", sec("a"))
+        assert e.value.code == "not_yours"
+    assert engine.get(drop).buyers["alex"].status == "held"
+
+
+def test_s3_a_web_buyer_cannot_take_over_a_join_the_assistant_left_unconfirmed(api, engine, fake, drop):
+    fake.lose_reply("authorize")
+    with pytest.raises(CrowdError):
+        engine.join(drop, "Alex", 0)
+    with pytest.raises(ApiError) as e:
+        api.join(drop, "Alex", 0, sec("b"))
+    assert e.value.code == "join_in_progress" and api.tokens.row(drop, "alex") is None
+
+
+def test_s3_a_claim_never_replaces_the_proof_of_a_hold_still_there(tmp_path):
+    t = Tokens(str(tmp_path / "t.db"))
+    t.claim("d1", "ada", sec("a"), "c1", "now")
+    assert t.bind("d1", "ada", sec("a"), "AUTH1") and not t.bind("d1", "ada", sec("a"), "AUTH2")   # a binding is final
+    assert t.claim("d1", "ada", sec("b"), "c1", "now", hold_auth_id="AUTH1") is False
+    assert t.owns("d1", "ada", sec("a"), "c1", "AUTH1")
+    t.drop_claim("d1", "ada", sec("b"))
+    t.drop_claim("d1", "ada", sec("a"))                                               # a refused join only forgets an UNBOUND claim
+    assert t.owns("d1", "ada", sec("a"), "c1", "AUTH1")
+    assert t.claim("d1", "ada", sec("b"), "c1", "now", hold_auth_id=None) is True     # the hold is gone: a new join may follow
+    assert t.bind("d1", "ada", sec("b"), "AUTH1") and not t.owns("d1", "ada", sec("a"), "c1", "AUTH1")
+    assert t.claim("d1", "ada", sec("c"), "c2", "now", hold_auth_id="AUTH1") is True  # another life of the drop: old proof is dead
+    assert not t.owns("d1", "ada", sec("b"), "c1", "AUTH1") and t.claimed("d1", "ada", sec("c"), "c2")
+
+
+# S4: after settlement a stranger's refused join must not erase a charged buyer's proof
+
+def paid_ada(api, engine, drop):
+    api.join(drop, "Ada", 0, sec("a"))
+    sim(engine, drop, 4)
+    settle(engine, drop)
+
+
+def test_s4_a_strangers_refused_join_leaves_a_charged_buyers_proof_alone(api, engine, drop):
+    paid_ada(api, engine, drop)
+    before = api.tokens.row(drop, "ada")
+    with pytest.raises(ApiError) as e:
+        api.join(drop, "Ada", 0, sec("x"))
+    assert e.value.code == "drop_closed" and api.tokens.row(drop, "ada") == before
+    assert api.me(drop, "ada", sec("a"))["me"]["charged"] == "36.00"
+
+
+def test_s4_a_charged_buyers_own_retry_gets_their_join_back(api, engine, drop):
+    paid_ada(api, engine, drop)
+    before = api.tokens.row(drop, "ada")
+    again = api.join(drop, "Ada", 0, sec("a"))
+    assert again["again"] is True and again["me"]["status"] == "captured" and again["me"]["charged"] == "36.00"
+    assert api.tokens.row(drop, "ada") == before
+
+
+def test_s4_a_closed_drop_refuses_a_join_before_any_claim_is_written(api, engine, drop, monkeypatch):
+    def never(*a, **k):
+        raise AssertionError("a claim was written for a drop that takes no joins")
+    monkeypatch.setattr(api.tokens, "claim", never)
+    engine.close(drop)
+    with pytest.raises(ApiError) as e:
+        api.join(drop, "Zed", 0, sec("z"))
+    assert e.value.code == "drop_closed"
+
+
+def test_s4_a_refused_join_keeps_its_claim_only_while_the_engine_holds_an_open_intent(api, engine, fake, drop):
+    fake.refuse("authorize", "UNPROCESSABLE_ENTITY")
+    with pytest.raises(ApiError) as e:
+        api.join(drop, "Ada", 0, sec())
+    assert e.value.code == "paypal_error" and e.value.extra.get("nothing_held") is True and api.tokens.row(drop, "ada") is None
+    fake.lose_reply("authorize")
+    with pytest.raises(ApiError) as e:
+        api.join(drop, "Bo", 0, sec("b"))
+    assert e.value.code == "paypal_unavailable" and "nothing_held" not in e.value.extra and api.tokens.row(drop, "bo")
+
+
+# the server's own limits
+
+@pytest.mark.parametrize("phase", ["body", "headers"])
+def test_a_slow_request_is_cut_off_at_a_total_deadline_not_a_per_read_one(api, monkeypatch, phase):
+    import crowdweb.server as srv
+    monkeypatch.setattr(srv, "READ_TIMEOUT", 5)                  # every single read is fast enough ...
+    monkeypatch.setattr(srv, "REQUEST_DEADLINE", 1.0)            # ... but the whole request may not take longer than this
+    with running(api) as call:
+        s = socket.create_connection(("127.0.0.1", call.port))
+        if phase == "body":
+            s.sendall(b"POST /api/drops/x/join HTTP/1.1\r\nHost: localhost:%d\r\nContent-Type: application/json\r\n"
+                      b"Content-Length: 100\r\n\r\n" % call.port)
+        else:
+            s.sendall(b"GET /api/info HTTP/1.1\r\nHost: localhost:%d\r\nX-Pad: " % call.port)    # a header that never ends
+        t0, closed, said = time.monotonic(), None, b""
+        while time.monotonic() - t0 < 4:
+            try:
+                s.sendall(b" ")                                  # one byte every 0.2 s: never idle for READ_TIMEOUT
+                s.settimeout(0.2)
+                said = s.recv(4096)                              # the server's answer, or its closing the connection
+                closed = time.monotonic() - t0
+                break
+            except socket.timeout:
+                continue
+            except OSError:
+                closed = time.monotonic() - t0
+                break
+        s.close()
+        assert closed is not None and closed < 3, "the server let a slow client keep its slot"
+        assert said == b"" or b" 408 " in said.split(b"\r\n")[0]    # told "too slow" (or just cut off), never served
+
+
+def test_one_address_cannot_hold_every_connection(api, monkeypatch):
+    import crowdweb.server as srv
+    monkeypatch.setattr(srv, "MAX_CONNECTIONS_PER_ADDRESS", 3)
+    monkeypatch.setattr(srv, "READ_TIMEOUT", 5)
+    monkeypatch.setattr(srv, "REQUEST_DEADLINE", 5)
+    with running(api) as call:
+        idle = [socket.create_connection(("127.0.0.1", call.port)) for _ in range(3)]
+        time.sleep(0.3)
+        extra = socket.create_connection(("127.0.0.1", call.port))
+        extra.settimeout(2)
+        try:
+            assert extra.recv(1) == b""                          # turned away at once, not left waiting
+        except ConnectionError:
+            pass
+        extra.close()
+        for s in idle:
+            s.settimeout(0.3)
+            with pytest.raises(socket.timeout):                  # the first three are still being served
+                s.recv(1)
+        idle.pop().close()
+        time.sleep(0.5)
+        assert call("/api/info")[0] == 200                       # a slot freed: the address can ask again
+        for s in idle:
+            s.close()
+
+
+def test_behind_a_proxy_the_right_most_forwarded_address_is_the_client(api, drop, monkeypatch):
+    import crowdweb.server as srv
+    monkeypatch.setattr(srv.time, "sleep", lambda s: None)
+    with running(api, trust_proxy=True) as call:
+        def wrong(i, real="203.0.113.9"):
+            return call(f"/api/maker/drops/{drop}", headers={"X-Maker-Key": f"wrong-key-{i:08d}",
+                                                              "X-Forwarded-For": f"10.0.{i}.1, {real}"})[0]
+        codes = [wrong(i) for i in range(22)]                    # the client rotates the left-most entry it wrote itself
+        assert codes[:20] == [401] * 20 and codes[20:] == [429, 429]
+        assert wrong(30, real="203.0.113.77") == 401             # a different client, as the proxy saw it, has its own budget
+        assert call(f"/api/maker/drops/{drop}", headers={"X-Maker-Key": KEY, "X-Forwarded-For": "1.1.1.1, 203.0.113.9"})[0] == 200
+
+
+def test_the_right_key_always_works_after_a_flood_of_wrong_ones(http, drop, monkeypatch):
+    import crowdweb.server as srv
+    monkeypatch.setattr(srv.time, "sleep", lambda s: None)
+    codes = [http(f"/api/maker/drops/{drop}", headers={"X-Maker-Key": f"wrong-key-{i:08d}"})[0] for i in range(25)]
+    assert codes[-1] == 429
+    for _ in range(3):
+        assert http(f"/api/maker/drops/{drop}", headers={"X-Maker-Key": KEY})[0] == 200
+    assert http(f"/api/maker/drops/{drop}", headers={"X-Maker-Key": "wrong-key-after-a-right-one"})[0] == 429
+
+
+# P2
+
+def test_a_photo_is_served_only_for_a_published_drop_with_that_title(tmp_path, engine):
+    from crowdweb.api import load_details
+    (tmp_path / "details").mkdir()
+    (tmp_path / "details" / "mugs.jpg").write_bytes(b"\xff\xd8\xff fake jpeg")
+    (tmp_path / "details" / "d.json").write_text(json.dumps({"Speckled mugs": {"photo": "mugs.jpg"}, "Vases": {"photo": "mugs.jpg"}}))
+    a = Api(engine, details=load_details(str(tmp_path / "details" / "d.json")), togi_home=str(tmp_path / "togi"))
+    with pytest.raises(ApiError) as e:                           # no drop by that title yet
+        a.photo("0")
+    assert e.value.status == 404
+    d = engine.create_drop("Speckled mugs", lad.parse("3:40"), 3, 60)
+    with pytest.raises(ApiError):                                # a draft is not public, nor is its photo
+        a.photo("0")
+    engine.publish(d)
+    assert a.photo("0")[1] == "image/jpeg"
+    with pytest.raises(ApiError):                                # a title nobody has published
+        a.photo("1")
+
+
+def test_the_maker_key_is_printed_only_when_it_was_made_here(monkeypatch, capsys):
+    import crowdweb.__main__ as cli
+
+    class Httpd:
+        def serve_forever(self):
+            pass
+
+        def server_close(self):
+            pass
+
+    class Stub:
+        mode = "fake"
+        engine = type("E", (), {"store": type("S", (), {"path": "/tmp/x.db"})()})()
+
+        def drops(self):
+            return []
+    monkeypatch.setattr(cli, "Api", lambda **k: Stub())
+    monkeypatch.setattr(cli, "serve", lambda api, key, *a, **k: Httpd())
+    monkeypatch.delenv("CROWD_MAKER_KEY", raising=False)
+    assert cli.main(["--port", "8799"]) == 0
+    out = capsys.readouterr().out
+    assert "#key=" in out                                        # made here, so it has to be shown once
+    for argv, env in ((["--port", "8799", "--maker-key", "given-on-the-command-line"], None),
+                      (["--port", "8799"], "given-in-the-environment")):
+        if env:
+            monkeypatch.setenv("CROWD_MAKER_KEY", env)
+        assert cli.main(argv) == 0
+        out = capsys.readouterr().out
+        assert "given-on-the-command-line" not in out and "given-in-the-environment" not in out and "#key=" not in out
+        assert "/maker" in out
+
+
+# ---- drop.js itself: what the buyer's page does with its secret (run for real, in node, against a scripted server) ---------
+
+# The page's own code runs unchanged in a node `vm` with a fake document and a scripted API: no browser, no network.
+# A scenario is {store, persist, join: [answers], steps: [...]}; steps are ["tick"], ["advance", ms], ["submit", name], ["tab", record].
+DROP_JS_HARNESS = r'''
+const fs = require("fs"), vm = require("vm");
+const sc = JSON.parse(fs.readFileSync(0, "utf8"));
+const src = fs.readFileSync(process.argv[2], "utf8");
+const KEY = "crowd-price:d_test";
+const persist = sc.persist !== false;
+let now = 1000000, ticker = null, nsecret = 0, lastCard = [];
+const mem = new Map();
+if (sc.store) mem.set(KEY, JSON.stringify(sc.store));
+const calls = [], forms = {}, joinQ = [...(sc.join || [])];
+const DROP = { drop: "d_test", title: "Mugs", state: "live", joinable: true, price: "40.00", start_price: "40.00", minimum: 3,
+  minimum_met: false, buyers: 0, steps: [{ step: 0, from_buyers: 3, price: "40.00" }], locked_step: null, next_step: null,
+  next_message: null, details: null, paypal: "fake", maker_name: "Juniper", settled: null, saved_each: null, next_saving: null,
+  ends_at: "2999-01-01T00:00:00Z", time_left_seconds: 100, server_time: "2026-11-01T12:00:00Z" };
+const ME = { buyer: "alex", name: "Alex", status: "held", card: "Test card ending 4444", held: "40.00", charged: null, saved: null,
+  start_price: "40.00", can_leave: true, leaving: false };
+
+async function api(path, opts = {}) {
+  if (path === "/api/cards") return [{ index: 0, label: "Test card ending 4444" }];
+  const act = path.split("/").pop();
+  calls.push({ act, body: opts.body });
+  if (act === "join") {
+    const r = joinQ.shift();
+    if (!r) throw { code: "offline", message: "The drop could not be reached." };
+    if (r.error) throw r.error;
+    return { buyer: "alex", me: ME, drop: DROP, ...r.ok };
+  }
+  if (act === "me") return { me: ME, drop: DROP };
+  return DROP;
+}
+function store(k, v) {
+  if (!persist) return null;
+  if (v === undefined) return JSON.parse(mem.get(k) || "null");
+  if (v === null) mem.delete(k); else mem.set(k, JSON.stringify(v));
+}
+function el(tag, attrs, ...kids) {
+  const n = { tag, attrs: attrs || {}, kids: kids.flat(Infinity) };
+  if (n.attrs.onsubmit) forms.submit = n.attrs.onsubmit;
+  if (n.attrs.id === "name") forms.name = n.attrs;
+  return n;
+}
+const words = n => (typeof n === "string" ? [n] : n && n.kids ? [n.attrs.text, ...n.kids.flatMap(words)].filter(Boolean) : []);
+const els = {};
+function fake(id) {
+  return { id, textContent: "", hidden: false, classList: { add() {}, remove() {}, toggle() {} }, style: {}, value: "",
+    replaceChildren(...k) { if (id === "join") lastCard = k.flat(Infinity); }, getBoundingClientRect: () => ({ width: 700, top: 0, bottom: 100 }),
+    contains: () => false, getAttribute: () => null, setAttribute() {}, addEventListener() {}, focus() {}, scrollIntoView() {} };
+}
+const document = { getElementById: id => els[id] || (els[id] = fake(id)), title: "", activeElement: null, querySelector: () => null,
+  addEventListener() {}, hidden: false };
+const CP = { el, api, store, secret: () => ("T" + ++nsecret).padEnd(43, "x"), showMode() {}, money: s => "$" + s, short: s => "$" + s,
+  splitMoney: s => ({ whole: String(s).split(".")[0], cents: "." + (String(s).split(".")[1] || "00") }),
+  plural: (n, a, b) => `${n} ${n === 1 ? a : b || a + "s"}`, clockFrom: () => () => 100, duration: s => s + "s", ladder() {},
+  poll: t => { ticker = t; }, calm: () => true };
+const ctx = { CP, document, window: { innerWidth: 1200, innerHeight: 800, addEventListener() {} }, location: { pathname: "/d/d_test", origin: "http://x" },
+  navigator: {}, setTimeout, clearTimeout, setInterval: () => 0, Date: { now: () => now, parse: Date.parse }, console, JSON, Math, parseFloat, parseInt,
+  String, Number, Object, Array, Set, Promise, Symbol };
+vm.createContext(ctx);
+vm.runInContext(src, ctx);
+
+(async () => {
+  while (!ticker) await new Promise(r => setTimeout(r, 1));
+  const trace = [];
+  for (const [op, arg] of sc.steps) {
+    if (op === "tick") await ticker();
+    else if (op === "advance") now += arg;
+    else if (op === "tab") mem.set(KEY, JSON.stringify(arg));
+    else if (op === "submit") { forms.name.oninput({ target: { value: arg } }); await forms.submit({ preventDefault() {} }); }
+    trace.push({ op, store: persist ? JSON.parse(mem.get(KEY) || "null") : null, said: lastCard.flatMap(words) });
+  }
+  console.log(JSON.stringify({ trace, calls }));
+})();
+'''
+
+needs_node = pytest.mark.skipif(shutil.which("node") is None, reason="node is needed to run the page's own code")
+SECRET_A = "S" * 43
+PENDING = {"name": "Alex", "card": 0, "secret": SECRET_A, "pending": True}
+
+
+def drop_js(tmp_path, **scenario) -> dict:
+    harness = tmp_path / "drop_js_harness.js"
+    harness.write_text(DROP_JS_HARNESS)
+    run = subprocess.run(["node", str(harness), str(WEB / "static" / "drop.js")], input=json.dumps(scenario), text=True,
+                         capture_output=True, timeout=60)
+    assert run.returncode == 0, run.stderr
+    return json.loads(run.stdout)
+
+
+def err(code, message="Words from the server.", **extra):
+    return {"error": {"code": code, "message": message, **extra}}
+
+
+@needs_node
+@pytest.mark.parametrize("code", ["slow_down", "internal", "offline", "paypal_unavailable", "earlier_attempt_unresolved", "join_unconfirmed",
+                                  "not_recorded_held", "paypal_error", "error", "http_502", "join_in_progress", "already_joined"])
+def test_the_page_keeps_its_secret_on_every_answer_that_does_not_prove_nothing_was_held(tmp_path, code):
+    out = drop_js(tmp_path, store=PENDING, join=[err(code)], steps=[["tick"]])
+    last = out["trace"][-1]
+    assert last["store"] == PENDING, code                                  # still the same secret, still pending
+    assert any("Confirming your join" in w for w in last["said"]) and not any("Join the drop" in w for w in last["said"])
+
+
+@needs_node
+@pytest.mark.parametrize("answer", [err("bad_card"), err("bad_buyer"), err("join_declined"), err("hold_not_open"), err("drop_closed"),
+                                    err("drop_ended"), err("not_recorded"), err("paypal_error", nothing_held=True)])
+def test_the_page_forgets_its_secret_only_when_nothing_was_held(tmp_path, answer):
+    out = drop_js(tmp_path, store=PENDING, join=[answer], steps=[["tick"]])
+    assert out["trace"][-1]["store"] is None
+    assert any("Words from the server." in w for w in out["trace"][-1]["said"])
+
+
+@needs_node
+def test_s1_the_page_asks_again_with_the_same_secret_after_a_lost_reply_and_a_429(tmp_path):
+    out = drop_js(tmp_path, store=PENDING, join=[err("slow_down"), err("internal"), {"ok": {"again": True}}],
+                  steps=[["tick"], ["tick"], ["advance", 4000], ["tick"], ["advance", 8000], ["tick"]])
+    joins = [c["body"] for c in out["calls"] if c["act"] == "join"]
+    assert len(joins) == 3 and all(b["secret"] == SECRET_A and b["name"] == "Alex" for b in joins)   # same secret, same name, every time
+    assert [t["store"] for t in out["trace"][:4]] == [PENDING] * 4                                 # kept through the 429 and the 500
+    assert out["trace"][-1]["store"] == {"buyer": "alex", "secret": SECRET_A}                      # then the join is handed back
+
+
+@needs_node
+def test_s1_a_retry_is_not_asked_again_before_its_wait_is_over(tmp_path):
+    out = drop_js(tmp_path, store=PENDING, join=[err("slow_down")], steps=[["tick"], ["tick"], ["tick"]])
+    assert [c["act"] for c in out["calls"]].count("join") == 1
+
+
+@needs_node
+def test_s1_a_retry_that_finds_the_name_taken_never_suggests_another_name(tmp_path):
+    taken = "That name is taken in this drop. Try another, for example with an initial."
+    out = drop_js(tmp_path, store=PENDING, join=[err("already_joined", taken)], steps=[["tick"]])
+    last = out["trace"][-1]
+    assert last["store"] == PENDING
+    said = " ".join(last["said"])
+    assert "may have gone through" in said and "Try another" not in said and "another name" in said      # "don't join under another name"
+    assert "keeps checking" in said
+
+
+@needs_node
+def test_a_first_ask_that_finds_the_name_taken_says_so_and_lets_go(tmp_path):
+    taken = "That name is taken in this drop. Try another, for example with an initial."
+    out = drop_js(tmp_path, join=[err("already_joined", taken)], steps=[["tick"], ["submit", "Alex"]])
+    last = out["trace"][-1]
+    assert last["store"] is None and taken in last["said"]                 # nothing of this secret was ever sent before: really taken
+
+
+@needs_node
+def test_a_first_ask_whose_answer_is_lost_is_kept_and_asked_again(tmp_path):
+    out = drop_js(tmp_path, join=[err("offline"), {"ok": {"again": True}}], steps=[["tick"], ["submit", "Alex"], ["advance", 5000], ["tick"]])
+    joins = [c["body"] for c in out["calls"] if c["act"] == "join"]
+    assert len(joins) == 2 and joins[0]["secret"] == joins[1]["secret"] and out["trace"][2]["store"]["pending"] is True
+    assert out["trace"][-1]["store"] == {"buyer": "alex", "secret": joins[0]["secret"]}
+
+
+@needs_node
+@pytest.mark.parametrize("other", [{"buyer": "alex", "secret": SECRET_A}, PENDING])
+def test_a_second_tab_cannot_overwrite_a_stored_join_with_a_new_pending_one(tmp_path, other):
+    out = drop_js(tmp_path, steps=[["tick"], ["tab", other], ["submit", "Zed"]], join=[err("offline")])
+    assert not any(c["act"] == "join" and c["body"]["name"] == "Zed" for c in out["calls"])           # no new secret was ever sent
+    assert out["trace"][-1]["store"] == other                                                         # and the stored one is untouched
+
+
+@needs_node
+def test_a_browser_that_will_not_keep_the_record_still_keeps_the_secret_while_the_page_is_open(tmp_path):
+    out = drop_js(tmp_path, persist=False, join=[err("offline"), {"ok": {"again": True}}],
+                  steps=[["tick"], ["submit", "Alex"], ["advance", 5000], ["tick"]])
+    joins = [c["body"] for c in out["calls"] if c["act"] == "join"]
+    assert len(joins) == 2 and joins[0]["secret"] == joins[1]["secret"]
+    assert any("Confirming your join" in w for w in out["trace"][1]["said"])                          # no form to type another name into

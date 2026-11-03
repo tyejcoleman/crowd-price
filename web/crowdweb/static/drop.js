@@ -6,12 +6,31 @@
   const KEY = "crowd-price:" + dropId;      // {name, card, secret, pending} until the join is confirmed, then {buyer, secret}
   const $ = id => document.getElementById(id);
 
+  // The record is the only thing that links this browser to its hold, so it is kept where the browser keeps things; a browser that
+  // refuses to keep it still keeps it in this page, so a lost answer can at least be asked again while the page is open.
+  const persists = (() => { store(KEY + ":probe", 1); const ok = store(KEY + ":probe") === 1; store(KEY + ":probe", null); return ok; })();
+  let memo = null;
+  const kept = () => (persists ? store(KEY) : memo);
+  const keep = v => { if (persists) store(KEY, v); else memo = v; };       // null forgets it
+  const keepsPending = () => !!(kept() || {}).pending;
+
   const s = { drop: null, me: null, cards: [], busy: false, error: null, clock: null, lastPrice: null, lastLadder: "",
-              lastCard: "", confirmLeave: false, copied: false, form: { name: "", card: 0 }, gone: false };
+              lastCard: "", confirmLeave: false, copied: false, form: { name: "", card: 0 }, gone: false, tries: 0, retryAt: 0 };
+
+  // What a join's refusal can prove. Only these answers show that NOTHING was held under this secret, so only they let the page
+  // forget it. Every other answer (too many requests, a server error, no answer at all, PayPal trouble, a join still being
+  // sorted out, one that could not be confirmed) keeps the secret and asks again: the first ask may have placed a hold whose
+  // answer was lost, and a new secret under another name would place a second one.
+  const NOTHING_HELD = new Set(["bad_card", "bad_buyer", "bad_secret", "join_declined", "hold_not_open", "drop_closed", "drop_ended",
+    "drop_not_found", "drop_not_published", "wrong_paypal", "drop_unbound", "not_recorded"]);
+  // Only for the very first ask, which no earlier ask of this secret can have preceded: "taken" then means taken by someone else.
+  const ONLY_IF_FIRST = new Set(["already_joined", "buyer_excluded", "join_in_progress"]);
+  const ASKING_AGAIN = "We could not confirm your join yet. Checking again…";
+  const MAY_BE_IN = "Your earlier try may have gone through, so please don't join again under another name. This page keeps checking.";
 
   // ---- talking to the server
   async function tick() {
-    const mine = store(KEY);
+    const mine = kept();
     try {
       if (mine && mine.buyer && mine.secret) {
         try {
@@ -19,11 +38,12 @@
           s.drop = r.drop; s.me = r.me;
         } catch (e) {
           if (e.code !== "not_yours" && e.code !== "buyer_not_found") throw e;
-          store(KEY, null); s.me = null;
+          keep(null); s.me = null;
           s.drop = await api(`/api/drops/${dropId}`);
         }
       } else if (mine && mine.pending) {
-        await finishJoin(mine);              // a join whose answer never came: ask again with the same secret
+        if (Date.now() >= s.retryAt) await finishJoin(mine, false);      // a join whose answer never came: ask again, same secret
+        else s.drop = await api(`/api/drops/${dropId}`);                 // not yet: keep the page's numbers fresh meanwhile
       } else {
         s.drop = await api(`/api/drops/${dropId}`);
       }
@@ -36,21 +56,23 @@
   }
 
   // Ask to join with a secret already written down. Asked again (same secret) after a lost answer, the server hands back
-  // the same join; it never places a second hold.
-  async function finishJoin(mine) {
+  // the same join; it never places a second hold. `first` is true only for the ask the buyer has just made.
+  async function finishJoin(mine, first) {
     try {
       const r = await api(`/api/drops/${dropId}/join`, { body: { name: mine.name, card: mine.card, secret: mine.secret } });
-      store(KEY, { buyer: r.buyer, secret: mine.secret });
-      s.me = r.me; s.drop = r.drop; s.error = null;
+      keep({ buyer: r.buyer, secret: mine.secret });
+      s.me = r.me; s.drop = r.drop; s.error = null; s.tries = 0;
     } catch (e) {
-      if (e.code === "offline" || e.code === "paypal_unavailable" || e.code === "earlier_attempt_unresolved") {
-        s.error = "We could not confirm your join yet. Checking again…";
-        if (!s.drop) s.drop = await api(`/api/drops/${dropId}`);
-      } else {
-        store(KEY, null);
+      if (NOTHING_HELD.has(e.code) || e.nothing_held === true || (first && ONLY_IF_FIRST.has(e.code))) {
+        keep(null); s.tries = 0;
         s.error = e.message;
-        s.drop = await api(`/api/drops/${dropId}`);
+      } else {
+        s.tries += 1;                                                    // wait a little longer each time, up to 20 s
+        s.retryAt = Date.now() + Math.min(20000, 1500 * 2 ** s.tries);
+        s.error = (e.code === "join_unconfirmed" || e.code === "not_recorded_held") ? e.message
+          : (e.code === "already_joined" || e.code === "join_in_progress" || e.code === "buyer_excluded") ? MAY_BE_IN : ASKING_AGAIN;
       }
+      try { if (!keepsPending() || !s.drop) s.drop = await api(`/api/drops/${dropId}`); } catch (e2) { /* the next tick tries again */ }
     }
   }
 
@@ -60,17 +82,23 @@
     s.error = null;
     const name = s.form.name.trim();
     if (!name) { s.error = "Add your name."; render(); if ($("name")) $("name").focus(); return; }
+    const there = kept();
+    if (there && (there.buyer || there.pending)) {      // another tab got here first: never replace its secret with a new one
+      if (!there.buyer) s.error = "A join from this browser is still being confirmed. This page keeps checking.";
+      await tick();
+      return;
+    }
     const mine = { name, card: s.form.card, secret: secret(), pending: true };
-    store(KEY, mine);                        // written down before asking, so a lost answer can be asked again
+    keep(mine);                              // written down before asking, so a lost answer can be asked again
     s.busy = true; render();
-    try { await finishJoin(mine); if (s.me) s.form.name = ""; } finally { s.busy = false; render(); }
+    try { await finishJoin(mine, true); if (s.me) s.form.name = ""; } finally { s.busy = false; render(); }
   }
 
   async function leave() {
     if (s.busy) return;
     s.busy = true; s.error = null; render();
     try {
-      const mine = store(KEY);
+      const mine = kept();
       const r = await api(`/api/drops/${dropId}/leave`, { body: { buyer: mine.buyer, secret: mine.secret } });
       s.me = r.me; s.drop = r.drop; s.confirmLeave = false;
     } catch (err) {
@@ -220,7 +248,7 @@
                                  : `The rest of your ${money(me.start_price)} hold was released.` }), others(d));
     } else if (me.status === "left") {
       out.push(big("You left"), el("p", { text: `Your ${money(me.start_price)} hold was released. You pay nothing.` }));
-      if (d.joinable) out.push(el("button", { class: "btn quiet", onclick: () => { store(KEY, null); s.me = null; render(); }, text: "Join again" }));
+      if (d.joinable) out.push(el("button", { class: "btn quiet", onclick: () => { keep(null); s.me = null; render(); }, text: "Join again" }));
     } else if (me.status === "voided") {
       out.push(big("You paid nothing"),
         el("p", { text: "The drop missed its minimum, so your hold was released. The pending charge drops off your card; when depends on your bank." }), others(d));
@@ -258,7 +286,7 @@
     showMode(d.paypal);
     renderLead(d);
     renderLadder(d);
-    const pending = !s.me && (store(KEY) || {}).pending;
+    const pending = !s.me && keepsPending();
     const cardKey = JSON.stringify([s.me, pending, d.joinable, d.state, d.price, d.start_price, d.minimum, d.minimum_met, !!d.next_step,
                                     d.settled, d.others, s.error, s.busy, s.confirmLeave, s.copied, s.cards.length]);
     const join = $("join");
@@ -275,7 +303,7 @@
     const b = document.querySelector("#join form .btn");
     const r = b ? b.getBoundingClientRect() : null;
     const offscreen = !r || r.top > window.innerHeight - 8 || r.bottom < 0;
-    const want = d.joinable && !s.me && !(store(KEY) || {}).pending && offscreen && window.innerWidth <= 860;
+    const want = d.joinable && !s.me && !keepsPending() && offscreen && window.innerWidth <= 860;
     $("sticky").hidden = !want;
     $("stickybtn").textContent = `Hold ${money(d.start_price)} and join`;
   }

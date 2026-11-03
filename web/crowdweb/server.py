@@ -22,8 +22,10 @@ There is no route that settles, excludes or binds. Those move money, and only a 
 from __future__ import annotations
 
 import hmac
+import io
 import json
 import re
+import socket
 import threading
 import time
 from collections import deque
@@ -41,7 +43,9 @@ MAX_BODY = 4096
 JOINS_PER_MINUTE = 12          # per client address: holds are real sandbox calls, so a page cannot be used to flood them
 JOINS_PER_DROP_MINUTE = 120    # per drop, whoever asks: the ceiling still holds behind a proxy that hides addresses
 MAX_CONNECTIONS = 64           # open connections at once; a client that opens many slow ones cannot exhaust the threads
-READ_TIMEOUT = 10              # seconds a connection may sit without sending its request
+MAX_CONNECTIONS_PER_ADDRESS = 16   # of those, one address's share (not applied behind --trust-proxy, where every client is the proxy)
+READ_TIMEOUT = 10              # seconds a connection may sit without sending anything
+REQUEST_DEADLINE = 15          # seconds for a whole request to arrive, however slowly (READ_TIMEOUT alone is reset by every byte)
 MIN_MAKER_KEY = 16
 KEY_FAILS_PER_MINUTE = 20
 CSP = ("default-src 'self'; script-src 'self'; style-src 'self' https://fonts.googleapis.com; "
@@ -77,28 +81,81 @@ class RateLimit:
 
 
 class CappedServer(ThreadingHTTPServer):
-    """A threading server that turns a connection away (closes it) when MAX_CONNECTIONS are already being served."""
+    """A threading server that turns a connection away (closes it) when MAX_CONNECTIONS are already being served, or when one
+    address already holds `per_address` of them (0: no per-address cap). Together with the request deadline, a few slow clients
+    can neither keep every slot nor keep one for long."""
     daemon_threads = True
 
-    def __init__(self, *a, **kw):
+    def __init__(self, *a, per_address: int | None = None, **kw):
         self._slots = threading.BoundedSemaphore(MAX_CONNECTIONS)
+        self._per_address = MAX_CONNECTIONS_PER_ADDRESS if per_address is None else per_address
+        self._open: dict[str, int] = {}
+        self._open_lock = threading.Lock()
         super().__init__(*a, **kw)
 
     def process_request(self, request, client_address):
-        if not self._slots.acquire(blocking=False):
+        who = client_address[0]
+        with self._open_lock:
+            full = bool(self._per_address) and self._open.get(who, 0) >= self._per_address
+            if full or not self._slots.acquire(blocking=False):
+                taken = False
+            else:
+                taken = True
+                self._open[who] = self._open.get(who, 0) + 1
+        if not taken:
             self.shutdown_request(request)
             return
-        super().process_request(request, client_address)
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            self._release(who)
+            raise
 
     def process_request_thread(self, request, client_address):
         try:
             super().process_request_thread(request, client_address)
         finally:
-            self._slots.release()
+            self._release(client_address[0])
+
+    def _release(self, who: str) -> None:
+        with self._open_lock:
+            left = self._open.get(who, 0) - 1
+            if left > 0:
+                self._open[who] = left
+            else:
+                self._open.pop(who, None)
+        self._slots.release()
+
+
+class _Deadline(io.RawIOBase):
+    """Reads a connection, but never for longer in all than `seconds`: a client that sends a byte every few seconds is idle for
+    no single read, yet it keeps its slot for as long as it likes unless the whole request has a limit."""
+
+    def __init__(self, sock, seconds: float):
+        self.sock, self.end = sock, time.monotonic() + seconds
+
+    def readable(self) -> bool:
+        return True
+
+    def readinto(self, b) -> int:
+        left = self.end - time.monotonic()
+        if left <= 0:
+            raise socket.timeout("the request took too long to arrive")
+        self.sock.settimeout(min(READ_TIMEOUT, left))
+        return self.sock.recv_into(b)
 
 
 def make_handler(api: Api, maker_key: str, quiet: bool = True, hosts: set[str] | None = None, trust_proxy: bool = False):
     joins, drop_joins, key_fails = RateLimit(JOINS_PER_MINUTE), RateLimit(JOINS_PER_DROP_MINUTE), RateLimit(KEY_FAILS_PER_MINUTE)
+    join_gate = threading.Lock()          # the two join limits are checked and taken together
+
+    def admit_join(who: str, drop: str) -> None:
+        """Called by the API once a join is valid and is not a hand-back of one that went through (api.py says why)."""
+        with join_gate:
+            if joins.full(who) or drop_joins.full(drop):
+                raise ApiError(429, "slow_down", "Too many joins right now. Wait a minute.")
+            joins.allow(who)
+            drop_joins.allow(drop)
 
     class Handler(BaseHTTPRequestHandler):
         server_version = "CrowdPrice"
@@ -107,7 +164,13 @@ def make_handler(api: Api, maker_key: str, quiet: bool = True, hosts: set[str] |
         error_content_type = "application/json; charset=utf-8"
         error_message_format = '{"ok":false,"error":{"code":"http_%(code)d","message":"%(message)s"}}'
 
+        def setup(self):
+            super().setup()
+            self.rfile.close()          # the plain reader gives way to one with a total deadline
+            self.rfile = io.BufferedReader(_Deadline(self.connection, REQUEST_DEADLINE), 8192)
+
         def end_headers(self):          # every response, the standard library's own errors included, carries the policy
+            self.connection.settimeout(READ_TIMEOUT)      # reading may have left a short deadline on the socket: writing gets a fair one
             if not getattr(self, "_policy_sent", False):
                 self.send_header("X-Content-Type-Options", "nosniff")
                 self.send_header("Referrer-Policy", "no-referrer")
@@ -120,10 +183,12 @@ def make_handler(api: Api, maker_key: str, quiet: bool = True, hosts: set[str] |
             super().send_response(*a, **kw)
 
         def _who(self) -> str:
+            """The client's address. Behind a trusted proxy that is the RIGHT-most X-Forwarded-For entry: the one the proxy
+            appended. Everything to its left was written by the client (or by proxies further out) and can be anything."""
             if trust_proxy:
-                fwd = (self.headers.get("X-Forwarded-For") or "").split(",")[0].strip()
+                fwd = ",".join(self.headers.get_all("X-Forwarded-For") or []).split(",")[-1].strip()
                 if fwd:
-                    return fwd
+                    return fwd[:64]
             return self.client_address[0]
 
         def _host_ok(self) -> bool:
@@ -173,6 +238,9 @@ def make_handler(api: Api, maker_key: str, quiet: bool = True, hosts: set[str] |
                 raise ApiError(413, "body_size", "That request is too large or empty.")
             try:
                 data = json.loads(self.rfile.read(n))
+            except TimeoutError:
+                self.close_connection = True
+                raise ApiError(408, "too_slow", "That request took too long to arrive.") from None
             except ValueError:
                 raise ApiError(400, "bad_json", "That is not valid JSON.") from None
             if not isinstance(data, dict):
@@ -180,14 +248,16 @@ def make_handler(api: Api, maker_key: str, quiet: bool = True, hosts: set[str] |
             return data
 
         def _maker(self):
+            """The right key always works, whatever else came from this address; only wrong keys count toward the limit."""
+            got = self.headers.get("X-Maker-Key") or ""
+            if hmac.compare_digest(got.encode("utf-8", "replace"), maker_key.encode()):
+                return
             who = self._who()
             if key_fails.full(who):
                 raise ApiError(429, "slow_down", "Too many wrong keys from here. Wait a minute.")
-            got = self.headers.get("X-Maker-Key") or ""
-            if not hmac.compare_digest(got.encode("utf-8", "replace"), maker_key.encode()):
-                key_fails.allow(who)
-                time.sleep(0.4)          # a wrong key costs time
-                raise ApiError(401, "maker_key", "The maker key is missing or wrong.")
+            key_fails.allow(who)
+            time.sleep(0.4)          # a wrong key costs time
+            raise ApiError(401, "maker_key", "The maker key is missing or wrong.")
 
         def _parts(self) -> list[str]:
             path = self.path.split("?", 1)[0].split("#", 1)[0]
@@ -251,9 +321,9 @@ def make_handler(api: Api, maker_key: str, quiet: bool = True, hosts: set[str] |
                     drop, action = self._drop_id(p[2]), p[3]
                     body = self._body()
                     if action == "join":
-                        if not joins.allow(self._who()) or not drop_joins.allow(drop):
-                            raise ApiError(429, "slow_down", "Too many joins right now. Wait a minute.")
-                        return self._json(200, {"ok": True, "data": api.join(drop, body.get("name"), body.get("card"), body.get("secret"))})
+                        who = self._who()
+                        data = api.join(drop, body.get("name"), body.get("card"), body.get("secret"), lambda: admit_join(who, drop))
+                        return self._json(200, {"ok": True, "data": data})
                     if action == "me":
                         return self._json(200, {"ok": True, "data": api.me(drop, body.get("buyer"), body.get("secret"))})
                     if action == "leave":
@@ -276,10 +346,15 @@ def serve(api: Api, maker_key: str, host: str = "127.0.0.1", port: int = 8780, q
           public_host: str | None = None, trust_proxy: bool = False) -> ThreadingHTTPServer:
     """Listen. The maker key must be at least MIN_MAKER_KEY characters. On this machine only (the default), a request must
     name this machine as its Host, which stops a web page elsewhere from reaching the server through DNS rebinding; with
-    `public_host` that name is accepted too. Listening on every address with no public host accepts any Host."""
+    `public_host` that name is accepted too. Listening on every address with no public host accepts any Host.
+
+    A request must arrive within REQUEST_DEADLINE in all, and one address may hold only MAX_CONNECTIONS_PER_ADDRESS connections.
+    With `trust_proxy` the client is the right-most X-Forwarded-For entry (the proxy must set it), and the per-address connection
+    cap is off, since every connection comes from the proxy: the proxy should buffer slow requests itself."""
     if not isinstance(maker_key, str) or len(maker_key) < MIN_MAKER_KEY:
         raise ValueError(f"the maker key must be at least {MIN_MAKER_KEY} characters")
-    httpd = CappedServer((host, port), make_handler(api, maker_key, quiet, None, trust_proxy))
+    httpd = CappedServer((host, port), make_handler(api, maker_key, quiet, None, trust_proxy),
+                         per_address=0 if trust_proxy else None)       # behind a proxy every client is the proxy: no per-address cap
     real = httpd.server_address[1]
     hosts = None
     if host in ("127.0.0.1", "localhost", "::1") or public_host:

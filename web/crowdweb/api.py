@@ -35,6 +35,7 @@ from .tokens import Tokens, well_formed
 # whose capture the sandbox is told to fail (for the agent's tests), so the page offers 0 to 7.
 WEB_CARDS = list(range(8))
 PUBLIC_STATES = {"live", "ended", "closed", "settling", "settled"}
+HOLDING = {"held", "captured", "capture_failed", "void_failed"}     # a buyer in one of these still has a hold (or a charge) on record
 MEDIA_TYPES = {"image/jpeg", "image/png", "image/webp"}
 
 # What PayPal said when settlement stopped, in words a maker can act on. The code is shown beside it, for searching.
@@ -110,6 +111,13 @@ MESSAGES = {
     "paypal_unavailable": (503, "PayPal did not answer. If a hold was placed it will be released, never charged. Try again in a minute."),
     "paypal_error": (502, "PayPal refused the request. Nothing was held."),
     "earlier_attempt_unresolved": (409, "An earlier try with this name is still being sorted out with PayPal. Try again in a minute."),
+    "join_in_progress": (409, "An earlier try with this name is still being sorted out with PayPal, so it cannot be used right now. "
+                              "Try again in a minute."),
+    "join_unconfirmed": (409, "Your earlier try may have placed a hold on your card, but it was never confirmed here, so this page "
+                              "cannot show or release it. Please do not join again. The maker can see the hold and can release it."),
+    "not_recorded": (503, "Your join could not be recorded, so the hold was released. Try again."),
+    "not_recorded_held": (503, "Your join could not be recorded, and we could not release the hold just now. The maker can see it "
+                               "and will release it. Please do not join again."),
     "hold_not_open": (409, "PayPal did not confirm the hold, so you are not in. Nothing will be charged. Try again."),
     "wrong_paypal": (409, "This drop belongs to another PayPal setup."),
     "drop_unbound": (409, "This drop belongs to another PayPal setup."),
@@ -126,6 +134,11 @@ MESSAGES = {
 def from_engine(e: Exception) -> ApiError:
     code = getattr(e, "code", "error")
     status, message = MESSAGES.get(code, (400, "That did not work."))
+    return ApiError(status, code, message)
+
+
+def _refusal(code: str) -> ApiError:
+    status, message = MESSAGES[code]
     return ApiError(status, code, message)
 
 
@@ -148,8 +161,8 @@ class Api:
         self.details = details or {}
         self._locks: dict[str, threading.Lock] = {}
         self._locks_guard = threading.Lock()
-        self.media = {str(i): (r["photo_file"], r["photo_type"])
-                      for i, r in enumerate(self.details.values()) if r.get("photo_file")}
+        self.media = {str(i): (r["photo_file"], r["photo_type"], title)       # key -> (file, type, the title it belongs to)
+                      for i, (title, r) in enumerate(self.details.items()) if r.get("photo_file")}
         self.tokens = Tokens(self.engine.store.path + ".web.db")
         self.togi_home = Path(togi_home or os.environ.get("TOGI_HOME") or Path.home() / ".togi").expanduser()
 
@@ -173,18 +186,31 @@ class Api:
         return {"paypal": self.mode, "maker_name": self.maker_name}
 
     def photo(self, key: str) -> tuple[bytes, str]:
-        if key not in self.media:
+        """A product photo, but only for a drop that is public: some published drop has the title the photo was written for."""
+        entry = self.media.get(key)
+        if entry is None or not self._published(entry[2]):
             raise ApiError(404, "not_found", "Nothing here.")
-        f, ctype = self.media[key]
+        f, ctype, _ = entry
         return Path(f).read_bytes(), ctype
 
+    def _published(self, title: str) -> bool:
+        for i in reversed(self.engine.store.drop_ids()):
+            try:
+                d = self.engine.get(i)
+            except (CrowdError, StoreError):
+                continue
+            if d.state != "draft" and d.title.strip().lower() == title:
+                return True
+        return False
+
     def _details(self, d) -> dict | None:
-        row = self.details.get(d.title.strip().lower())
+        title = d.title.strip().lower()
+        row = self.details.get(title)
         if not row:
             return None
         out = {k: row[k] for k in ("what", "ships") if row.get(k)}
-        for k, (f, _) in self.media.items():
-            if f == row.get("photo_file"):
+        for k, (_f, _ctype, t) in self.media.items():
+            if t == title:                                   # the photo written for THIS title, never another's with the same file
                 out["photo"] = f"/media/{k}"
         return out
 
@@ -270,9 +296,22 @@ class Api:
             raise ApiError(403, "not_yours", "This browser does not hold that join.")
         return b
 
-    def join(self, drop: str, name, card, secret) -> dict:
+    def join(self, drop: str, name, card, secret, admit=None) -> dict:
         """Hold the start price for a web buyer. `secret` is made by the browser before it asks, so asking again after a lost
-        reply hands back the same join instead of placing a second hold."""
+        reply hands back the same join instead of placing a second hold.
+
+        The rules that keep one join intent from becoming two holds, and a hold from being released by someone who did not place
+        it (tokens.py has the other half):
+          * A retry whose secret already proves the buyer's hold is handed back whatever state that hold is in now, before anything
+            else is looked at: never refused, never counted against a limit, never able to touch its own proof.
+          * `admit` (the server's rate limit) is asked only once the request is valid and is not such a hand-back, so junk cannot
+            use up a buyer's allowance and a retry can never be turned away by it.
+          * A buyer held with no proof is someone else's, unless this secret's own unbound claim sits on it: then an earlier try of
+            THIS secret may have placed that hold and died before it was bound. Nothing guesses (`join_unconfirmed`); the maker
+            sees the hold.
+          * Another secret cannot join a name while the engine has a join for it that PayPal may have acted on and nobody has
+            confirmed: it would be handed that earlier request's hold (`join_in_progress`).
+          * A drop that takes no joins is refused before any claim is written, and a refused join forgets only its own claim."""
         d = self._drop(drop)
         if not isinstance(card, int) or isinstance(card, bool) or card not in WEB_CARDS:
             raise ApiError(400, "bad_card", "Pick one of the test cards.")
@@ -283,33 +322,59 @@ class Api:
         with self._lock(d.id):
             d = self.engine.get(d.id)
             b = d.buyers.get(bid)
+            if b is not None and self.tokens.owns(d.id, bid, secret, d.created_at, b.auth_id):    # a retry of a join that went through
+                return {"buyer": bid, "me": self._mine(d, bid), "drop": self._public(d), "again": True}
+            if admit is not None:
+                admit()
+            mine = self.tokens.claimed(d.id, bid, secret, d.created_at)
             if b is not None and b.status == "held":
-                if self.tokens.owns(d.id, bid, secret, d.created_at, b.auth_id):     # a retry of a join that went through
-                    return {"buyer": bid, "me": self._mine(d, bid), "drop": self._public(d), "again": True}
-                raise ApiError(409, "already_joined", MESSAGES["already_joined"][1])
-            self.tokens.claim(d.id, bid, secret, d.created_at, self.engine.now().isoformat())
+                if mine:
+                    raise _refusal("join_unconfirmed")
+                raise _refusal("already_joined")
+            self._require_open(d)
+            if not mine and self._open_intent(d, bid):
+                raise _refusal("join_in_progress")
+            still_there = b.auth_id if b is not None and b.status in HOLDING else None
+            if not self.tokens.claim(d.id, bid, secret, d.created_at, self.engine.now().isoformat(), still_there):
+                raise _refusal("already_joined")
             try:
                 out = self.engine.join(d.id, name, card)
             except (CrowdError, StoreError, HoldError) as e:
                 err = from_engine(e)
-                if err.code not in ("paypal_unavailable", "earlier_attempt_unresolved"):   # refused outright: nothing is held
+                if not self._open_intent(self.engine.get(d.id), bid):     # refused outright: nothing is held, nothing to remember
                     self.tokens.drop_claim(d.id, bid, secret)
+                    err.extra["nothing_held"] = True
                 raise err from None
             try:
                 bound = self.tokens.bind(d.id, out["buyer"], secret, out["auth_id"])
             except Exception:  # noqa: BLE001 - a hold nobody on the web can prove is released at once
                 bound = False
             if not bound:
-                self._release(d.id, out["buyer"])
-                raise ApiError(503, "not_recorded", "Your join could not be recorded, so the hold was released. Try again.")
+                released = self._release(d.id, out["buyer"]) == "released"
+                raise _refusal("not_recorded" if released else "not_recorded_held")
             d = self.engine.get(d.id)
             return {"buyer": out["buyer"], "me": self._mine(d, out["buyer"]), "drop": self._public(d)}
 
-    def _release(self, drop: str, buyer: str) -> None:
+    @staticmethod
+    def _open_intent(d, bid: str) -> bool:
+        """Has the engine a join for this buyer that PayPal may have acted on and nobody has confirmed or released?"""
+        return any(j.get("buyer") == bid for j in d.unresolved.values())
+
+    def _require_open(self, d) -> None:
+        state = self.engine.display_state(d)
+        if state != "live":
+            raise _refusal("drop_ended" if state == "ended" else "drop_closed")
+
+    def _release(self, drop: str, buyer: str) -> str:
+        """Ask the engine to release a hold the web cannot prove: 'released', 'pending' (the leave is on record, PayPal has not
+        voided it yet) or 'refused'. Close and settle honour a recorded leave (D-11b); a refused one is the maker's to sort out."""
         try:
             self.engine.leave(drop, buyer)
-        except (CrowdError, StoreError, HoldError):
-            pass        # a leave the engine could not finish stays on record; close and settle honour it (D-11b)
+        except CrowdError as e:
+            return "pending" if e.code == "leave_pending" else "refused"
+        except (StoreError, HoldError):
+            return "refused"
+        return "released"
 
     def me(self, drop: str, buyer, secret) -> dict:
         d = self._drop(drop)

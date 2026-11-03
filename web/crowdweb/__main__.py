@@ -28,6 +28,7 @@ def main(argv=None) -> int:
                     help="JSON of product details per drop title (what you get, when it ships, a photo beside the file)")
     ap.add_argument("--verbose", action="store_true", help="log every request")
     a = ap.parse_args(argv)
+    made_here = not a.maker_key
     key = a.maker_key or secrets.token_urlsafe(18)
     try:
         api = Api(maker_name=a.maker_name, details=load_details(a.details))
@@ -44,7 +45,10 @@ def main(argv=None) -> int:
     print(f"Crowd Price on {base}  ({mode}; store: {api.engine.store.path})")
     for d in api.drops():
         print(f"  {d['state']:<9} {base}/d/{d['drop']}   {d['title']}")
-    print(f"  maker view: {base}/maker#key={key}")
+    if made_here:           # a key you set yourself is never printed again (logs, scrollback and screen shares keep what is printed)
+        print(f"  maker view: {base}/maker#key={key}")
+    else:
+        print(f"  maker view: {base}/maker   (open it, then enter your maker key)")
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
