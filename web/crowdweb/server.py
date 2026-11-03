@@ -43,8 +43,9 @@ MAX_BODY = 4096
 JOINS_PER_MINUTE = 12          # per client address: holds are real sandbox calls, so a page cannot be used to flood them
 JOINS_PER_DROP_MINUTE = 120    # per drop, whoever asks: the ceiling still holds behind a proxy that hides addresses
 MAX_CONNECTIONS = 64           # open connections at once; a client that opens many slow ones cannot exhaust the threads
-MAX_CONNECTIONS_PER_ADDRESS = 16   # of those, one address's share until its request is being served, which for a join or leave is
-                                   # when it wins the drop's turn: waiting in the queue costs a slot (off behind --trust-proxy)
+MAX_CONNECTIONS_PER_ADDRESS = 16   # of those, one address's share, counted from the moment a connection is accepted until its response has
+                                   # been written (off behind --trust-proxy). A join or leave that has won its drop's turn is the one
+                                   # exemption: from then on it is the server's own slow PayPal call, not the client's doing
 READ_TIMEOUT = 10              # seconds a connection may sit without sending anything
 REQUEST_DEADLINE = 15          # seconds for a whole request to arrive, however slowly (READ_TIMEOUT alone is reset by every byte)
 MIN_MAKER_KEY = 16
@@ -83,18 +84,22 @@ class RateLimit:
 
 class CappedServer(ThreadingHTTPServer):
     """A threading server that turns a connection away (closes it) when MAX_CONNECTIONS are already being served, or when one
-    address already has `per_address` requests that are not yet being served (0: no per-address cap). A connection counts toward its
-    address until the server starts on it (`arrived`): a request still arriving, and a join or leave still waiting for the drop's
-    turn. A queue is made of connections too, and every one of them is a slot of the MAX_CONNECTIONS everyone shares: if waiting were
-    free, one address could fill the queue behind one slow PayPal call and shut every other visitor, and the maker, out. Once a
-    request has the turn it is the server's own work (a slow PayPal call) and no longer counts to its address. Together with the
-    request deadline and the wait limit, a few clients can neither keep every slot nor keep one for long."""
+    address already has `per_address` connections in progress (0: no per-address cap). A connection counts toward its address from the
+    moment it is accepted until its response has been written (`process_request_thread` ends it), whatever it asks for: a request still arriving, a read of
+    a drop with a long log that takes seconds to build, and a join or leave still waiting for the drop's turn. Every one of them holds
+    a thread and one of the MAX_CONNECTIONS slots everyone shares; if any of them were free to the address that opened it, one address
+    could fill every slot with plain GETs and shut every other visitor, and the maker, out. The one exemption is a join or leave that
+    has won the drop's turn (`arrived`): from there it is the server's own work (a slow PayPal call, which the drop's lock already
+    serialises), and no longer counts to its address. Together with the request deadline and the wait limit, a few clients can neither
+    keep every slot nor keep one for long. One address is one share: visitors who reach this server through one address (a tunnel, a
+    proxy without --trust-proxy) are one client to it, and a proxy has to cap its own clients (SECURITY.md)."""
     daemon_threads = True
+    request_queue_size = 128          # connections the system holds for accept(): a flood from one address must not make others' wait in the SYN queue
 
     def __init__(self, *a, per_address: int | None = None, **kw):
         self._slots = threading.BoundedSemaphore(MAX_CONNECTIONS)
         self._per_address = MAX_CONNECTIONS_PER_ADDRESS if per_address is None else per_address
-        self._arriving: dict[int, str] = {}         # id(connection) -> address, while its request is still arriving
+        self._arriving: dict[int, str] = {}         # id(connection) -> address, while it counts toward the address
         self._open: dict[str, int] = {}             # address -> how many of its connections are in that state
         self._open_lock = threading.Lock()
         super().__init__(*a, **kw)
@@ -127,7 +132,8 @@ class CappedServer(ThreadingHTTPServer):
             self._slots.release()
 
     def arrived(self, request) -> None:
-        """This connection's request has been read in full (or it is over): its address no longer pays for it."""
+        """This connection no longer counts toward its address: a join or leave has won the drop's turn, or the connection is over
+        (`process_request_thread` always calls this last). Safe to call twice."""
         with self._open_lock:
             who = self._arriving.pop(id(request), None)
             if who is None:
@@ -255,9 +261,9 @@ def make_handler(api: Api, maker_key: str, quiet: bool = True, hosts: set[str] |
 
         # ---- requests
         def _arrived(self):
-            """The server has started on this request: from here on its work (a slow PayPal call) is the server's own, not the
-            client's doing, and does not count against its address's share of connections. A GET, a `me` and anything refused is
-            started as soon as it has been read; a join or leave only when it wins the drop's turn (api.py calls this then)."""
+            """A join or leave has won the drop's turn: from here its work (a slow PayPal call) is the server's own, not the client's
+            doing, and does not count against its address's share of connections. Everything else counts until its response has been
+            written (CappedServer): a plain GET on a drop with a long log is as much work, and as much of a slot, as any."""
             done = getattr(self.server, "arrived", None)
             if done is not None:
                 done(self.request)
@@ -304,17 +310,14 @@ def make_handler(api: Api, maker_key: str, quiet: bool = True, hosts: set[str] |
             return s
 
         def _refuse_method(self):
-            self._arrived()
             self._error(ApiError(405, "method", "Not here."))
 
         do_PUT = do_DELETE = do_PATCH = do_OPTIONS = _refuse_method
 
         def do_HEAD(self):
-            self._arrived()
             self._headers(405, "application/json; charset=utf-8", 0)
 
         def do_GET(self):
-            self._arrived()
             if not self._host_ok():
                 return self._error(ApiError(421, "host", "Unknown host."))
             p = self._parts()
@@ -352,10 +355,7 @@ def make_handler(api: Api, maker_key: str, quiet: bool = True, hosts: set[str] |
 
         def do_POST(self):
             p = self._parts()
-            if not (len(p) == 4 and p[:2] == ["api", "drops"]):         # only these read a body; the others are read in full already
-                self._arrived()
             if not self._host_ok():
-                self._arrived()
                 return self._error(ApiError(421, "host", "Unknown host."))
             try:
                 if len(p) == 4 and p[:2] == ["api", "drops"]:
@@ -366,7 +366,6 @@ def make_handler(api: Api, maker_key: str, quiet: bool = True, hosts: set[str] |
                         return self._json(200, {"ok": True, "data": data})
                     if action == "leave":
                         return self._json(200, {"ok": True, "data": api.leave(drop, body.get("buyer"), body.get("secret"), self._arrived)})
-                    self._arrived()
                     if action == "me":
                         return self._json(200, {"ok": True, "data": api.me(drop, body.get("buyer"), body.get("secret"))})
                 if len(p) == 5 and p[:3] == ["api", "maker", "drops"] and p[4] in ("verify", "tieout"):
@@ -389,11 +388,12 @@ def serve(api: Api, maker_key: str, host: str = "127.0.0.1", port: int = 8780, q
     name this machine as its Host, which stops a web page elsewhere from reaching the server through DNS rebinding; with
     `public_host` that name is accepted too. Listening on every address with no public host accepts any Host.
 
-    A request must arrive within REQUEST_DEADLINE in all, and one address may hold only MAX_CONNECTIONS_PER_ADDRESS connections that are
-    not yet being served: that includes a join or leave waiting for its drop's turn, which also stops waiting after api.LOCK_WAIT.
-    A leave is checked against its browser's secret, and a join against the join limit, BEFORE it waits, so neither can queue up nothing.
-    With `trust_proxy` the client is the right-most X-Forwarded-For entry (the proxy must set it), and the per-address connection
-    cap is off, since every connection comes from the proxy: the proxy should buffer slow requests itself."""
+    A request must arrive within REQUEST_DEADLINE in all, and one address may hold only MAX_CONNECTIONS_PER_ADDRESS connections at once,
+    from accept until the response is written, whatever they ask for (a join or leave that has won its drop's turn is the one exemption,
+    and a wait for that turn stops after api.LOCK_WAIT). A leave is checked against its browser's secret, and a join against the join
+    limit, BEFORE it waits, so neither can queue up nothing. With `trust_proxy` the client is the right-most X-Forwarded-For entry (the
+    proxy must set it), and the per-address connection cap is off, since every connection comes from the proxy: the proxy should
+    buffer slow requests and cap its own clients (SECURITY.md)."""
     if not isinstance(maker_key, str) or len(maker_key) < MIN_MAKER_KEY:
         raise ValueError(f"the maker key must be at least {MIN_MAKER_KEY} characters")
     httpd = CappedServer((host, port), make_handler(api, maker_key, quiet, None, trust_proxy),

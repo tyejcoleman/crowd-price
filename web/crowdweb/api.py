@@ -29,7 +29,7 @@ from crowd.engine import CrowdError, Engine, m
 from crowd.paypal_holds import HoldError, TEST_CARDS
 from crowd.store import StoreError, iso, parse_iso, slug
 
-from .feed import display_name, feed, may_be_open
+from .feed import display_name, feed, how_released, may_be_open
 from .tokens import Tokens, digest, well_formed
 
 # The cards a web buyer may pick: sandbox test numbers, never a real card. Index 8 repeats index 0, and index 9 is the card
@@ -41,6 +41,7 @@ LOCK_WAIT = 10        # seconds a join or leave waits for the drop's turn (a slo
 CLAIM_WINDOW = 10     # seconds: a join the engine stamped this soon after a claim was written is that claim's own; a later one is not
 CLAIM_SLACK = 1       # ... and one stamped this much BEFORE the claim (clocks, millisecond rounding) still is
 MEDIA_TYPES = {"image/jpeg", "image/png", "image/webp"}
+FATE_STATUSES = ("left", "voided", "excluded")     # the buyer states whose words depend on what became of the hold (see `_fate`)
 
 # What PayPal said when settlement stopped, in words a maker can act on. The code is shown beside it, for searching.
 ISSUES = {
@@ -154,6 +155,47 @@ def _refusal(code: str, message: str | None = None, **extra) -> ApiError:
 # A drop that takes no joins, said to a buyer whose earlier try (this secret's claim) may still hold something at PayPal. Closing
 # the drop releases every join nobody confirmed (D-11), so this is a promise the engine keeps.
 UNSURE_CLOSED = "Joining has closed. If a hold was placed it will be released, and you will not be charged."
+
+
+# An engine refusal that says "nothing was held", said to a page whose claim was NOT forgotten: the engine's log cannot show that, so
+# the words must not either (a hold the claim's own earlier try placed may be open, or the engine could not be read).
+UNSURE_REFUSED = ("That try did not go through, but this page cannot tell whether an earlier try placed a hold. Please do not join again "
+                  "under another name; this page keeps checking, and the maker can see any hold.")
+NOTHING_WAS_HELD = {"join_declined", "hold_not_open", "paypal_error"}
+
+
+def _ends(events: list[dict]) -> dict:
+    """(buyer, auth_id) -> (event type, payload) of the LAST event that says what became of that hold: released (`hold_voided`,
+    `failed_hold_released`) or refused by PayPal (`void_failed`, not an orphan's). A hold is the pair, not the buyer: a buyer who
+    left, joined again and left again has had two."""
+    out = {}
+    for e in events:
+        p = e["payload"]
+        if e["type"] in ("hold_voided", "failed_hold_released") or (e["type"] == "void_failed" and not p.get("orphan")):
+            if p.get("buyer") and p.get("auth_id"):
+                out[(p["buyer"], p["auth_id"])] = (e["type"], p)
+    return out
+
+
+def _fate(b, ends: dict) -> str | None:
+    """What became of a buyer's current hold, for a buyer who is out of the crowd, as the engine's log says it (never guessed):
+      released        released at PayPal (a leave, or the maker taking the buyer out, went through)
+      not_released    PayPal REFUSED to release it (`void_failed`): it may still be open on the buyer's card
+      missed_minimum  released because the drop missed its minimum
+      lapsed          ran out at PayPal
+      gone            PayPal no longer shows it (voided elsewhere, or unknown to it)
+      taken_outside   money was taken from it outside the engine (the maker can refund it)
+    None: out of the crowd with no word on the hold. Only `left`, `voided` and `excluded` buyers have a fate; a buyer who left
+    and the log does not say otherwise was released."""
+    if b.status not in FATE_STATUSES:
+        return None
+    end = ends.get((b.id, b.auth_id)) if b.auth_id else None
+    if end is None:
+        return "released" if b.status == "left" else None
+    kind, p = end
+    if kind == "void_failed":
+        return "not_released"
+    return how_released(p, kind)
 
 
 def _card_label(i) -> str | None:
@@ -318,7 +360,16 @@ class Api:
                 "held": m(b.hold_amount) if b.status == "held" and b.hold_amount is not None else None,
                 "charged": m(b.captured) if b.captured is not None else None, "saved": saved,
                 "start_price": m(d.ladder.start_price), "can_leave": live and b.status == "held",
-                "leaving": b.id in d.leaving}
+                "leaving": b.id in d.leaving, "fate": self._fate_of(d, b)}
+
+    def _fate_of(self, d, b) -> str | None:
+        """`_fate` for one buyer's page. The log is read only for a buyer whose words depend on it: a buyer who left and whose release
+        the engine never saw refused needs no look."""
+        if b.status == "left" and not b.void_failed:
+            return "released"
+        if b.status not in FATE_STATUSES:
+            return None
+        return _fate(b, _ends(self.engine.store.events(d.id)))
 
     def _owned(self, d, buyer, secret):
         b = d.buyers.get(buyer) if isinstance(buyer, str) else None
@@ -354,7 +405,8 @@ class Api:
           * The engine is read again just before it is asked (after the claim is written), and the join is not started if anything
             about the buyer moved; after it answers, a hold that someone else also asked the engine for is not bound.
         A refusal that shows this secret holds nothing says so (`nothing_held`), so the page can let go of the secret; one that cannot
-        (this secret's attempt is open, or placed a hold) does not."""
+        (this secret's attempt is open, or placed a hold) does not, and the page lets go of the secret only on that mark (or on input
+        refused before any claim was written; drop.js): a refusal that keeps the claim never promises that nothing is held."""
         d = self._drop(drop)
         if not isinstance(card, int) or isinstance(card, bool) or card not in WEB_CARDS:
             raise ApiError(400, "bad_card", "Pick one of the test cards.")
@@ -436,6 +488,8 @@ class Api:
                 err = from_engine(e)
                 if self._forget_untraced(d.id, bid, secret, mark, fresh):          # refused outright: nothing is held, nothing to remember
                     err.extra["nothing_held"] = True
+                elif err.code in NOTHING_WAS_HELD:                                 # the claim stays: the log does not show nothing is held
+                    err.message = UNSURE_REFUSED
                 raise err from None
             except Exception:  # noqa: BLE001 - a crash the engine did not name: forget the claim only if the engine never heard of the try
                 self._forget_untraced(d.id, bid, secret, mark, fresh)
@@ -452,7 +506,7 @@ class Api:
                 bound = False
             if not bound:
                 released = self._release(d.id, out["buyer"]) == "released"
-                raise _refusal("not_recorded" if released else "not_recorded_held")
+                raise _refusal("not_recorded", nothing_held=True) if released else _refusal("not_recorded_held")
             d = self.engine.get(d.id)
             return {"buyer": out["buyer"], "me": self._mine(d, out["buyer"]), "drop": self._public(d)}
 
@@ -653,10 +707,12 @@ class Api:
         events = self.engine.store.events(d.id)
         unsure = self._unconfirmed_web_joins(d, events)        # a web join whose hold was never bound to its browser: only the maker can see it
         failed = {e["payload"].get("buyer"): e["payload"] for e in events if e["type"] == "hold_failed"}    # what each buyer's last failure was
+        ends = _ends(events)
         out["buyers_list"] = [{"name": display_name(r["name"]) + (" (unconfirmed web join)" if r["buyer"] in unsure else ""),
                                "status": r["status"], "held": r["held"], "charged": r["charged"], "card": _card_label(r["card"]),
                                "error": r["error"],      # the engine's own code for a failure, so the maker is not told "declined" for what is not
                                "hold_may_be_open": r["status"] == "hold_failed" and may_be_open(failed.get(r["buyer"]) or {}),
+                               "fate": _fate(d.buyers[r["buyer"]], ends),     # what became of the hold of a buyer who is out (see `_fate`)
                                "unconfirmed_web_join": r["buyer"] in unsure} for r in rows]
         out["simulated"] = sum(1 for r in rows if display_name(r["name"]) != r["name"])
         counts: dict = {}

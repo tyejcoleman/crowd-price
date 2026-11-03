@@ -22,13 +22,14 @@
   const s = { drop: null, me: null, mySecret: null, cards: [], busy: false, error: null, clock: null, lastPrice: null, lastLadder: "",
               lastCard: "", confirmLeave: false, copied: false, form: { name: "", card: 0 }, gone: false, tries: 0, retryAt: 0, joining: false, note: null };
 
-  // What a join's refusal can prove. Only these answers, and any answer the server marks `nothing_held`, show that NOTHING was held
-  // under this secret, so only they let the page forget it. Every other answer (too many requests, busy, a server error, no answer at
-  // all, PayPal trouble, a join still being sorted out, one that could not be confirmed, a drop that closed beside a join that may
-  // still hold something) keeps the secret and asks again: the first ask may have placed a hold whose answer was lost, and a new
-  // secret under another name would place a second one. A closed drop is NOT on this list: the server says when it is safe.
-  const NOTHING_HELD = new Set(["bad_card", "bad_buyer", "bad_secret", "join_declined", "hold_not_open",
-    "drop_not_found", "drop_not_published", "wrong_paypal", "drop_unbound", "not_recorded", "join_over", "join_stale"]);
+  // What a join's refusal can prove. The server decides: an answer that carries `nothing_held` says it looked and this secret holds nothing.
+  // The page lets go of the secret on that, and on these few answers about a request that never got as far as a claim (bad input, a drop
+  // that does not exist), and on nothing else. Not on "declined" or "PayPal did not confirm the hold" without the mark: the server keeps
+  // the claim when the engine's log shows an earlier try of this secret may have placed a hold (it can even be open after "not confirmed"),
+  // and a new secret under another name would place a second one. Every other answer (too many requests, busy, a server error, no answer
+  // at all, PayPal trouble, a join still being sorted out, one that could not be confirmed, a drop that closed beside a join that may
+  // still hold something) keeps the secret and asks again. A closed drop is NOT on this list: the server says when it is safe.
+  const NO_CLAIM = new Set(["bad_card", "bad_buyer", "bad_secret", "drop_not_found", "drop_not_published"]);
   // Only for the very first ask, which no earlier ask of this secret can have preceded: "taken" then means taken by someone else.
   const ONLY_IF_FIRST = new Set(["already_joined", "buyer_excluded", "join_in_progress"]);
   // Answers that will not change in seconds: the page asks again about once a minute, not every few seconds.
@@ -84,7 +85,7 @@
       s.me = r.me; s.mySecret = mine.secret; s.drop = r.drop; s.error = null; s.tries = 0; s.note = null;
     } catch (e) {
       s.note = null;
-      if (NOTHING_HELD.has(e.code) || e.nothing_held === true || (first && ONLY_IF_FIRST.has(e.code))) {
+      if (NO_CLAIM.has(e.code) || e.nothing_held === true || (first && ONLY_IF_FIRST.has(e.code))) {
         if (forget(mine.secret)) { s.tries = 0; s.error = e.message; }   // an answer about a secret that is no longer the stored one is not this page's to show
       } else if (SLOW.has(e.code) && s.drop && s.drop.state === "settled") {
         // The drop is settled: nothing about this answer can change now, so the page says it once and stops asking.
@@ -278,11 +279,31 @@
         el("p", { text: me.saved ? `${money(me.saved)} less than the ${money(me.start_price)} you held. The rest of your hold was released.`
                                  : `The rest of your ${money(me.start_price)} hold was released.` }), others(d));
     } else if (me.status === "left") {
-      out.push(big("You left"), el("p", { text: `Your ${money(me.start_price)} hold was released. You pay nothing.` }));
-      if (d.joinable) out.push(el("button", { class: "btn quiet", onclick: () => { forget(s.mySecret); s.me = null; s.mySecret = null; render(); }, text: "Join again" }));
-    } else if (me.status === "voided") {
-      out.push(big("You paid nothing"),
-        el("p", { text: "The drop missed its minimum, so your hold was released. The pending charge drops off your card; when depends on your bank." }), others(d));
+      if (me.fate === "not_released") {      // the leave stands, but PayPal refused to release the hold: say so, and offer no second hold
+        out.push(big("You left"),
+          el("p", { text: `PayPal has not released your ${money(me.start_price)} hold. You will not be charged. The maker can see it and will sort it out. Until it is released it can still show as pending on your card.` }));
+      } else {
+        out.push(big("You left"), el("p", { text: `Your ${money(me.start_price)} hold was released. You pay nothing.` }));
+        if (d.joinable) out.push(el("button", { class: "btn quiet", onclick: () => { forget(s.mySecret); s.me = null; s.mySecret = null; render(); }, text: "Join again" }));
+      }
+    } else if (me.status === "voided") {      // out of the crowd with the hold gone: what the server's log says became of it
+      const [title, text] = {
+        missed_minimum: ["You paid nothing", "The drop missed its minimum, so your hold was released. The pending charge drops off your card; when depends on your bank."],
+        lapsed: ["You paid nothing", "Your hold ran out at PayPal before this drop settled, so you are not in it. Nothing was charged."],
+        gone: ["You paid nothing", "PayPal no longer shows your hold, so you are not in this drop. Nothing was charged."],
+        taken_outside: ["Your hold was charged outside this drop", "PayPal shows money was taken from your hold by something other than this drop, so you are not in it. The maker can see the charge and can refund it."],
+        released: ["You paid nothing", "Your hold was released, so you are not in this drop. Nothing was charged."],
+      }[me.fate] || ["You are out of this drop", "Your hold is no longer part of this drop. The maker can see what became of it."];
+      out.push(big(title), el("p", { text }), others(d));
+    } else if (me.status === "excluded") {     // the maker took this buyer out of the drop
+      const text = {
+        not_released: "PayPal has not released your hold yet. You will not be charged for this drop. The maker can see it and will sort it out.",
+        taken_outside: "PayPal shows money was taken from your hold by something other than this drop. The maker can see the charge and can refund it.",
+        released: `Your ${money(me.start_price)} hold was released. You pay nothing.`,
+        lapsed: `Your ${money(me.start_price)} hold is no longer open. You pay nothing.`,
+        gone: `Your ${money(me.start_price)} hold is no longer open. You pay nothing.`,
+      }[me.fate] || "The maker can see what became of your hold.";
+      out.push(big("You were taken out of this drop"), el("p", { text }), others(d));
     } else {
       out.push(big("Something needs the maker"),
         el("p", { text: "Your card could not be charged or released as planned. The maker sees it and will sort it out. You are never charged more than the final price." }));

@@ -1082,10 +1082,12 @@ def test_the_page_keeps_its_secret_on_every_answer_that_does_not_prove_nothing_w
 
 
 @needs_node
-@pytest.mark.parametrize("answer", [err("bad_card"), err("bad_buyer"), err("join_declined"), err("hold_not_open"), err("not_recorded"),
+@pytest.mark.parametrize("answer", [err("bad_card"), err("bad_buyer"),           # (refused before any claim exists: nothing can be held)
+                                    err("join_declined", nothing_held=True), err("hold_not_open", nothing_held=True),
+                                    err("not_recorded", nothing_held=True), err("wrong_paypal", nothing_held=True),
                                     err("paypal_error", nothing_held=True), err("drop_closed", nothing_held=True),
                                     err("drop_ended", nothing_held=True), err("already_joined", nothing_held=True),
-                                    err("join_stale", nothing_held=True)])
+                                    err("join_stale", nothing_held=True), err("join_over", nothing_held=True)])
 def test_the_page_forgets_its_secret_only_when_nothing_was_held(tmp_path, answer):
     out = drop_js(tmp_path, store=PENDING, join=[answer], steps=[["tick"]])
     assert out["trace"][-1]["store"] is None
@@ -1843,7 +1845,7 @@ def test_r4_the_page_says_what_the_server_says_about_a_hold_that_may_be_open(tmp
 @needs_node
 def test_r4_a_join_that_is_over_lets_the_page_go_and_say_so(tmp_path):
     words = "Your earlier try is over, and nothing is held on your card now. If you still want in, join again."
-    out = drop_js(tmp_path, store=PENDING, join=[err("join_over", words)], steps=[["tick"]])
+    out = drop_js(tmp_path, store=PENDING, join=[err("join_over", words, nothing_held=True)], steps=[["tick"]])      # (the server marks it)
     assert out["trace"][-1]["store"] is None and words in out["trace"][-1]["said"]
 
 
@@ -1922,3 +1924,377 @@ def test_r4_a_claim_never_overwrites_an_unbound_claim_while_a_hold_is_on_record_
     assert t.claim("d1", "ada", sec("b"), "c1", "now", hold_auth_id="AUTH1", attempt=2) is False
     assert t.own("d1", "ada", sec("a")) is not None and not t.retired("d1", sec("a"), "c1")
     assert t.claim("d1", "ada", sec("a"), "c1", "again", hold_auth_id="AUTH1", attempt=1) is True      # its own, rewritten: fine
+
+
+# ---- round 5: what became of a hold is said as the log says it; the page forgets only what the server says is nothing; a read is a slot ----
+#
+# The refuter's probes (scratchpad r5/probes) are the originals of these: pa (F1), ph (F2), pb (F3), pc (F4), flood/legit/mkbig (F8).
+
+HELD_ME = {"buyer": "alex", "name": "Alex", "status": "held", "card": "Test card ending 4444", "held": None, "charged": None, "saved": None,
+           "start_price": "40.00", "can_leave": False, "leaving": False}
+HELD_REC = {"buyer": "alex", "secret": SECRET_A}
+
+
+def page_says(tmp_path, **me) -> str:
+    """What the buyer's page draws for a `me` the server answered with these fields."""
+    out = drop_js(tmp_path, store=HELD_REC, me=[{"ok": {"me": {**HELD_ME, **me}}}], steps=[["tick"]])
+    return " | ".join(out["trace"][-1]["said"])
+
+
+def refused_leave_then_close(api, engine, fake, drop, who="Alex", tag="a"):
+    """A web buyer leaves while PayPal refuses the void (D-11b: the leave stands, pending); close retries and PayPal refuses again."""
+    api.join(drop, who, 0, sec(tag))
+    fake.refuse("void", "UNPROCESSABLE_ENTITY", times=None)
+    assert api.leave(drop, who.lower(), sec(tag))["pending"] is True
+    sim(engine, drop, 3)
+    engine.close(drop)
+
+
+# F1: a buyer who left but whose hold PayPal would not release is not told it was released
+
+def test_r5_f1_a_leave_paypal_would_not_release_reaches_the_buyer_and_the_maker(api, engine, fake, drop):
+    refused_leave_then_close(api, engine, fake, drop)
+    b = engine.get(drop).buyers["alex"]
+    assert b.status == "left" and b.void_failed and len(open_auths(fake)) == 4          # the engine knows: left, and the hold is still open
+    me = api.me(drop, "alex", sec("a"))["me"]
+    assert (me["status"], me["fate"]) == ("left", "not_released")
+    row = next(r for r in api.maker(drop)["buyers_list"] if r["name"] == "Alex")
+    assert (row["status"], row["fate"]) == ("left", "not_released")
+    mine = [f["text"] for f in api.maker(drop)["feed"] if f["who"] == "Alex"]
+    assert mine == ["left. PayPal would not release the hold"]                         # one line, never "Hold released" and then "would not"
+
+
+def test_r5_f1_a_leave_that_went_through_is_released(api, engine, fake, drop):
+    api.join(drop, "Alex", 0, sec("a"))
+    assert api.leave(drop, "alex", sec("a"))["released"] == "40.00"
+    assert api.me(drop, "alex", sec("a"))["me"]["fate"] == "released"
+    assert api.maker(drop)["buyers_list"][0]["fate"] == "released"
+    assert [f["text"] for f in api.maker(drop)["feed"] if f["who"] == "Alex"][:1] == ["left. Hold released"]
+
+
+def test_r5_f1_a_refused_leave_of_an_earlier_hold_says_nothing_about_a_later_one(api, engine, fake, drop):
+    api.join(drop, "Alex", 0, sec("a"))
+    fake.refuse("void", "UNPROCESSABLE_ENTITY", times=2)                               # the leave, and the retry that completes it
+    assert api.leave(drop, "alex", sec("a"))["pending"] is True
+    engine.reconcile(drop)                                                             # the leave stands; the hold stays open at PayPal
+    b = engine.get(drop).buyers["alex"]
+    assert b.status == "left" and b.void_failed
+    assert api.join(drop, "Alex", 0, sec("b"))["me"]["status"] == "held"               # joins again (a second hold), then leaves cleanly
+    assert len(open_auths(fake)) == 2                                                  # (SECURITY.md: the first is still open beside it)
+    assert api.leave(drop, "alex", sec("b"))["released"] == "40.00"
+    assert engine.get(drop).buyers["alex"].void_failed                                 # (the engine's flag is about the buyer, and stays set)
+    assert api.me(drop, "alex", sec("b"))["me"]["fate"] == "released"                  # the fate is about THIS hold
+    assert [r["fate"] for r in api.maker(drop)["buyers_list"]] == ["released"]
+
+
+@needs_node
+def test_r5_f1_the_page_does_not_say_released_for_a_hold_paypal_would_not_release(tmp_path):
+    said = page_says(tmp_path, status="left", fate="not_released")
+    assert "You left" in said and "has not released your $40.00 hold" in said and "You will not be charged" in said
+    assert "maker can see it" in said
+    assert "was released" not in said and "Join again" not in said                    # and no button to hold the card a second time
+    said = page_says(tmp_path, status="left", fate="released")
+    assert "Your $40.00 hold was released. You pay nothing." in said and "Join again" in said
+
+
+@needs_node
+def test_r5_f1_the_maker_sees_a_leave_whose_hold_is_still_open_as_a_problem(api, engine, fake, drop, tmp_path):
+    refused_leave_then_close(api, engine, fake, drop)
+    shown = maker_js(tmp_path, api.maker(drop))
+    said = {r[0]: " ".join(r[1:]) for r in shown["rows"]}
+    assert said["Alex"] == "left, hold not released"
+    assert "1 left, hold not released" in shown["counts"][0]
+
+
+# F2: the page forgets its secret only when the server says nothing was held
+
+def test_r5_f2_a_hold_taken_outside_the_engine_keeps_the_claim_and_does_not_promise_nothing_is_charged(api, engine, fake, drop, clock):
+    fake.lose_reply("authorize")
+    with pytest.raises(ApiError) as e:
+        api.join(drop, "Alex", 0, sec("w"))
+    assert e.value.code == "paypal_unavailable"
+    h1 = open_auths(fake)[0]
+    fake.capture(h1, "40.00", "outside-capture-1")                                      # somebody charges the hold before the page asks again
+    clock.advance(seconds=4)
+    with pytest.raises(ApiError) as e:
+        api.join(drop, "Alex", 0, sec("w"))
+    assert e.value.code == "hold_not_open" and "nothing_held" not in e.value.extra     # the server kept the claim ...
+    assert api.tokens.row(drop, "alex") is not None
+    assert "Nothing will be charged" not in e.value.message and "you are not in" not in e.value.message    # ... and does not say it is nothing
+    with pytest.raises(ApiError) as e:
+        api.join(drop, "Alex", 0, sec("w"))
+    assert e.value.code == "release_stuck"                                              # what the page learns if it still has the secret
+
+
+def test_r5_f2_a_decline_the_server_forgot_the_claim_for_says_nothing_was_held(api, engine, fake, drop):
+    fake.decline_next_authorize()
+    with pytest.raises(ApiError) as e:
+        api.join(drop, "Dee", 0, sec("d"))
+    assert e.value.code == "join_declined" and e.value.extra["nothing_held"] is True
+    assert "nothing was held" in e.value.message and api.tokens.row(drop, "dee") is None
+
+
+@pytest.mark.parametrize("how", ["decline", "refuse"])
+def test_r5_f2_a_refusal_made_while_the_claim_stays_does_not_say_nothing_was_held(api, engine, fake, drop, monkeypatch, how):
+    monkeypatch.setattr(api, "_forget_untraced", lambda *a, **k: False)       # the claim stays (the log shows an earlier try may hold something)
+    if how == "decline":
+        fake.decline_next_authorize()
+    else:
+        fake.refuse("authorize", "UNPROCESSABLE_ENTITY")
+    with pytest.raises(ApiError) as e:
+        api.join(drop, "Dee", 0, sec("d"))
+    assert e.value.code in ("join_declined", "paypal_error") and "nothing_held" not in e.value.extra
+    assert "nothing was held" not in e.value.message.lower() and "do not join again" in e.value.message
+
+
+@needs_node
+@pytest.mark.parametrize("code", ["hold_not_open", "join_declined", "not_recorded", "wrong_paypal", "drop_unbound", "paypal_error"])
+def test_r5_f2_the_page_keeps_its_secret_when_the_server_did_not_say_nothing_was_held(tmp_path, code):
+    out = drop_js(tmp_path, store=PENDING, join=[err(code, "PayPal did not confirm the hold, so you are not in. Nothing will be charged.")],
+                  steps=[["tick"]])
+    last = out["trace"][-1]
+    assert last["store"] == PENDING                                                     # the same secret, still pending
+    said = " ".join(last["said"])
+    assert "Join the drop" not in said and "Nothing will be charged" not in said      # no form for another name, no promise it cannot keep
+
+
+@needs_node
+def test_r5_f2_after_a_hold_not_open_the_page_asks_again_with_the_same_secret_and_hears_the_truth(tmp_path):
+    stuck = "Your earlier try may have left a hold on your card that PayPal would not release or describe as planned."
+    out = drop_js(tmp_path, store=PENDING, join=[err("hold_not_open"), err("release_stuck", stuck)],
+                  steps=[["tick"], ["advance", 4000], ["tick"]])
+    joins = [c["body"] for c in out["calls"] if c["act"] == "join"]
+    assert len(joins) == 2 and all(b["secret"] == SECRET_A for b in joins)
+    assert out["trace"][-1]["store"] == PENDING and stuck in " ".join(out["trace"][-1]["said"])
+
+
+# F3: "the drop missed its minimum" is said only when it did
+
+@pytest.fixture
+def funded_with_two_holds_gone(api, engine, fake, drop):
+    """A funded drop. Alex's hold is captured at PayPal outside the engine; Bo's hold lapses. Close records both as voided."""
+    api.join(drop, "Alex", 0, sec("a"))
+    api.join(drop, "Bo", 1, sec("b"))
+    sim(engine, drop, 4)
+    fake.capture(engine.get(drop).buyers["alex"].auth_id, "40.00", "outside-capture-1")
+    fake.expire(engine.get(drop).buyers["bo"].auth_id)
+    engine.close(drop)
+    charge(engine, drop)
+    assert engine.get(drop).settled["outcome"] == "funded"
+    return drop
+
+
+def test_r5_f3_a_hold_captured_outside_or_lapsed_on_a_funded_drop_is_not_a_missed_minimum(api, funded_with_two_holds_gone):
+    drop = funded_with_two_holds_gone
+    assert [api.me(drop, w, sec(t))["me"]["fate"] for w, t in (("alex", "a"), ("bo", "b"))] == ["taken_outside", "lapsed"]
+    rows = {r["name"]: r for r in api.maker(drop)["buyers_list"]}
+    assert (rows["Alex"]["status"], rows["Alex"]["fate"]) == ("voided", "taken_outside")
+    assert (rows["Bo"]["status"], rows["Bo"]["fate"]) == ("voided", "lapsed")
+    said = {f["who"]: f["text"] for f in api.maker(drop)["feed"] if f["who"] in ("Alex", "Bo")}
+    assert "charged outside the drop" in said["Alex"] and "released" not in said["Alex"].replace("not released", "")
+    assert "ran out" in said["Bo"]
+    assert not any(f["text"].endswith("holds released") or f["text"] == "hold released" for f in api.maker(drop)["feed"])
+
+
+def test_r5_f3_a_hold_released_because_the_drop_missed_its_minimum_says_so(api, engine, drop):
+    api.join(drop, "Alex", 0, sec("a"))
+    engine.close(drop)
+    charge(engine, drop)
+    assert engine.get(drop).settled["outcome"] != "funded"
+    assert api.me(drop, "alex", sec("a"))["me"]["fate"] == "missed_minimum"
+    assert api.maker(drop)["buyers_list"][0]["fate"] == "missed_minimum"
+
+
+@needs_node
+def test_r5_f3_the_page_says_missed_minimum_only_when_that_is_what_happened(tmp_path):
+    for fate, must, mustnt in (("missed_minimum", "The drop missed its minimum, so your hold was released", None),
+                               ("lapsed", "Your hold ran out at PayPal", "missed its minimum"),
+                               ("gone", "PayPal no longer shows your hold", "missed its minimum"),
+                               ("released", "Your hold was released", "missed its minimum"),
+                               ("taken_outside", "money was taken from your hold by something other than this drop", "You paid nothing"),
+                               (None, "The maker can see what became of it", "You paid nothing")):
+        said = page_says(tmp_path, status="voided", fate=fate)
+        assert must in said, (fate, said)
+        if mustnt:
+            assert mustnt not in said, (fate, said)
+
+
+@needs_node
+def test_r5_f3_the_maker_sees_a_hold_charged_outside_the_drop_as_a_problem_not_as_released(api, funded_with_two_holds_gone, tmp_path):
+    shown = maker_js(tmp_path, api.maker(funded_with_two_holds_gone))
+    said = {r[0]: " ".join(r[1:]) for r in shown["rows"]}
+    assert said["Alex"] == "charged outside the drop" and said["Bo"] == "hold ran out"
+    assert "released" not in said["Alex"] and "released" not in said["Bo"]
+
+
+def test_r5_f3_the_feed_tells_a_released_hold_from_one_that_lapsed_was_taken_or_vanished():
+    def ev(i, buyer, **p):
+        return {"id": i, "ts": f"2026-11-01T12:0{i}:00.000Z", "drop_id": "d", "type": "hold_voided",
+                "payload": {"buyer": buyer, "name": buyer.title(), "auth_id": f"A{i}", **p}}
+    lines = feed([ev(1, "a", reason="not_funded"), ev(2, "b", reason="paypal_says_expired", expired=True),
+                  ev(3, "c", reason="paypal_says_captured", taken_outside_engine=True), ev(4, "d", reason="paypal_says_voided"),
+                  ev(5, "e", reason="paypal_says_denied", released_by_void=True)], {}, "T")
+    assert [(f["kind"], f["text"]) for f in reversed(lines)] == [
+        ("released", "hold released"), ("lapsed", "hold ran out at PayPal, so out of the drop"),
+        ("taken_outside", "hold was charged outside the drop, so out of the drop. It was not released: refund it at PayPal"),
+        ("gone", "hold no longer at PayPal, so out of the drop"), ("released", "hold released")]
+
+
+# F4: a buyer the maker took out is told what happened to them
+
+def test_r5_f4_a_buyer_taken_out_with_the_hold_released_is_told_so(api, engine, fake, drop):
+    api.join(drop, "Alex", 0, sec("a"))
+    assert engine.exclude(drop, "alex")["released"] is True
+    me = api.me(drop, "alex", sec("a"))["me"]
+    assert (me["status"], me["fate"]) == ("excluded", "released")
+    assert api.maker(drop)["buyers_list"][0]["fate"] == "released"
+
+
+def test_r5_f4_a_buyer_taken_out_whose_hold_paypal_would_not_release_is_told_that(api, engine, fake, drop):
+    api.join(drop, "Alex", 0, sec("a"))
+    fake.refuse("void", "UNPROCESSABLE_ENTITY", times=None)
+    assert engine.exclude(drop, "alex")["released"] is False
+    assert api.me(drop, "alex", sec("a"))["me"]["fate"] == "not_released"
+    assert api.maker(drop)["buyers_list"][0]["fate"] == "not_released"
+
+
+@needs_node
+def test_r5_f4_the_page_does_not_say_the_card_could_not_be_released_when_it_was(tmp_path):
+    said = page_says(tmp_path, status="excluded", fate="released")
+    assert "You were taken out of this drop" in said and "Your $40.00 hold was released. You pay nothing." in said
+    assert "could not be charged or released" not in said and "Something needs the maker" not in said
+    said = page_says(tmp_path, status="excluded", fate="not_released")
+    assert "PayPal has not released your hold yet" in said and "You will not be charged for this drop" in said
+    assert "was released" not in said
+    said = page_says(tmp_path, status="excluded", fate="taken_outside")
+    assert "money was taken from your hold" in said and "You pay nothing" not in said
+    assert "The maker can see what became of your hold" in page_says(tmp_path, status="excluded", fate=None)
+    assert "Something needs the maker" in page_says(tmp_path, status="capture_failed", fate=None)         # the other words are as they were
+
+
+@needs_node
+def test_r5_f4_the_maker_sees_whether_a_removed_buyers_hold_was_released(api, engine, fake, drop, tmp_path):
+    api.join(drop, "Alex", 0, sec("a"))
+    api.join(drop, "Bo", 1, sec("b"))
+    engine.exclude(drop, "alex")
+    fake.refuse("void", "UNPROCESSABLE_ENTITY", times=None)
+    engine.exclude(drop, "bo")
+    said = {r[0]: " ".join(r[1:]) for r in maker_js(tmp_path, api.maker(drop))["rows"]}
+    assert said == {"Alex": "taken out", "Bo": "taken out, hold not released"}
+
+
+# F8: every connection counts against its address until its response is written
+
+def get_status(port, path, source_port=None, headers=None, timeout=15):
+    """One GET, as its status or the name of what went wrong (a connection the server turned away raises)."""
+    import http.client
+    c = http.client.HTTPConnection("127.0.0.1", port, timeout=timeout, source_address=("127.0.0.1", source_port) if source_port else None)
+    try:
+        c.request("GET", path, headers={"Host": f"127.0.0.1:{port}", **(headers or {})})
+        r = c.getresponse()
+        r.read()
+        return r.status
+    except Exception as e:  # noqa: BLE001
+        return type(e).__name__
+    finally:
+        c.close()
+
+
+def test_r5_f8_plain_reads_count_against_their_address_until_they_are_written_and_cannot_shut_out_another(api, drop, monkeypatch):
+    import crowdweb.server as srv
+    monkeypatch.setattr(srv, "MAX_CONNECTIONS", 6)
+    monkeypatch.setattr(srv, "MAX_CONNECTIONS_PER_ADDRESS", 3)
+    victim_ports = set(free_ports(3))
+    httpd = serve(api, KEY, "127.0.0.1", 0)
+    orig = httpd.process_request
+    httpd.process_request = lambda request, addr: orig(request, ("10.9.9.9", addr[1]) if addr[1] in victim_ports else addr)   # the visitor's address
+    port = httpd.server_address[1]
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    real, inside, release = api.drop, threading.Semaphore(0), threading.Event()
+
+    def long_read(d):                                                        # a drop with a long log: the read takes a while
+        inside.release()
+        release.wait(20)
+        return real(d)
+    monkeypatch.setattr(api, "drop", long_read)
+    results = []
+    threads = [threading.Thread(target=lambda: results.append(get_status(port, f"/api/drops/{drop}"))) for _ in range(8)]
+    try:
+        for t in threads:
+            t.start()
+            time.sleep(0.02)
+        for _ in range(3):
+            assert inside.acquire(timeout=5)                                 # three reads are under way ...
+        time.sleep(0.4)
+        assert httpd._open == {"127.0.0.1": 3}, httpd._open                  # ... and counted to their address while they are
+        assert httpd._slots._value == 6 - 3                                  # the other five were turned away at the door
+        assert get_status(port, f"/api/drops/{drop}") != 200                 # (that address cannot start a fourth)
+        for sp in victim_ports:                                              # another address is served, and so is the maker
+            assert get_status(port, "/api/info", source_port=sp) == 200
+        assert get_status(port, f"/api/maker/drops/{drop}", source_port=next(iter(victim_ports)), headers={"X-Maker-Key": KEY}) == 200
+    finally:
+        release.set()
+        for t in threads:
+            t.join(15)
+        httpd.shutdown()
+        httpd.server_close()
+    assert sorted(r for r in results if isinstance(r, int)) == [200] * 3 and len(results) == 8, results      # three were served, five never were
+    assert httpd._open == {} and httpd._slots._value == 6                    # and everything is given back
+
+
+def test_r5_f8_every_kind_of_request_gives_its_place_back_when_it_is_over(api, drop, monkeypatch):
+    import crowdweb.server as srv
+    monkeypatch.setattr(srv, "MAX_CONNECTIONS_PER_ADDRESS", 2)
+    with running(api) as call:
+        for _ in range(8):                                                   # more than the address's share, one after the other
+            assert call(f"/api/drops/{drop}")[0] == 200 and call("/")[0] == 200 and call("/static/app.js")[0] == 200
+            assert call(f"/api/maker/drops/{drop}", headers={"X-Maker-Key": KEY})[0] == 200
+            assert call(f"/api/drops/{drop}/me", body={"buyer": "x", "secret": sec("z")})[0] == 403
+            assert call(f"/api/drops/{drop}", method="DELETE")[0] == 405
+            assert call("/api/nowhere")[0] == 404
+            assert call(f"/api/maker/drops/{drop}", headers={"X-Maker-Key": "wrong-key-xxxxxxxx"})[0] in (401, 429)
+        assert call.httpd._open == {} and call.httpd._slots._value == srv.MAX_CONNECTIONS
+
+
+def test_r5_f8_ordinary_use_is_not_locked_out_by_the_count(api, drop, monkeypatch):
+    """A page load, the polls and the maker's view together are a handful of overlapping reads, far under an address's share."""
+    real, release = api.drop, threading.Event()
+
+    def slowish(d):
+        release.wait(0.3)
+        return real(d)
+    monkeypatch.setattr(api, "drop", slowish)
+    with running(api) as call:
+        results = []
+        threads = [threading.Thread(target=lambda: results.append(call(f"/api/drops/{drop}")[0])) for _ in range(10)]    # ten at once
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(15)
+        assert results == [200] * 10
+        assert call.httpd._open == {}
+
+
+def test_r5_f8_a_join_or_leave_that_has_won_the_turn_is_the_servers_own_work_and_not_counted(api, engine, drop, monkeypatch):
+    import crowdweb.server as srv
+    monkeypatch.setattr(srv, "MAX_CONNECTIONS_PER_ADDRESS", 2)
+    api.join(drop, "Ada", 0, sec("a"))
+    real, inside, release = engine.leave, threading.Event(), threading.Event()
+
+    def slow_paypal(*a, **k):                                                # PayPal answers slowly
+        inside.set()
+        release.wait(20)
+        return real(*a, **k)
+    monkeypatch.setattr(engine, "leave", slow_paypal)
+    with running(api) as call:
+        results = []
+        t = threading.Thread(target=lambda: results.append(post_status(call.port, f"/api/drops/{drop}/leave", {"buyer": "ada", "secret": sec("a")})))
+        t.start()
+        try:
+            assert inside.wait(5)
+            assert call.httpd._open == {}                                    # it has the turn: its address does not pay for PayPal's slowness
+            assert call.httpd._slots._value == srv.MAX_CONNECTIONS - 1       # (it still holds a thread and a slot)
+        finally:
+            release.set()
+            t.join(15)
+        assert results == [200]
