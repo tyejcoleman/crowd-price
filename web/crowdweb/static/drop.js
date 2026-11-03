@@ -3,27 +3,66 @@
 (() => {
   const { el, api, secret, showMode, money, short, splitMoney, plural, clockFrom, duration, ladder, poll, store } = CP;
   const dropId = location.pathname.split("/")[2];
-  const KEY = "crowd-price:" + dropId;      // {name, card, secret, pending} until the join is confirmed, then {buyer, secret}
+  const KEY = "crowd-price:" + dropId;      // {name, card, secret, life, pending} until the join is confirmed, then {buyer, secret}
   const $ = id => document.getElementById(id);
 
-  const s = { drop: null, me: null, cards: [], busy: false, error: null, clock: null, lastPrice: null, lastLadder: "",
-              lastCard: "", confirmLeave: false, copied: false, form: { name: "", card: 0 }, gone: false };
+  // The record is the only thing that links this browser to its hold, so it is kept where the browser keeps things; a browser that
+  // refuses to keep it still keeps it in this page, so a lost answer can at least be asked again while the page is open.
+  const persists = (() => { store(KEY + ":probe", 1); const ok = store(KEY + ":probe") === 1; store(KEY + ":probe", null); return ok; })();
+  let memo = null;
+  const kept = () => (persists ? store(KEY) : memo);
+  const keep = v => { if (persists) store(KEY, v); else memo = v; };       // null forgets it
+  const keepsPending = () => !!(kept() || {}).pending;
+  // Several tabs of one browser share this record, and an answer can arrive long after it was asked for. An answer is about ONE secret:
+  // it may let go of the stored record only if that is still the record with that secret. Another tab may have joined again since, and
+  // erasing ITS record would leave a hold nobody here can see or release, and a buyer who joins again under another name.
+  const sameRecord = secret => { const k = kept(); return !!k && k.secret === secret; };
+  const forget = secret => { if (!sameRecord(secret)) return false; keep(null); return true; };
+
+  const s = { drop: null, me: null, mySecret: null, cards: [], busy: false, error: null, clock: null, lastPrice: null, lastLadder: "",
+              lastCard: "", confirmLeave: false, copied: false, form: { name: "", card: 0 }, gone: false, tries: 0, retryAt: 0, joining: false, note: null };
+
+  // What a join's refusal can prove. The server decides: an answer that carries `nothing_held` says it looked and this secret holds nothing.
+  // The page lets go of the secret on that, and on these few answers about a request that never got as far as a claim (bad input, a drop
+  // that does not exist), and on nothing else. Not on "declined" or "PayPal did not confirm the hold" without the mark: the server keeps
+  // the claim when the engine's log shows an earlier try of this secret may have placed a hold (it can even be open after "not confirmed"),
+  // and a new secret under another name would place a second one. Every other answer (too many requests, busy, a server error, no answer
+  // at all, PayPal trouble, a join still being sorted out, one that could not be confirmed, a drop that closed beside a join that may
+  // still hold something) keeps the secret and asks again. A closed drop is NOT on this list: the server says when it is safe.
+  const NO_CLAIM = new Set(["bad_card", "bad_buyer", "bad_secret", "drop_not_found", "drop_not_published"]);
+  // Only for the very first ask, which no earlier ask of this secret can have preceded: "taken" then means taken by someone else.
+  const ONLY_IF_FIRST = new Set(["already_joined", "buyer_excluded", "join_in_progress"]);
+  // Answers that will not change in seconds: the page asks again about once a minute, not every few seconds.
+  const SLOW = new Set(["join_unconfirmed", "release_stuck", "not_recorded_held", "join_in_progress", "already_joined", "buyer_excluded", "drop_closed", "drop_ended"]);
+  // The server's own words are the right ones, and the page must not wrap them in "if not, nothing was held": they say what may be held.
+  const SAYS_SO = { join_unconfirmed: "We could not confirm your join", release_stuck: "We could not confirm your join",
+    not_recorded_held: "We could not confirm your join", drop_closed: "Joining has closed", drop_ended: "Joining has closed" };
+  const ASKING_AGAIN = "We could not confirm your join yet. Checking again…";
+  const MAY_BE_IN = "Your earlier try may have gone through, so please don't join again under another name. This page keeps checking.";
 
   // ---- talking to the server
   async function tick() {
-    const mine = store(KEY);
+    const mine = kept();
     try {
       if (mine && mine.buyer && mine.secret) {
         try {
           const r = await api(`/api/drops/${dropId}/me`, { body: { buyer: mine.buyer, secret: mine.secret } });
-          s.drop = r.drop; s.me = r.me;
+          s.drop = r.drop;
+          if (sameRecord(mine.secret)) { s.me = r.me; s.mySecret = mine.secret; }     // an answer for a record that is gone says nothing about this one
         } catch (e) {
           if (e.code !== "not_yours" && e.code !== "buyer_not_found") throw e;
-          store(KEY, null); s.me = null;
+          if (forget(mine.secret)) { s.me = null; s.mySecret = null; }               // only the record this answer was about
           s.drop = await api(`/api/drops/${dropId}`);
         }
       } else if (mine && mine.pending) {
-        await finishJoin(mine);              // a join whose answer never came: ask again with the same secret
+        s.drop = await api(`/api/drops/${dropId}`);
+        if (mine.life && s.drop.life && mine.life !== s.drop.life) {     // asked in an earlier life of this drop id (it was reset since):
+          if (forget(mine.secret)) { s.error = null; s.note = null; }    // that ask is not this drop's, and must not join this one
+        } else if (mine.final) {
+          s.note = mine.final; s.error = null;                           // answered for good: nothing left to ask
+        } else if (!s.joining && Date.now() >= s.retryAt) {
+          await finishJoin(mine, false);                                 // a join whose answer never came: ask again, same secret
+        }
       } else {
         s.drop = await api(`/api/drops/${dropId}`);
       }
@@ -36,21 +75,32 @@
   }
 
   // Ask to join with a secret already written down. Asked again (same secret) after a lost answer, the server hands back
-  // the same join; it never places a second hold.
-  async function finishJoin(mine) {
+  // the same join; it never places a second hold. `first` is true only for the ask the buyer has just made.
+  async function finishJoin(mine, first) {
+    if (s.joining) return;                       // one ask at a time: the poll must not send a second while a slow PayPal call is answering
+    s.joining = true;
     try {
       const r = await api(`/api/drops/${dropId}/join`, { body: { name: mine.name, card: mine.card, secret: mine.secret } });
-      store(KEY, { buyer: r.buyer, secret: mine.secret });
-      s.me = r.me; s.drop = r.drop; s.error = null;
+      keep({ buyer: r.buyer, secret: mine.secret });
+      s.me = r.me; s.mySecret = mine.secret; s.drop = r.drop; s.error = null; s.tries = 0; s.note = null;
     } catch (e) {
-      if (e.code === "offline" || e.code === "paypal_unavailable" || e.code === "earlier_attempt_unresolved") {
-        s.error = "We could not confirm your join yet. Checking again…";
-        if (!s.drop) s.drop = await api(`/api/drops/${dropId}`);
+      s.note = null;
+      if (NO_CLAIM.has(e.code) || e.nothing_held === true || (first && ONLY_IF_FIRST.has(e.code))) {
+        if (forget(mine.secret)) { s.tries = 0; s.error = e.message; }   // an answer about a secret that is no longer the stored one is not this page's to show
+      } else if (SLOW.has(e.code) && s.drop && s.drop.state === "settled") {
+        // The drop is settled: nothing about this answer can change now, so the page says it once and stops asking.
+        s.note = { title: SAYS_SO[e.code] || "We could not confirm your join", text: e.message }; s.error = null;
+        if (sameRecord(mine.secret)) keep({ ...mine, final: s.note });
       } else {
-        store(KEY, null);
-        s.error = e.message;
-        s.drop = await api(`/api/drops/${dropId}`);
+        s.tries += 1;                                                    // wait a little longer each time, up to 20 s ...
+        s.retryAt = Date.now() + (SLOW.has(e.code) ? 60000 : Math.min(20000, 1500 * 2 ** s.tries));     // ... or a minute for a stuck answer
+        s.error = SAYS_SO[e.code] ? e.message
+          : (e.code === "already_joined" || e.code === "join_in_progress" || e.code === "buyer_excluded") ? MAY_BE_IN : ASKING_AGAIN;
+        if (SAYS_SO[e.code]) s.note = { title: SAYS_SO[e.code], text: e.message };
       }
+      try { if (!keepsPending() || !s.drop) s.drop = await api(`/api/drops/${dropId}`); } catch (e2) { /* the next tick tries again */ }
+    } finally {
+      s.joining = false;
     }
   }
 
@@ -60,17 +110,27 @@
     s.error = null;
     const name = s.form.name.trim();
     if (!name) { s.error = "Add your name."; render(); if ($("name")) $("name").focus(); return; }
-    const mine = { name, card: s.form.card, secret: secret(), pending: true };
-    store(KEY, mine);                        // written down before asking, so a lost answer can be asked again
+    const there = kept();
+    if (there && (there.buyer || there.pending)) {      // another tab got here first: never replace its secret with a new one
+      if (!there.buyer) s.error = "A join from this browser is still being confirmed. This page keeps checking.";
+      await tick();
+      return;
+    }
+    const mine = { name, card: s.form.card, secret: secret(), life: (s.drop || {}).life || null, pending: true };
+    keep(mine);                              // written down before asking, so a lost answer can be asked again
     s.busy = true; render();
-    try { await finishJoin(mine); if (s.me) s.form.name = ""; } finally { s.busy = false; render(); }
+    try { await finishJoin(mine, true); if (s.me) s.form.name = ""; } finally { s.busy = false; render(); }
   }
 
   async function leave() {
     if (s.busy) return;
+    const mine = kept();
+    if (!mine || !mine.buyer || !mine.secret) {           // another tab let go of this join: there is nothing here to release it with
+      s.confirmLeave = false; s.error = "This page lost track of your join. Reload the page to see where it stands."; render();
+      return;
+    }
     s.busy = true; s.error = null; render();
     try {
-      const mine = store(KEY);
       const r = await api(`/api/drops/${dropId}/leave`, { body: { buyer: mine.buyer, secret: mine.secret } });
       s.me = r.me; s.drop = r.drop; s.confirmLeave = false;
     } catch (err) {
@@ -219,11 +279,31 @@
         el("p", { text: me.saved ? `${money(me.saved)} less than the ${money(me.start_price)} you held. The rest of your hold was released.`
                                  : `The rest of your ${money(me.start_price)} hold was released.` }), others(d));
     } else if (me.status === "left") {
-      out.push(big("You left"), el("p", { text: `Your ${money(me.start_price)} hold was released. You pay nothing.` }));
-      if (d.joinable) out.push(el("button", { class: "btn quiet", onclick: () => { store(KEY, null); s.me = null; render(); }, text: "Join again" }));
-    } else if (me.status === "voided") {
-      out.push(big("You paid nothing"),
-        el("p", { text: "The drop missed its minimum, so your hold was released. The pending charge drops off your card; when depends on your bank." }), others(d));
+      if (me.fate === "not_released") {      // the leave stands, but PayPal refused to release the hold: say so, and offer no second hold
+        out.push(big("You left"),
+          el("p", { text: `PayPal has not released your ${money(me.start_price)} hold. You will not be charged. The maker can see it and will sort it out. Until it is released it can still show as pending on your card.` }));
+      } else {
+        out.push(big("You left"), el("p", { text: `Your ${money(me.start_price)} hold was released. You pay nothing.` }));
+        if (d.joinable) out.push(el("button", { class: "btn quiet", onclick: () => { forget(s.mySecret); s.me = null; s.mySecret = null; render(); }, text: "Join again" }));
+      }
+    } else if (me.status === "voided") {      // out of the crowd with the hold gone: what the server's log says became of it
+      const [title, text] = {
+        missed_minimum: ["You paid nothing", "The drop missed its minimum, so your hold was released. The pending charge drops off your card; when depends on your bank."],
+        lapsed: ["You paid nothing", "Your hold ran out at PayPal before this drop settled, so you are not in it. Nothing was charged."],
+        gone: ["You paid nothing", "PayPal no longer shows your hold, so you are not in this drop. Nothing was charged."],
+        taken_outside: ["Your hold was charged outside this drop", "PayPal shows money was taken from your hold by something other than this drop, so you are not in it. The maker can see the charge and can refund it."],
+        released: ["You paid nothing", "Your hold was released, so you are not in this drop. Nothing was charged."],
+      }[me.fate] || ["You are out of this drop", "Your hold is no longer part of this drop. The maker can see what became of it."];
+      out.push(big(title), el("p", { text }), others(d));
+    } else if (me.status === "excluded") {     // the maker took this buyer out of the drop
+      const text = {
+        not_released: "PayPal has not released your hold yet. You will not be charged for this drop. The maker can see it and will sort it out.",
+        taken_outside: "PayPal shows money was taken from your hold by something other than this drop. The maker can see the charge and can refund it.",
+        released: `Your ${money(me.start_price)} hold was released. You pay nothing.`,
+        lapsed: `Your ${money(me.start_price)} hold is no longer open. You pay nothing.`,
+        gone: `Your ${money(me.start_price)} hold is no longer open. You pay nothing.`,
+      }[me.fate] || "The maker can see what became of your hold.";
+      out.push(big("You were taken out of this drop"), el("p", { text }), others(d));
     } else {
       out.push(big("Something needs the maker"),
         el("p", { text: "Your card could not be charged or released as planned. The maker sees it and will sort it out. You are never charged more than the final price." }));
@@ -233,6 +313,7 @@
   }
 
   function cardPending() {
+    if (s.note) return [el("h2", { text: s.note.title }), el("p", { class: "msg", text: s.note.text })];
     return [el("h2", { text: "Confirming your join…" }),
       el("p", { text: "If PayPal placed your hold, you are in. If not, nothing was held. This page checks again by itself." }),
       s.error ? el("p", { class: "msg", text: s.error }) : null];
@@ -258,9 +339,9 @@
     showMode(d.paypal);
     renderLead(d);
     renderLadder(d);
-    const pending = !s.me && (store(KEY) || {}).pending;
+    const pending = !s.me && keepsPending();
     const cardKey = JSON.stringify([s.me, pending, d.joinable, d.state, d.price, d.start_price, d.minimum, d.minimum_met, !!d.next_step,
-                                    d.settled, d.others, s.error, s.busy, s.confirmLeave, s.copied, s.cards.length]);
+                                    d.settled, d.others, s.error, s.note, s.busy, s.confirmLeave, s.copied, s.cards.length]);
     const join = $("join");
     const typing = document.activeElement && join.contains(document.activeElement) && ["INPUT", "SELECT"].includes(document.activeElement.tagName);
     if (cardKey !== s.lastCard && !(typing && !s.me && d.joinable && !s.error && !s.busy)) {
@@ -275,7 +356,7 @@
     const b = document.querySelector("#join form .btn");
     const r = b ? b.getBoundingClientRect() : null;
     const offscreen = !r || r.top > window.innerHeight - 8 || r.bottom < 0;
-    const want = d.joinable && !s.me && !(store(KEY) || {}).pending && offscreen && window.innerWidth <= 860;
+    const want = d.joinable && !s.me && !keepsPending() && offscreen && window.innerWidth <= 860;
     $("sticky").hidden = !want;
     $("stickybtn").textContent = `Hold ${money(d.start_price)} and join`;
   }
