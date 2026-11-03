@@ -1,24 +1,37 @@
-"""Buyer tokens: how a web buyer proves a join is theirs, to see it or to leave.
+"""Buyer secrets: how a web buyer proves a join is theirs, to see it or to leave.
 
-The engine knows a buyer by name. The web adds a secret per join, kept only as a hash in a small database beside the drop
-store (`<store>.web.db`). A buyer with no token (one the assistant or a test added) cannot be seen or released from the web.
+The browser makes a random secret BEFORE it asks to join and sends it with the join; only its hash is kept, beside the
+drop store (`<store>.web.db`). The hash is written down before PayPal is asked, so a join whose reply never reached the
+browser can be asked again with the same secret and is handed back, never placed twice.
+
+A secret proves one hold, not a name: it is bound to the authorisation the engine recorded for that join and to the drop's
+creation time. A buyer of the same name joining later (the assistant, a test, someone else), or a drop id reused after the
+store was reset, has a different hold or a different creation time, so an old secret proves nothing about it. A secret not
+yet bound to a hold (its join never confirmed) proves nothing at all.
+
+A buyer with no secret (one the assistant or a test added) can never be seen or released from the web.
 """
 from __future__ import annotations
 
 import contextlib
 import hashlib
 import hmac
-import secrets
+import re
 import sqlite3
-import time
 
-SCHEMA = """CREATE TABLE IF NOT EXISTS buyer_tokens (
-  drop_id TEXT NOT NULL, buyer TEXT NOT NULL, token_sha256 TEXT NOT NULL, created REAL NOT NULL,
-  PRIMARY KEY (drop_id, buyer))"""
+SECRET = re.compile(r"^[A-Za-z0-9_-]{32,128}$")
+
+SCHEMA = """CREATE TABLE IF NOT EXISTS buyer_secrets (
+  drop_id TEXT NOT NULL, buyer TEXT NOT NULL, secret_sha256 TEXT NOT NULL, drop_created TEXT NOT NULL,
+  auth_id TEXT, created TEXT NOT NULL, PRIMARY KEY (drop_id, buyer))"""
 
 
-def _sha(token: str) -> str:
-    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+def digest(secret: str) -> str:
+    return hashlib.sha256(secret.encode("utf-8")).hexdigest()
+
+
+def well_formed(secret) -> bool:
+    return isinstance(secret, str) and bool(SECRET.match(secret))
 
 
 class Tokens:
@@ -36,16 +49,35 @@ class Tokens:
         finally:
             c.close()
 
-    def issue(self, drop: str, buyer: str) -> str:
-        """A new token for this buyer of this drop. It replaces any earlier one (the same name joining again)."""
-        token = secrets.token_urlsafe(24)
+    def row(self, drop: str, buyer: str) -> dict | None:
         with self._db() as c:
-            c.execute("INSERT OR REPLACE INTO buyer_tokens VALUES (?, ?, ?, ?)", (drop, buyer, _sha(token), time.time()))
-        return token
+            r = c.execute("SELECT secret_sha256, drop_created, auth_id, created FROM buyer_secrets WHERE drop_id = ? AND buyer = ?",
+                          (drop, buyer)).fetchone()
+        return dict(zip(("secret_sha256", "drop_created", "auth_id", "created"), r)) if r else None
 
-    def check(self, drop: str, buyer: str, token) -> bool:
-        if not isinstance(token, str) or not token or not isinstance(buyer, str):
-            return False
+    def claim(self, drop: str, buyer: str, secret: str, drop_created: str, at: str) -> None:
+        """Write down, before PayPal is asked, that this secret is asking to join as this buyer. Not yet bound to a hold."""
         with self._db() as c:
-            row = c.execute("SELECT token_sha256 FROM buyer_tokens WHERE drop_id = ? AND buyer = ?", (drop, buyer)).fetchone()
-        return bool(row) and hmac.compare_digest(row[0], _sha(token))
+            c.execute("INSERT OR REPLACE INTO buyer_secrets VALUES (?, ?, ?, ?, NULL, ?)",
+                      (drop, buyer, digest(secret), drop_created, at))
+
+    def bind(self, drop: str, buyer: str, secret: str, auth_id: str) -> bool:
+        """Bind the claim to the hold the engine placed. False if the claim is no longer this secret's."""
+        with self._db() as c:
+            n = c.execute("UPDATE buyer_secrets SET auth_id = ? WHERE drop_id = ? AND buyer = ? AND secret_sha256 = ?",
+                          (auth_id, drop, buyer, digest(secret))).rowcount
+        return n == 1
+
+    def drop_claim(self, drop: str, buyer: str, secret: str) -> None:
+        """Forget a claim whose join was refused outright (nothing was held), so it can never bind to a later hold."""
+        with self._db() as c:
+            c.execute("DELETE FROM buyer_secrets WHERE drop_id = ? AND buyer = ? AND secret_sha256 = ? AND auth_id IS NULL",
+                      (drop, buyer, digest(secret)))
+
+    def owns(self, drop: str, buyer: str, secret, drop_created: str | None, auth_id: str | None) -> bool:
+        """Does this secret prove this buyer's CURRENT hold in THIS life of the drop?"""
+        if not well_formed(secret) or not isinstance(buyer, str) or not auth_id or not drop_created:
+            return False
+        r = self.row(drop, buyer)
+        return bool(r) and hmac.compare_digest(r["secret_sha256"], digest(secret)) and r["drop_created"] == drop_created \
+            and r["auth_id"] == auth_id

@@ -1,6 +1,7 @@
 "use strict";
 (async () => {
   const list = document.getElementById("drops");
+  try { CP.showMode((await CP.api("/api/info")).paypal); } catch (e) { /* the label waits for the server */ }
   try {
     const drops = await CP.api("/api/drops");
     const open = drops.filter(d => d.state === "live");

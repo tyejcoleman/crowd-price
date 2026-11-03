@@ -6,6 +6,7 @@ asked) are left out; what they lead to is shown instead. Every amount is copied 
 """
 from __future__ import annotations
 
+import re
 from datetime import datetime
 
 # event type -> the kind of line it makes; consecutive events of the same kind are grouped into one line
@@ -23,60 +24,69 @@ def _ts(s: str) -> datetime:
     return datetime.fromisoformat(s.replace("Z", "+00:00"))
 
 
+def display_name(name: str) -> str:
+    """How a buyer is shown. The test buyers the assistant adds are named `Sim 001`; say what they are."""
+    m = re.fullmatch(r"Sim (\d+)", name or "")
+    return f"Simulated buyer {m.group(1)}" if m else name
+
+
 def _names(items: list[dict]) -> str:
-    names = [i["name"] for i in items]
+    names = [display_name(i["name"]) for i in items]
     if len(names) <= 3:
         return ", ".join(names[:-1]) + (" and " if len(names) > 1 else "") + names[-1]
     return f"{names[0]}, {names[1]} and {len(names) - 2} others"
 
 
-def _line(kind: str, items: list[dict], title: str) -> str:
+def _line(kind: str, items: list[dict], title: str) -> tuple[str | None, str]:
+    """(who, what): the buyer names on their own, and the words. The page shows the names in their own element, so a
+    name can never read as part of a sentence about money."""
     p = items[-1]["payload"]
     n = len(items)
+    who = _names(items)
     if kind == "created":
-        return f"Drop created: {title}, minimum {p.get('minimum')}"
+        return None, f"Drop created: {title}, minimum {p.get('minimum')}"
     if kind == "published":
-        return "Published. Buyers can join"
+        return None, "Published. Buyers can join"
     if kind == "joined":
-        return f"{_names(items)} joined. ${p.get('amount')} held each" if n > 1 else f"{_names(items)} joined. ${p.get('amount')} held"
+        return who, (f"joined. ${p.get('amount')} held each" if n > 1 else f"joined. ${p.get('amount')} held")
     if kind == "declined":
-        return f"{_names(items)}: card declined, nothing held"
+        return who, "card declined, nothing held"
     if kind == "step":
         if p.get("step") == 0:
-            return f"Minimum reached with {p.get('count')} buyers: everyone pays ${p.get('price')}"
-        return f"{p.get('count')} buyers: everyone now pays ${p.get('price')}"
+            return None, f"Minimum reached with {p.get('count')} buyers: everyone pays ${p.get('price')}"
+        return None, f"{p.get('count')} buyers: everyone now pays ${p.get('price')}"
     if kind == "left":
-        return f"{_names(items)} left. Hold released"
+        return who, "left. Hold released"
     if kind == "closed":
         how = "Time ran out" if p.get("reason") == "expired" else "Closed"
         met = "minimum met" if p.get("funded") else "minimum missed"
-        return f"{how} with {p.get('count')} buyers, {met}"
+        return None, f"{how} with {p.get('count')} buyers, {met}"
     if kind == "settling":
         if p.get("outcome") == "funded":
-            return f"Settling: {p.get('count')} holds, each charged ${p.get('final_price')}"
-        return f"Settling: minimum missed, releasing {p.get('count')} holds"
+            return None, f"Settling: {p.get('count')} holds, each charged ${p.get('final_price')}"
+        return None, f"Settling: minimum missed, releasing {p.get('count')} holds"
     if kind == "captured":
-        return f"{n} charged ${p.get('amount')}" if n > 1 else f"{_names(items)} charged ${p.get('amount')}"
+        return (None, f"{n} charged ${p.get('amount')}") if n > 1 else (who, f"charged ${p.get('amount')}")
     if kind == "capture_failed":
-        return f"Charge failed for {_names(items)}"
+        return who, "charge failed"
     if kind == "released":
-        return f"{n} holds released" if n > 1 else f"{_names(items)}'s hold released"
+        return (None, f"{n} holds released") if n > 1 else (who, "hold released")
     if kind == "void_failed":
-        return f"PayPal would not release the hold of {_names(items)}"
+        return who, "PayPal would not release the hold"
     if kind == "excluded":
-        return f"{_names(items)} taken out of the drop"
+        return who, "taken out of the drop"
     if kind == "blocked":
-        return "Settlement stopped: it needs you"
+        return None, "Settlement stopped: it needs you"
     if kind == "settled":
         c = p.get("counts") or {}
         if p.get("outcome") == "funded":
-            return f"Settled: {c.get('captured', 0)} paid ${p.get('final_price')}"
-        return f"Settled: minimum missed, {c.get('voided', 0)} holds released, nobody paid"
-    return kind
+            return None, f"Settled: {c.get('captured', 0)} paid ${p.get('final_price')}"
+        return None, f"Settled: minimum missed, {c.get('voided', 0)} holds released, nobody paid"
+    return None, kind
 
 
 def feed(events: list[dict], buyers: dict, title: str, limit: int = 60) -> list[dict]:
-    """[{at, kind, text, count}] newest first. `buyers` maps buyer id -> display name."""
+    """[{at, kind, who, text, count}] newest first; `who` is the buyer names or None. `buyers` maps id -> name."""
     groups: list[dict] = []
     for e in events:
         kind = KINDS.get(e["type"])
@@ -90,6 +100,8 @@ def feed(events: list[dict], buyers: dict, title: str, limit: int = 60) -> list[
             last["items"].append(item)
         else:
             groups.append({"kind": kind, "items": [item]})
-    out = [{"at": g["items"][-1]["ts"], "kind": g["kind"], "text": _line(g["kind"], g["items"], title),
-            "count": len(g["items"])} for g in groups]
+    out = []
+    for g in groups:
+        who, what = _line(g["kind"], g["items"], title)
+        out.append({"at": g["items"][-1]["ts"], "kind": g["kind"], "who": who, "text": what, "count": len(g["items"])})
     return list(reversed(out))[:limit]

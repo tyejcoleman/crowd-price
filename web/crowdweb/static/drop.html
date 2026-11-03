@@ -7,28 +7,31 @@
 <body>
 <header class="bar">
   <a class="brand" href="/"><svg width="24" height="22" viewBox="0 0 24 22" aria-hidden="true"><path d="M3 5h6v5h5v5" fill="none" stroke="#16201a" stroke-width="2.6"/><path d="M14 15h7" fill="none" stroke="#1d7a44" stroke-width="2.6"/></svg><span>Crowd Price</span></a>
-  <span class="env" id="env">Sandbox · test money only</span>
+  <span class="env" id="env"></span>
 </header>
-<main class="wrap">
+<p class="wrap status" id="status">Loading the drop…</p>
+<main class="wrap" id="page" hidden>
   <section class="hero">
-    <div>
+    <div class="lead">
       <p class="by" id="by"></p>
-      <h1 class="two"><span id="title"></span> <span class="turn" id="turn">The more people join, the lower the price, for everyone.</span></h1>
+      <h1 class="two"><span id="title"></span> <span class="turn" id="turn"></span></h1>
+      <p class="what" id="what" hidden></p>
       <div class="pricebox">
-        <div class="label" id="pricelabel">Everyone pays</div>
-        <div class="price" id="price" aria-live="polite"></div>
+        <div class="label" id="pricelabel"></div>
+        <div class="pricerow"><div class="price" id="price" aria-live="polite"></div><span class="was gone" id="was" aria-hidden="true"></span></div>
         <p class="next" id="next"></p>
+        <p class="saved" id="saved" hidden></p>
       </div>
+      <div class="ladder-box"><div id="ladder"></div><p class="caption" id="caption"></p></div>
     </div>
-    <aside class="card join" id="join" aria-live="polite"></aside>
+    <aside class="side">
+      <img class="photo" id="photo" alt="" hidden>
+      <div class="card join" id="join" aria-live="polite"></div>
+    </aside>
   </section>
-  <section class="ladder-wrap">
-    <div class="ladder-head"><h3>The price ladder</h3><span class="label">buyers along the bottom</span></div>
-    <div id="ladder"></div>
-    <p class="caption" id="caption"></p>
-  </section>
-  <footer class="foot">Every price and count on this page comes from the drop's engine. Holds are placed through PayPal's sandbox with test cards: no real money moves.</footer>
+  <footer class="foot" id="foot"></footer>
 </main>
+<div class="stickyjoin" id="sticky" hidden><button class="btn" id="stickybtn" type="button"></button></div>
 <script src="/static/app.js"></script>
 <script src="/static/drop.js"></script>
 </body>

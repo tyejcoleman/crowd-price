@@ -73,7 +73,7 @@ python3 -m pip install pytest
 
 ```bash
 cd crowd-price
-PYTHONPATH=../togi/src python3 -m pytest -q      # 671 passed, 5 skipped (the 5 live sandbox tests)
+PYTHONPATH=../togi/src python3 -m pytest -q      # 701 passed, 5 skipped (the 5 live sandbox tests)
 ```
 
 The tests run against a pretend PayPal built from what the sandbox actually answered (docs/DECISIONS.md F-08 to F-17).
@@ -124,10 +124,12 @@ The assistant runs in an empty folder with one tool, Bash limited to `togi ...` 
 In a second terminal, with the same settings as the assistant (so both see the same drops):
 
 ```bash
-CROWD_ENV=test CROWD_PAYPAL=fake PYTHONPATH=src:web python3 -m crowdweb --maker-name Juniper
+CROWD_ENV=test CROWD_PAYPAL=fake CROWD_DETAILS=web/demo/details.json PYTHONPATH=src:web python3 -m crowdweb --maker-name Juniper
 ```
 
-It prints a link per drop and a maker link with its key. On the **drop page** a buyer joins with a sandbox test card and
+It prints a link per drop and a maker link with its key (set your own with `CROWD_MAKER_KEY`, 16+ characters).
+`CROWD_DETAILS` names a JSON file of what each drop sells (`web/demo/details.json` is Juniper's), with an optional photo
+beside it. On the **drop page** a buyer joins with a sandbox test card and
 watches the price step down as the crowd grows; they can leave until the drop closes, and afterwards see what they paid.
 The **maker view** shows the ladder with the profit at each step, the activity, the buyers, and the settlement waiting
 for your `togi approve`; once settled, it checks every hold and capture with PayPal and runs the balance proof. Neither
@@ -177,8 +179,9 @@ The live tests: `CROWD_LIVE=1 PYTHONPATH=../togi/src python3 -m pytest -q tests/
 
 ## How it was checked
 
-- 641 engine tests against the pretend PayPal, including real threads racing on the store's file lock, and 30 for the
-  pages (only the engine's numbers shown; only your own hold can be released; no route that settles).
+- 641 engine tests against the pretend PayPal, including real threads racing on the store's file lock, and 60 for the
+  pages: only the engine's numbers shown; a join asked again after a lost reply is handed back, never placed twice; a
+  browser can release only the hold it placed; names that hide or reorder text are refused; no route that settles.
 - 5 live sandbox tests, run after every review round: a funded drop, a missed minimum, a leave after a step locked,
   a capture made to fail, and the report (docs/DECISIONS.md F-10, F-14).
 - What the sandbox actually answered, and where it differs from the docs, is recorded in docs/DECISIONS.md (F-08 to
