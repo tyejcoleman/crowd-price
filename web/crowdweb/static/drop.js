@@ -13,8 +13,13 @@
   const kept = () => (persists ? store(KEY) : memo);
   const keep = v => { if (persists) store(KEY, v); else memo = v; };       // null forgets it
   const keepsPending = () => !!(kept() || {}).pending;
+  // Several tabs of one browser share this record, and an answer can arrive long after it was asked for. An answer is about ONE secret:
+  // it may let go of the stored record only if that is still the record with that secret. Another tab may have joined again since, and
+  // erasing ITS record would leave a hold nobody here can see or release, and a buyer who joins again under another name.
+  const sameRecord = secret => { const k = kept(); return !!k && k.secret === secret; };
+  const forget = secret => { if (!sameRecord(secret)) return false; keep(null); return true; };
 
-  const s = { drop: null, me: null, cards: [], busy: false, error: null, clock: null, lastPrice: null, lastLadder: "",
+  const s = { drop: null, me: null, mySecret: null, cards: [], busy: false, error: null, clock: null, lastPrice: null, lastLadder: "",
               lastCard: "", confirmLeave: false, copied: false, form: { name: "", card: 0 }, gone: false, tries: 0, retryAt: 0, joining: false, note: null };
 
   // What a join's refusal can prove. Only these answers, and any answer the server marks `nothing_held`, show that NOTHING was held
@@ -23,14 +28,14 @@
   // still hold something) keeps the secret and asks again: the first ask may have placed a hold whose answer was lost, and a new
   // secret under another name would place a second one. A closed drop is NOT on this list: the server says when it is safe.
   const NOTHING_HELD = new Set(["bad_card", "bad_buyer", "bad_secret", "join_declined", "hold_not_open",
-    "drop_not_found", "drop_not_published", "wrong_paypal", "drop_unbound", "not_recorded"]);
+    "drop_not_found", "drop_not_published", "wrong_paypal", "drop_unbound", "not_recorded", "join_over", "join_stale"]);
   // Only for the very first ask, which no earlier ask of this secret can have preceded: "taken" then means taken by someone else.
   const ONLY_IF_FIRST = new Set(["already_joined", "buyer_excluded", "join_in_progress"]);
   // Answers that will not change in seconds: the page asks again about once a minute, not every few seconds.
-  const SLOW = new Set(["join_unconfirmed", "not_recorded_held", "join_in_progress", "already_joined", "buyer_excluded", "drop_closed", "drop_ended"]);
+  const SLOW = new Set(["join_unconfirmed", "release_stuck", "not_recorded_held", "join_in_progress", "already_joined", "buyer_excluded", "drop_closed", "drop_ended"]);
   // The server's own words are the right ones, and the page must not wrap them in "if not, nothing was held": they say what may be held.
-  const SAYS_SO = { join_unconfirmed: "We could not confirm your join", not_recorded_held: "We could not confirm your join",
-    drop_closed: "Joining has closed", drop_ended: "Joining has closed" };
+  const SAYS_SO = { join_unconfirmed: "We could not confirm your join", release_stuck: "We could not confirm your join",
+    not_recorded_held: "We could not confirm your join", drop_closed: "Joining has closed", drop_ended: "Joining has closed" };
   const ASKING_AGAIN = "We could not confirm your join yet. Checking again…";
   const MAY_BE_IN = "Your earlier try may have gone through, so please don't join again under another name. This page keeps checking.";
 
@@ -41,17 +46,19 @@
       if (mine && mine.buyer && mine.secret) {
         try {
           const r = await api(`/api/drops/${dropId}/me`, { body: { buyer: mine.buyer, secret: mine.secret } });
-          s.drop = r.drop; s.me = r.me;
+          s.drop = r.drop;
+          if (sameRecord(mine.secret)) { s.me = r.me; s.mySecret = mine.secret; }     // an answer for a record that is gone says nothing about this one
         } catch (e) {
           if (e.code !== "not_yours" && e.code !== "buyer_not_found") throw e;
-          keep(null); s.me = null;
+          if (forget(mine.secret)) { s.me = null; s.mySecret = null; }               // only the record this answer was about
           s.drop = await api(`/api/drops/${dropId}`);
         }
       } else if (mine && mine.pending) {
         s.drop = await api(`/api/drops/${dropId}`);
         if (mine.life && s.drop.life && mine.life !== s.drop.life) {     // asked in an earlier life of this drop id (it was reset since):
-          keep(null);                                                    // that ask is not this drop's, and must not join this one
-          s.error = null; s.note = null;
+          if (forget(mine.secret)) { s.error = null; s.note = null; }    // that ask is not this drop's, and must not join this one
+        } else if (mine.final) {
+          s.note = mine.final; s.error = null;                           // answered for good: nothing left to ask
         } else if (!s.joining && Date.now() >= s.retryAt) {
           await finishJoin(mine, false);                                 // a join whose answer never came: ask again, same secret
         }
@@ -74,12 +81,15 @@
     try {
       const r = await api(`/api/drops/${dropId}/join`, { body: { name: mine.name, card: mine.card, secret: mine.secret } });
       keep({ buyer: r.buyer, secret: mine.secret });
-      s.me = r.me; s.drop = r.drop; s.error = null; s.tries = 0; s.note = null;
+      s.me = r.me; s.mySecret = mine.secret; s.drop = r.drop; s.error = null; s.tries = 0; s.note = null;
     } catch (e) {
       s.note = null;
       if (NOTHING_HELD.has(e.code) || e.nothing_held === true || (first && ONLY_IF_FIRST.has(e.code))) {
-        keep(null); s.tries = 0;
-        s.error = e.message;
+        if (forget(mine.secret)) { s.tries = 0; s.error = e.message; }   // an answer about a secret that is no longer the stored one is not this page's to show
+      } else if (SLOW.has(e.code) && s.drop && s.drop.state === "settled") {
+        // The drop is settled: nothing about this answer can change now, so the page says it once and stops asking.
+        s.note = { title: SAYS_SO[e.code] || "We could not confirm your join", text: e.message }; s.error = null;
+        if (sameRecord(mine.secret)) keep({ ...mine, final: s.note });
       } else {
         s.tries += 1;                                                    // wait a little longer each time, up to 20 s ...
         s.retryAt = Date.now() + (SLOW.has(e.code) ? 60000 : Math.min(20000, 1500 * 2 ** s.tries));     // ... or a minute for a stuck answer
@@ -113,9 +123,13 @@
 
   async function leave() {
     if (s.busy) return;
+    const mine = kept();
+    if (!mine || !mine.buyer || !mine.secret) {           // another tab let go of this join: there is nothing here to release it with
+      s.confirmLeave = false; s.error = "This page lost track of your join. Reload the page to see where it stands."; render();
+      return;
+    }
     s.busy = true; s.error = null; render();
     try {
-      const mine = kept();
       const r = await api(`/api/drops/${dropId}/leave`, { body: { buyer: mine.buyer, secret: mine.secret } });
       s.me = r.me; s.drop = r.drop; s.confirmLeave = false;
     } catch (err) {
@@ -265,7 +279,7 @@
                                  : `The rest of your ${money(me.start_price)} hold was released.` }), others(d));
     } else if (me.status === "left") {
       out.push(big("You left"), el("p", { text: `Your ${money(me.start_price)} hold was released. You pay nothing.` }));
-      if (d.joinable) out.push(el("button", { class: "btn quiet", onclick: () => { keep(null); s.me = null; render(); }, text: "Join again" }));
+      if (d.joinable) out.push(el("button", { class: "btn quiet", onclick: () => { forget(s.mySecret); s.me = null; s.mySecret = null; render(); }, text: "Join again" }));
     } else if (me.status === "voided") {
       out.push(big("You paid nothing"),
         el("p", { text: "The drop missed its minimum, so your hold was released. The pending charge drops off your card; when depends on your bank." }), others(d));

@@ -16,7 +16,19 @@ KINDS = {
     "hold_captured": "captured", "capture_failed": "capture_failed", "hold_voided": "released", "void_failed": "void_failed",
     "buyer_excluded": "excluded", "settle_blocked": "blocked", "drop_settled": "settled",
 }
-GROUPED = {"joined", "declined", "left", "captured", "capture_failed", "released", "void_failed"}
+GROUPED = {"joined", "declined", "left", "captured", "capture_failed", "released", "void_failed", "unconfirmed"}
+# What the engine writes as the code of a `hold_failed` that is not a decline: a join nobody confirmed that was then looked into.
+# `join_unconfirmed`: PayPal holds nothing for it (or would not say). The two below: a hold exists (or money moved) and PayPal would
+# not release it: the same line as any hold PayPal would not release. Anything else is PayPal (or the card) refusing the join.
+UNCONFIRMED = "join_unconfirmed"
+STUCK_RELEASE = {"orphan_void_failed", "orphan_unexpected_status"}
+UNREADABLE = "PayPal would not say"          # how the engine's message starts when PayPal would not say whether a join left a hold
+
+
+def may_be_open(p: dict) -> bool:
+    """Does this `hold_failed` leave a hold that may still be open at PayPal: one PayPal would not release, or one it would not describe?
+    (A decline, and a join PayPal holds nothing for, leave none.)"""
+    return p.get("code") in STUCK_RELEASE or (p.get("code") == UNCONFIRMED and str(p.get("message") or "").startswith(UNREADABLE))
 GROUP_GAP_SECONDS = 60
 
 
@@ -51,6 +63,8 @@ def _line(kind: str, items: list[dict], title: str) -> tuple[str | None, str]:
         return who, (f"joined. ${p.get('amount')} held each" if n > 1 else f"joined. ${p.get('amount')} held")
     if kind == "declined":
         return who, "card declined, nothing held"
+    if kind == "unconfirmed":
+        return who, "join never confirmed, nothing held"
     if kind == "step":
         if p.get("step") == 0:
             return None, f"Minimum reached with {p.get('count')} buyers: everyone pays ${p.get('price')}"
@@ -72,7 +86,7 @@ def _line(kind: str, items: list[dict], title: str) -> tuple[str | None, str]:
     if kind == "released":
         return (None, f"{n} holds released") if n > 1 else (who, "hold released")
     if kind == "void_failed":
-        return who, "PayPal would not release the hold"
+        return who, ("PayPal would not say whether a hold exists" if p.get("code") == UNCONFIRMED else "PayPal would not release the hold")
     if kind == "excluded":
         return who, "taken out of the drop"
     if kind == "blocked":
@@ -91,6 +105,8 @@ def feed(events: list[dict], buyers: dict, title: str, limit: int = 60) -> list[
     for e in events:
         kind = KINDS.get(e["type"])
         p = e["payload"]
+        if e["type"] == "hold_failed":              # not every failed hold is a decline: say what the engine recorded
+            kind = "void_failed" if may_be_open(p) else ("unconfirmed" if p.get("code") == UNCONFIRMED else "declined")
         if kind is None or (e["type"] == "hold_voided" and p.get("reason") == "left"):   # a leave says so in its own line
             continue
         item = {"ts": e["ts"], "payload": p, "name": p.get("name") or buyers.get(p.get("buyer"), p.get("buyer") or "")}

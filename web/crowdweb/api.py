@@ -27,10 +27,10 @@ from crowd import ladder as lad
 from crowd import verify as vf
 from crowd.engine import CrowdError, Engine, m
 from crowd.paypal_holds import HoldError, TEST_CARDS
-from crowd.store import StoreError, slug
+from crowd.store import StoreError, iso, parse_iso, slug
 
-from .feed import display_name, feed
-from .tokens import Tokens, well_formed
+from .feed import display_name, feed, may_be_open
+from .tokens import Tokens, digest, well_formed
 
 # The cards a web buyer may pick: sandbox test numbers, never a real card. Index 8 repeats index 0, and index 9 is the card
 # whose capture the sandbox is told to fail (for the agent's tests), so the page offers 0 to 7.
@@ -38,6 +38,8 @@ WEB_CARDS = list(range(8))
 PUBLIC_STATES = {"live", "ended", "closed", "settling", "settled"}
 HOLDING = {"held", "captured", "capture_failed", "void_failed"}     # a buyer in one of these still has a hold (or a charge) on record
 LOCK_WAIT = 10        # seconds a join or leave waits for the drop's turn (a slow PayPal call can hold it) before it answers 503, busy
+CLAIM_WINDOW = 10     # seconds: a join the engine stamped this soon after a claim was written is that claim's own; a later one is not
+CLAIM_SLACK = 1       # ... and one stamped this much BEFORE the claim (clocks, millisecond rounding) still is
 MEDIA_TYPES = {"image/jpeg", "image/png", "image/webp"}
 
 # What PayPal said when settlement stopped, in words a maker can act on. The code is shown beside it, for searching.
@@ -118,6 +120,9 @@ MESSAGES = {
     "join_unconfirmed": (409, "Your earlier try may have placed a hold on your card, but it was never confirmed here, so this page "
                               "cannot show or release it. Please do not join again. The maker can see the hold and can release it."),
     "join_stale": (409, "This drop was reset since this page last asked to join. Reload the page and join again."),
+    "join_over": (409, "Your earlier try is over, and nothing is held on your card now. If you still want in, join again."),
+    "release_stuck": (409, "Your earlier try may have left a hold on your card that PayPal would not release or describe as planned. "
+                           "This page cannot show or release it. The maker can see it and will sort it out. Please do not join again."),
     "busy": (503, "This drop is busy with other joins right now. Try again in a moment."),
     "not_recorded": (503, "Your join could not be recorded, so the hold was released. Try again."),
     "not_recorded_held": (503, "Your join could not be recorded, and we could not release the hold just now. The maker can see it "
@@ -192,13 +197,16 @@ class Api:
             return self._locks.setdefault(drop, threading.Lock())
 
     @contextlib.contextmanager
-    def _turn(self, drop: str):
+    def _turn(self, drop: str, on_turn=None):
         """Wait for the drop's turn, but not for ever: a request queued behind a slow PayPal call answers 503 (busy) and the page,
-        which keeps its secret on a 503, asks again. Nothing has been written when it gives up."""
+        which keeps its secret on a 503, asks again. Nothing has been written when it gives up. `on_turn` is called once the turn is
+        won: the server counts a request against its address until then (server.py), because a queue is not free."""
         lock = self._lock(drop)
         if not lock.acquire(timeout=LOCK_WAIT):
             raise _refusal("busy")
         try:
+            if on_turn is not None:
+                on_turn()
             yield
         finally:
             lock.release()
@@ -326,19 +334,27 @@ class Api:
         it (tokens.py has the other half):
           * A retry whose secret already proves the buyer's hold is handed back whatever state that hold is in now, before anything
             else is looked at: never refused, never counted against a limit, never able to touch its own proof.
-          * A buyer with a hold or a charge on record and no proof is someone else's, unless this secret's own unbound claim sits on
-            it: then an earlier try of THIS secret may have placed it and died before it was bound. Nothing guesses
-            (`join_unconfirmed`, worded by what is on record: held, charged ...); the maker sees it. This comes before every other
-            refusal, the drop's closing included, so a buyer who may have been charged is never told they were not in.
+          * A claim is this secret's record of ONE engine join attempt. What became of that attempt is read from the engine's log
+            (`_story`), never guessed: it is open (PayPal may have acted on it), it placed the hold on record (`join_unconfirmed`:
+            worded by what is on record, held or charged; the maker sees it), it left a hold PayPal would not release
+            (`release_stuck`), or it is over (released, failed, its hold gone). A claim that is over never starts a join again
+            (`join_over`: nothing is held now, join again if you still want in), however often the page asks and whatever happened
+            to the answer. A hold on record that the claim's attempt did NOT place is someone else's: it is no reason to say a
+            thing about the buyer's money.
+          * A join the engine has open for the buyer is this claim's own only if it is the claim's attempt AND the engine stamped it
+            within moments of the claim being written (both on the engine's clock). A claim whose process died before the engine
+            heard of it proves nothing about a join made much later by anyone else.
           * Another secret cannot join a name while the engine has a join for it that PayPal may have acted on and nobody has
-            confirmed: it would be handed that earlier request's hold. Nor can this secret, unless every such join is the one
-            ITS claim started (the claim records the engine's attempt number): the assistant may have started another on the name
-            since (`join_in_progress`).
-          * A drop that takes no joins is refused before any claim is written, and a refused join forgets only its own claim.
+            confirmed: it would be handed that earlier request's hold (`join_in_progress`). Nor can this one, unless every such
+            join is its own.
+          * A drop that takes no joins is refused before any claim is written.
           * `admit` (the server's rate limit) is asked last, only for a request that will really reach PayPal: junk, hand-backs and
-            refusals made from our own records never use up a buyer's allowance.
+            refusals made from our own records never use up a buyer's allowance. If it has a `peek`, a request the limit would turn
+            away is refused before it waits for the drop's turn; if it has a `turn`, that is called when the turn is won.
+          * The engine is read again just before it is asked (after the claim is written), and the join is not started if anything
+            about the buyer moved; after it answers, a hold that someone else also asked the engine for is not bound.
         A refusal that shows this secret holds nothing says so (`nothing_held`), so the page can let go of the secret; one that cannot
-        (this secret's claim sits beside an open join) does not."""
+        (this secret's attempt is open, or placed a hold) does not."""
         d = self._drop(drop)
         if not isinstance(card, int) or isinstance(card, bool) or card not in WEB_CARDS:
             raise ApiError(400, "bad_card", "Pick one of the test cards.")
@@ -346,43 +362,90 @@ class Api:
             raise ApiError(400, "bad_secret", "Reload the page and try again.")
         name = clean_name(name)
         bid = slug(name)
-        with self._turn(d.id):
+        again = self._handed_back(d, bid, secret)
+        if again is not None:                         # a retry of a join that went through is only read: it never waits for anyone
+            return again
+        if admit is not None and getattr(admit, "peek", None) is not None:
+            admit.peek()                              # a request the limit would turn away does not queue behind everyone else's
+        with self._turn(d.id, getattr(admit, "turn", None)):
             d = self.engine.get(d.id)
+            again = self._handed_back(d, bid, secret)
+            if again is not None:
+                return again
+            if self.tokens.retired(d.id, secret, d.created_at):       # its attempt ended, or its claim was overwritten: never again
+                raise _refusal("join_over", nothing_held=True)
             b = d.buyers.get(bid)
-            if b is not None and self.tokens.owns(d.id, bid, secret, d.created_at, b.auth_id):    # a retry of a join that went through
-                return {"buyer": bid, "me": self._mine(d, bid), "drop": self._public(d), "again": True}
             theirs = self.tokens.own(d.id, bid, secret)
             if theirs is not None and theirs["drop_created"] != d.created_at:      # asked in an earlier life of this drop id (a reset)
                 raise _refusal("join_stale", nothing_held=True)
             claim = self.tokens.claim_of(d.id, bid, secret, d.created_at)
-            mine = claim is not None
+            legacy = claim is not None and claim["attempt"] is None                # from before attempts were recorded: proves nothing
             intents = [j for j in d.unresolved.values() if j.get("buyer") == bid]
-            ours = [j for j in intents if mine and claim["attempt"] is not None and int(j.get("attempt") or 0) == claim["attempt"]]
-            unsure = mine and bool(intents)           # this secret's claim sits beside a join PayPal may have acted on
-            if b is not None and mine and b.status in HOLDING:
+            ours, beside, stuck, over = [], False, False, False
+            if legacy:
+                beside = b is not None and b.status in HOLDING
+            elif claim is not None:
+                story = self._story(d, self.engine.store.events(d.id), bid, claim["attempt"], claim["created"])
+                ours = [j for j in intents if story["own"] and int(j.get("attempt") or 0) == claim["attempt"]]
+                beside, stuck = self._beside(b, story), story["stuck"]
+                over = b is not None and b.attempts >= claim["attempt"] and not beside and not stuck    # the engine has moved on
+            if beside:
                 raise self._unconfirmed(b)
+            if stuck:
+                raise _refusal("release_stuck")
             if b is not None and b.status == "held":
                 raise _refusal("already_joined", nothing_held=True)
             state = self.engine.display_state(d)
             if state != "live":
                 code = "drop_ended" if state == "ended" else "drop_closed"
+                unsure = bool(ours) or (legacy and bool(intents))        # this secret's claim sits beside a join PayPal may have acted on
                 raise _refusal(code, UNSURE_CLOSED) if unsure else _refusal(code, nothing_held=True)
             if len(ours) != len(intents):
-                raise _refusal("join_in_progress", nothing_held=not mine)
+                raise _refusal("join_in_progress", nothing_held=not (ours or legacy))
+            if over:
+                self.tokens.retire(d.id, secret, d.created_at)
+                raise _refusal("join_over", nothing_held=True)
+            if self._stranger_beside(d, bid, secret):
+                raise _refusal("join_in_progress", nothing_held=True)
             if admit is not None:
                 admit()
-            still_there = b.auth_id if b is not None and b.status in HOLDING else None
             attempt = (b.attempts if b is not None else 0) + 1
-            if not self.tokens.claim(d.id, bid, secret, d.created_at, self.engine.now().isoformat(), still_there, attempt):
-                raise _refusal("already_joined", nothing_held=True)
+            fresh = not ours                          # a claim whose own join is open is asked again as it is; any other is written anew
+            if fresh:
+                still_there = b.auth_id if b is not None and b.status in HOLDING else None
+                if not self.tokens.claim(d.id, bid, secret, d.created_at, lambda: iso(self.engine.now()), still_there, attempt):
+                    raise _refusal("already_joined", nothing_held=True)
+            # The last look before PayPal is asked. Anything another actor (the assistant, the maker) did to this buyer between the
+            # first look and now makes this a different join: do not start it, say so, and let the page ask again. Whatever is left of
+            # the window between this look and the engine taking its file lock is the engine's, and is closed after the fact below.
+            try:
+                seen = self.engine.store.events(d.id)                 # the log first, then the state: whatever lands between the two is
+                mark = seen[-1]["id"] if seen else 0                  # in the state (and stops the join below), and whatever lands after
+                d2 = self.engine.get(d.id)                            # the mark is counted when the engine has answered
+            except Exception:                         # noqa: BLE001 - nothing was started: the claim goes with it
+                if fresh:
+                    self.tokens.drop_claim(d.id, bid, secret)
+                raise
+            if self._signature(d2, bid) != self._signature(d, bid):
+                if fresh:
+                    self.tokens.drop_claim(d.id, bid, secret)
+                raise _refusal("busy")
             try:
                 out = self.engine.join(d.id, name, card)
             except (CrowdError, StoreError, HoldError) as e:
                 err = from_engine(e)
-                if not self._open_intent(self.engine.get(d.id), bid):     # refused outright: nothing is held, nothing to remember
-                    self.tokens.drop_claim(d.id, bid, secret)
+                if self._forget_untraced(d.id, bid, secret, mark, fresh):          # refused outright: nothing is held, nothing to remember
                     err.extra["nothing_held"] = True
                 raise err from None
+            except Exception:  # noqa: BLE001 - a crash the engine did not name: forget the claim only if the engine never heard of the try
+                self._forget_untraced(d.id, bid, secret, mark, fresh)
+                raise
+            d = self.engine.get(d.id)
+            asked = self._joins_since(self.engine.store.events(d.id), bid, mark)
+            if len(asked) != len(set(asked)):
+                # Someone else asked the engine for this very join (the same request id) between the last look and the engine's lock:
+                # it answered both with one hold, and nothing says whose it is. It is not bound; the maker sees it.
+                raise self._unconfirmed(d.buyers[out["buyer"]])
             try:
                 bound = self.tokens.bind(d.id, out["buyer"], secret, out["auth_id"])
             except Exception:  # noqa: BLE001 - a hold nobody on the web can prove is released at once
@@ -393,10 +456,120 @@ class Api:
             d = self.engine.get(d.id)
             return {"buyer": out["buyer"], "me": self._mine(d, out["buyer"]), "drop": self._public(d)}
 
+    def _stranger_beside(self, d, bid: str, secret) -> bool:
+        """Is there another secret's unbound claim on this name whose attempt left a hold PayPal would not release, or is still open?
+        Writing this secret's claim would overwrite it, and with it the only record that the hold may be that browser's: the page that
+        made it would then be told nothing is held."""
+        old = self.tokens.row(d.id, bid)
+        if (old is None or old["auth_id"] is not None or old["drop_created"] != d.created_at or old["attempt"] is None
+                or old["secret_sha256"] == digest(secret)):
+            return False
+        story = self._story(d, self.engine.store.events(d.id), bid, old["attempt"], old["created"])
+        return story["stuck"] or story["open"]
+
+    def _handed_back(self, d, bid: str, secret) -> dict | None:
+        """The answer to a retry of a join that went through (this secret proves the buyer's hold), or None. It only reads."""
+        b = d.buyers.get(bid)
+        if b is not None and self.tokens.owns(d.id, bid, secret, d.created_at, b.auth_id):
+            return {"buyer": bid, "me": self._mine(d, bid), "drop": self._public(d), "again": True}
+        return None
+
     @staticmethod
     def _open_intent(d, bid: str) -> bool:
         """Has the engine a join for this buyer that PayPal may have acted on and nobody has confirmed or released?"""
         return any(j.get("buyer") == bid for j in d.unresolved.values())
+
+    @staticmethod
+    def _signature(d, bid: str) -> tuple:
+        """What a join depends on, for one buyer: how many attempts the engine has closed, the buyer's status and hold, and which
+        joins are open. If it differs between two looks, someone else acted in between."""
+        b = d.buyers.get(bid)
+        return (b.attempts if b else 0, b.status if b else None, b.auth_id if b else None,
+                tuple(sorted(r for r, j in d.unresolved.items() if j.get("buyer") == bid)))
+
+    @staticmethod
+    def _joins_since(events: list[dict], bid: str, mark: int) -> list[str]:
+        """The request ids of the joins started for this buyer after the event `mark`. The engine holds the drop's file lock from the
+        moment it writes one to the moment it has answered, so after one request's own join no other can be written before it is done:
+        the same id twice means another actor asked for the very same join first."""
+        return [e["payload"].get("request_id") for e in events
+                if e["id"] > mark and e["type"] == "join_started" and e["payload"].get("buyer") == bid]
+
+    @staticmethod
+    def _story(d, events: list[dict], bid: str, attempt: int, created: str | None, anywhere: bool = False) -> dict:
+        """What the engine's log says became of the join attempt a claim started: {own, open, placed, stuck, ended}.
+
+        `own`: the engine stamped a join for this buyer and attempt within CLAIM_WINDOW of the claim being written, so it is what the
+        claim started (`anywhere`: the buyer's newest join, whenever and whatever attempt, for a request that has just asked the engine
+        itself). `open`: PayPal may have acted on it and nobody has confirmed or released it. `placed`: the auth id of the hold it
+        placed. `stuck`: it ended with a hold PayPal would not release or read. `ended`: it is closed, one way or another."""
+        out = {"own": False, "open": False, "placed": None, "stuck": False, "ended": False, "attempt": None}
+        try:
+            made = parse_iso(created) if created else None
+        except (TypeError, ValueError):
+            made = None
+        start = None
+        for i, e in enumerate(events):
+            p = e["payload"]
+            if e["type"] != "join_started" or p.get("buyer") != bid:
+                continue
+            if anywhere:
+                start = i                                          # keep going: the newest is the one
+                continue
+            if int(p.get("attempt") or 0) != attempt:
+                continue
+            try:
+                gap = (parse_iso(e["ts"]) - made).total_seconds()
+            except (TypeError, ValueError, AttributeError):
+                continue
+            if -CLAIM_SLACK <= gap <= CLAIM_WINDOW:
+                start = i
+                break
+        if start is None:
+            return out
+        rid, out["own"], out["attempt"] = events[start]["payload"].get("request_id"), True, int(events[start]["payload"].get("attempt") or 0)
+        for e in events[start + 1:]:
+            p = e["payload"]
+            if p.get("request_id") != rid:
+                continue
+            if e["type"] == "hold_placed":
+                out["placed"], out["ended"] = p.get("auth_id"), True
+            elif e["type"] == "hold_failed":
+                out["ended"] = True
+                out["stuck"] = out["stuck"] or may_be_open(p)
+            elif e["type"] == "orphan_hold_released" and not p.get("superseded"):
+                out["ended"] = True
+        out["open"] = not out["ended"] and rid in d.unresolved
+        return out
+
+    @staticmethod
+    def _beside(b, story: dict) -> bool:
+        """Is the hold the engine has on record for this buyer (held, charged, or stuck) the one the claim's own attempt placed?"""
+        return b is not None and b.status in HOLDING and story["placed"] is not None and story["placed"] == b.auth_id
+
+    def _forget_untraced(self, drop: str, bid: str, secret: str, mark: int, fresh: bool) -> bool:
+        """After a join that raised: forget this secret's unbound claim, unless the engine has a join this request started on record
+        and it is open, placed a hold, or left one PayPal would not release; or unless this was a retry of a claim whose own earlier
+        join is open (that join stands, whatever this ask came to). True when the claim is gone: nothing of the try is held anywhere.
+        If the engine cannot be read, nothing is forgotten and nothing is claimed."""
+        try:
+            d = self.engine.get(drop)
+            events = self.engine.store.events(drop)
+            claim = self.tokens.claim_of(d.id, bid, secret, d.created_at)
+            if claim is None:
+                return not self._open_intent(d, bid)
+            if self._joins_since(events, bid, mark):               # this request's own ask reached the engine's log
+                story = self._story(d, events, bid, claim["attempt"], claim["created"], anywhere=True)
+                if story["open"] or story["placed"] is not None or story["stuck"]:
+                    if story["attempt"] and story["attempt"] != claim["attempt"]:     # the engine numbered it differently (another actor's
+                        self.tokens.retag(drop, bid, secret, story["attempt"])        # try closed in between): the claim follows the engine
+                    return False
+            elif not fresh:
+                return False
+            self.tokens.drop_claim(drop, bid, secret)
+            return True
+        except Exception:  # noqa: BLE001
+            return False
 
     @staticmethod
     def _unconfirmed(b) -> ApiError:
@@ -428,9 +601,13 @@ class Api:
         self._owned(d, buyer, secret)
         return {"me": self._mine(d, buyer), "drop": self._public(d)}
 
-    def leave(self, drop: str, buyer, secret) -> dict:
+    def leave(self, drop: str, buyer, secret, on_turn=None) -> dict:
+        """Release the hold this browser placed. Whether the hold is this browser's is checked on a fresh read BEFORE waiting for the
+        drop's turn, so a request that is not (anyone's guess at a buyer or a secret) never queues behind a slow PayPal call or takes a
+        place in the line from a buyer who owns a hold; it is checked again once the turn is won."""
         d = self._drop(drop)
-        with self._turn(d.id):
+        self._owned(d, buyer, secret)
+        with self._turn(d.id, on_turn):
             d = self.engine.get(d.id)
             self._owned(d, buyer, secret)
             try:
@@ -473,16 +650,20 @@ class Api:
         d = self._drop(drop)
         out = self._public(d)
         rows = self.engine.buyers(d.id)
-        unsure = self.tokens.unbound(d.id, d.created_at)       # a web join whose hold was never bound to its browser: only the maker can see it
-        out["buyers_list"] = [{"name": display_name(r["name"]) + (" (unconfirmed web join)" if r["buyer"] in unsure and r["status"] in HOLDING else ""),
+        events = self.engine.store.events(d.id)
+        unsure = self._unconfirmed_web_joins(d, events)        # a web join whose hold was never bound to its browser: only the maker can see it
+        failed = {e["payload"].get("buyer"): e["payload"] for e in events if e["type"] == "hold_failed"}    # what each buyer's last failure was
+        out["buyers_list"] = [{"name": display_name(r["name"]) + (" (unconfirmed web join)" if r["buyer"] in unsure else ""),
                                "status": r["status"], "held": r["held"], "charged": r["charged"], "card": _card_label(r["card"]),
-                               "unconfirmed_web_join": r["buyer"] in unsure and r["status"] in HOLDING} for r in rows]
+                               "error": r["error"],      # the engine's own code for a failure, so the maker is not told "declined" for what is not
+                               "hold_may_be_open": r["status"] == "hold_failed" and may_be_open(failed.get(r["buyer"]) or {}),
+                               "unconfirmed_web_join": r["buyer"] in unsure} for r in rows]
         out["simulated"] = sum(1 for r in rows if display_name(r["name"]) != r["name"])
         counts: dict = {}
         for r in rows:
             counts[r["status"]] = counts.get(r["status"], 0) + 1
         out["buyers_by_status"] = counts
-        out["feed"] = feed(self.engine.store.events(d.id), {b.id: b.name for b in d.buyers.values()}, d.title)
+        out["feed"] = feed(events, {b.id: b.name for b in d.buyers.values()}, d.title)
         out["approvals"] = self.approvals(d.id)
         if d.costs:
             out["profit"] = [{"from_buyers": r["min_buyers"], "price": m(r["price"]), "profit": m(r["profit"])}
@@ -501,6 +682,22 @@ class Api:
             out["blocked"] = {k: d.blocked.get(k) for k in ("issue", "phase", "at") if d.blocked.get(k) is not None}
             issue = str(d.blocked.get("issue") or d.blocked.get("code") or "")
             out["blocked"]["words"] = ISSUES.get(issue.upper(), "PayPal refused a step")
+        return out
+
+    def _unconfirmed_web_joins(self, d, events: list[dict]) -> set[str]:
+        """The buyers whose hold (or charge, or hold PayPal would not release) sits beside a web claim that never got bound: the claim's
+        own attempt placed it, or left it. A claim whose attempt placed nothing of the sort (it was released, the hold on record is
+        the assistant's, the claim never reached the engine) marks nobody."""
+        out = set()
+        for bid, claim in self.tokens.unbound_claims(d.id, d.created_at).items():
+            b = d.buyers.get(bid)
+            if claim["attempt"] is None:                       # from before attempts were recorded: it may be
+                if b is not None and b.status in HOLDING:
+                    out.add(bid)
+                continue
+            story = self._story(d, events, bid, claim["attempt"], claim["created"])
+            if self._beside(b, story) or story["stuck"]:
+                out.add(bid)
         return out
 
     def verify(self, drop: str) -> dict:

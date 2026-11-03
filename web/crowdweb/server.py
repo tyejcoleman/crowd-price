@@ -43,7 +43,8 @@ MAX_BODY = 4096
 JOINS_PER_MINUTE = 12          # per client address: holds are real sandbox calls, so a page cannot be used to flood them
 JOINS_PER_DROP_MINUTE = 120    # per drop, whoever asks: the ceiling still holds behind a proxy that hides addresses
 MAX_CONNECTIONS = 64           # open connections at once; a client that opens many slow ones cannot exhaust the threads
-MAX_CONNECTIONS_PER_ADDRESS = 16   # of those, one address's share WHILE ITS REQUEST IS STILL ARRIVING (off behind --trust-proxy)
+MAX_CONNECTIONS_PER_ADDRESS = 16   # of those, one address's share until its request is being served, which for a join or leave is
+                                   # when it wins the drop's turn: waiting in the queue costs a slot (off behind --trust-proxy)
 READ_TIMEOUT = 10              # seconds a connection may sit without sending anything
 REQUEST_DEADLINE = 15          # seconds for a whole request to arrive, however slowly (READ_TIMEOUT alone is reset by every byte)
 MIN_MAKER_KEY = 16
@@ -82,10 +83,12 @@ class RateLimit:
 
 class CappedServer(ThreadingHTTPServer):
     """A threading server that turns a connection away (closes it) when MAX_CONNECTIONS are already being served, or when one
-    address already has `per_address` requests still ARRIVING (0: no per-address cap). A connection counts toward its address only
-    until its request has been read in full (`arrived`): one that is merely waiting for the drop's turn, or for PayPal, is the
-    server's own queue and must not shut that address (a whole venue behind one router) out of everything else. Together with the
-    request deadline, a few slow clients can neither keep every slot nor keep one for long."""
+    address already has `per_address` requests that are not yet being served (0: no per-address cap). A connection counts toward its
+    address until the server starts on it (`arrived`): a request still arriving, and a join or leave still waiting for the drop's
+    turn. A queue is made of connections too, and every one of them is a slot of the MAX_CONNECTIONS everyone shares: if waiting were
+    free, one address could fill the queue behind one slow PayPal call and shut every other visitor, and the maker, out. Once a
+    request has the turn it is the server's own work (a slow PayPal call) and no longer counts to its address. Together with the
+    request deadline and the wait limit, a few clients can neither keep every slot nor keep one for long."""
     daemon_threads = True
 
     def __init__(self, *a, per_address: int | None = None, **kw):
@@ -166,6 +169,21 @@ def make_handler(api: Api, maker_key: str, quiet: bool = True, hosts: set[str] |
             joins.allow(who)
             drop_joins.allow(drop)
 
+    class Admit:
+        """What the API asks of the server for one join: `peek` (would the limit turn this away? asked before it queues, takes
+        nothing), the call itself (take one, just before PayPal), and `turn` (the request has the drop's turn)."""
+
+        def __init__(self, who: str, drop: str, on_turn):
+            self.who, self.drop, self.turn = who, drop, on_turn
+
+        def peek(self) -> None:
+            with join_gate:
+                if joins.full(self.who) or drop_joins.full(self.drop):
+                    raise ApiError(429, "slow_down", "Too many joins right now. Wait a minute.")
+
+        def __call__(self) -> None:
+            admit_join(self.who, self.drop)
+
     class Handler(BaseHTTPRequestHandler):
         server_version = "CrowdPrice"
         sys_version = ""
@@ -237,19 +255,14 @@ def make_handler(api: Api, maker_key: str, quiet: bool = True, hosts: set[str] |
 
         # ---- requests
         def _arrived(self):
-            """The request has been read in full: from here on the server's own work (a queue for the drop, a slow PayPal call) is
-            not the client's doing, and does not count against its address's share of connections."""
+            """The server has started on this request: from here on its work (a slow PayPal call) is the server's own, not the
+            client's doing, and does not count against its address's share of connections. A GET, a `me` and anything refused is
+            started as soon as it has been read; a join or leave only when it wins the drop's turn (api.py calls this then)."""
             done = getattr(self.server, "arrived", None)
             if done is not None:
                 done(self.request)
 
         def _body(self) -> dict:
-            try:
-                return self._read_body()
-            finally:
-                self._arrived()
-
-        def _read_body(self) -> dict:
             if (self.headers.get("Content-Type") or "").split(";")[0].strip().lower() != "application/json":
                 raise ApiError(415, "json_only", "Send JSON.")
             try:
@@ -348,14 +361,14 @@ def make_handler(api: Api, maker_key: str, quiet: bool = True, hosts: set[str] |
                 if len(p) == 4 and p[:2] == ["api", "drops"]:
                     drop, action = self._drop_id(p[2]), p[3]
                     body = self._body()
-                    if action == "join":
-                        who = self._who()
-                        data = api.join(drop, body.get("name"), body.get("card"), body.get("secret"), lambda: admit_join(who, drop))
+                    if action == "join":       # a join or leave stays counted against its address until it wins the drop's turn
+                        data = api.join(drop, body.get("name"), body.get("card"), body.get("secret"), Admit(self._who(), drop, self._arrived))
                         return self._json(200, {"ok": True, "data": data})
+                    if action == "leave":
+                        return self._json(200, {"ok": True, "data": api.leave(drop, body.get("buyer"), body.get("secret"), self._arrived)})
+                    self._arrived()
                     if action == "me":
                         return self._json(200, {"ok": True, "data": api.me(drop, body.get("buyer"), body.get("secret"))})
-                    if action == "leave":
-                        return self._json(200, {"ok": True, "data": api.leave(drop, body.get("buyer"), body.get("secret"))})
                 if len(p) == 5 and p[:3] == ["api", "maker", "drops"] and p[4] in ("verify", "tieout"):
                     self._maker()
                     drop = self._drop_id(p[3])
@@ -376,7 +389,9 @@ def serve(api: Api, maker_key: str, host: str = "127.0.0.1", port: int = 8780, q
     name this machine as its Host, which stops a web page elsewhere from reaching the server through DNS rebinding; with
     `public_host` that name is accepted too. Listening on every address with no public host accepts any Host.
 
-    A request must arrive within REQUEST_DEADLINE in all, and one address may hold only MAX_CONNECTIONS_PER_ADDRESS connections.
+    A request must arrive within REQUEST_DEADLINE in all, and one address may hold only MAX_CONNECTIONS_PER_ADDRESS connections that are
+    not yet being served: that includes a join or leave waiting for its drop's turn, which also stops waiting after api.LOCK_WAIT.
+    A leave is checked against its browser's secret, and a join against the join limit, BEFORE it waits, so neither can queue up nothing.
     With `trust_proxy` the client is the right-most X-Forwarded-For entry (the proxy must set it), and the per-address connection
     cap is off, since every connection comes from the proxy: the proxy should buffer slow requests itself."""
     if not isinstance(maker_key, str) or len(maker_key) < MIN_MAKER_KEY:
