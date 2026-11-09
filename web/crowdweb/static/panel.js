@@ -97,7 +97,7 @@ const CPPanel = (() => {
   function settled(d, o) {
     const st = d.settlement, t = st.totals || {}, c = st.counts || {};
     const pn = d.profit_now && d.profit_now.settled ? d.profit_now : null;
-    const ok = o.mode === "fake" ? "Every hold and capture matches the Pretend PayPal." : "Every hold and capture matches PayPal.";
+    const ok = o.mode === "fake" ? "Every hold and capture matches the test-mode payments." : "Every hold and capture matches PayPal.";
     const row = (k, v, cls) => el("div", { class: cls || null }, el("dt", { text: k }), el("dd", { class: "v", text: v }));
     return [el("div", { class: "state", text: "Settled" }),
       el("p", { class: "what", text: st.outcome === "funded" ? `${plural(c.captured, "buyer")} paid ${money(st.final_price)}` : "Nobody paid" }),
@@ -129,7 +129,7 @@ const CPPanel = (() => {
         ? el("span", { class: "go", text: `PayPal's balance moved by exactly this drop's ${money(rep.engine_net)}, to the cent.` })
         : el("span", { class: "stop", text: `PayPal's balance does not match this drop's ${money(rep.engine_net)}.` }));
     }
-    const why = { no_transaction_search: "The Pretend PayPal keeps no balance history. Run the drop in the PayPal sandbox to match PayPal's balance.",
+    const why = { no_transaction_search: "Test mode keeps no balance history. Run the drop in the PayPal sandbox to match PayPal's balance.",
                   not_yet_indexed: "PayPal has not indexed these charges yet. It can take a few hours; try again later.",
                   nothing_captured: "Nothing was charged, so there is no balance change to match." }[rep.reason];
     return el("div", { class: "result muted", text: why || rep.what_to_do || "No answer yet." });

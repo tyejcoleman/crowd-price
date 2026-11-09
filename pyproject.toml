@@ -1,9 +1,10 @@
 [project]
 name = "closure-certifier"
 version = "0.1.0"
-description = "Certified money answers over PayPal records (working title)"
+description = "Crowd Price: a group price drop on PayPal holds, run by an AI assistant, approved by a person"
 requires-python = ">=3.11"
-dependencies = ["mcp>=1.2"]
+license = {text = "MIT"}
+dependencies = ["mcp>=1.2,<2", "cryptography"]
 
 [build-system]
 requires = ["setuptools>=68"]

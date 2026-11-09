@@ -148,7 +148,7 @@ def test_what_a_step_came_to_in_plain_words():
                                                           "$1,884.15 paid to you.")
     assert st.plain("crowd_drop_settle", {}, {"ok": False, "status": "needs_approval"}) == "Waiting for your approval in the panel."
     assert st.plain("crowd_drop_verify", {}, {"ok": True, "data": {"ok": True, "checks": [{}, {}]}}, paypal="fake") == \
-        "All 2 checks agree with the Pretend PayPal."
+        "All 2 checks agree with the test-mode payments."
 
 
 def test_how_a_step_ended():
@@ -520,6 +520,20 @@ def test_a_new_conversation_starts_over(server, world):
     code, out = c.json("/api/studio/reset", {})
     assert code == 200 and out["data"]["epoch"] == 2
     assert c.json("/api/studio")[1]["data"]["epoch"] == 2 and studio.events == []
+
+
+def test_a_studio_left_running_writes_again_what_the_system_cleared(server, world):
+    # macOS clears old files from its temporary folder: a studio running for days lost its gate and MCP config, and every
+    # assistant it started after that exited at once
+    import shutil
+    c, studio = server([[{"say": "hi"}], [{"say": "again"}]])
+    c.json("/api/studio/say", {"text": "one"})
+    c.events(turn_over)
+    shutil.rmtree(studio._tmp)
+    c.json("/api/studio/reset", {})
+    c.json("/api/studio/say", {"text": "two"})
+    evs = c.events(turn_over)
+    assert not [e for e in evs if e["t"] == "error"] and studio._mcp.exists() and (studio._bin / "togi-gate.py").exists()
 
 
 def test_a_draft_shows_in_the_panel(server, world):
@@ -1164,8 +1178,8 @@ def test_the_gate_refuses_a_tool_name_that_is_not_a_string_and_stays_up(world, t
 def test_the_docs_say_what_a_plain_copy_of_your_approver_is():
     flat = lambda t: " ".join(t.split())          # (a sentence may wrap)
     readme = (REPO / "README.md").read_text()
-    section = flat(readme[readme.index("### 6. The studio"):readme.index("### The same tools from any MCP client")])
+    section = flat(readme[readme.index("### 6. The studio"):readme.index("## The same tools from any MCP client")])
     assert "plain copy of your approver's files" in section and "is not detected" in section and "test scope" in section
-    assert "only on the Pretend PayPal" in section
+    assert "only in test mode" in section
     sec = flat((REPO / "web" / "SECURITY.md").read_text())
-    assert "plain copy of your approver's files" in sec and "is not detected" in sec and "only on the Pretend PayPal" in sec
+    assert "plain copy of your approver's files" in sec and "is not detected" in sec and "only in test mode" in sec

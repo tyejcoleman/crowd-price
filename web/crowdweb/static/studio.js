@@ -81,9 +81,9 @@
     if (it.state === "running") body.push(el("p", { class: "words muted", text: "Working on it…" }));
     else body.push(el("p", { class: "words", text: it.words || it.outcome || "" }));
     if (it.call || it.result !== undefined) {
-      body.push(el("details", { class: "raw", open: rawOpen }, el("summary", { text: "Show what Togi returned" }),
+      body.push(el("details", { class: "raw", open: rawOpen }, el("summary", { text: "Show the exact call and reply" }),
         it.call ? [el("div", { class: "k", text: "The call" }), el("pre", { class: "cmdline", text: it.call })] : null,
-        it.result !== undefined && it.result !== null ? [el("div", { class: "k", text: "Togi's reply" }), el("pre", { text: it.result })] : null));
+        it.result !== undefined && it.result !== null ? [el("div", { class: "k", text: "The reply" }), el("pre", { text: it.result })] : null));
     }
     return el("details", { class: "step s-" + it.state, open },
       el("summary", {},
@@ -311,7 +311,7 @@
     }
     const p = P.plan((rv.args || {}).expect);
     const until = hhmm(rv.expires_if_approved);
-    const test = rv.scope === "test" ? "Signed by a test approver: it counts only on the Pretend PayPal." : null;
+    const test = rv.scope === "test" ? "Signed by a test approver: it counts only in test mode." : null;
     kids.push(el("p", { class: "what", id: "approve-what", text: p.what }), el("p", { class: "total", text: p.totalLine }),
       p.kind === "capture" && rv.hold_each && rv.back_each !== null && rv.back_each !== undefined
         ? el("p", { class: "holds", text: `Each buyer's ${money(rv.hold_each)} hold is charged ${money(p.price)}${rv.back_each !== "0.00" ? `, and the other ${money(rv.back_each)} goes back to them` : ""}.` }) : null,
@@ -338,7 +338,7 @@
         el("button", { class: "btn", type: "submit", disabled: s.approving, text: s.approving ? "Checking…" : "Approve the charge" }),
         el("button", { class: "linkbtn notnow", type: "button", disabled: s.approving, onclick: () => { s.later[pending.id] = true; s.approveMsg = null; renderPanel(); }, text: "Not now" }))),
       s.approveMsg ? el("p", { class: "msg stop", role: "alert", text: s.approveMsg }) : null,
-      el("p", { class: "fine", id: "approve-fine", text: `Your yes works once, until ${until}. Your passphrase goes only to Togi's approver check on this computer; your assistant never sees it.${test ? " " + test : ""}` }));
+      el("p", { class: "fine", id: "approve-fine", text: `Your yes works once, until ${until}. Your passphrase goes only to the approver check on this computer; your assistant never sees it.${test ? " " + test : ""}` }));
     return kids;
   }
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Sandbox seeder (PLAN.md). Creates known activity in the PayPal SANDBOX and logs what it intended.
+"""Sandbox seeder. Creates known activity in the PayPal SANDBOX and logs what it intended.
 
 The log (data/seeder-log.jsonl, git-ignored) is the scorecard's answer key: one JSON line per
 action with the amounts WE sent and the ids PayPal returned. It never reads Transaction Search.

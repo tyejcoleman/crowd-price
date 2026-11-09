@@ -1,6 +1,6 @@
 # Crowd fix round 3 (Opus refuter pass 3, 2026-10-27, against 68e2279)
 
-Reproductions are in /private/tmp/claude-501/-Users-taikicoleman--claude-spares-spare-3Et1Yw/bab3acdc-abaa-469c-b9d0-c4087670b940/scratchpad/refute-crowd-3/
+Reproductions are in the reviewer's scratch folder (refute-crowd-3, not published)
 (r1–r13, r20 fuzz). Re-run each one against your fix. Each fix needs a regression test (fake PayPal only)
 that fails before and passes after. The code is committed, so use `git stash` or a worktree to show the
 before result.
@@ -72,6 +72,6 @@ before result.
 ## After the fixes
 - `python3 -m pytest -q tests` green (404 + 5 skipped now, plus the new tests).
 - `togi stone crowd --driver script` passes (7/7, 0 forbidden).
-- `harness/guard.sh --full` passes.
+- The private-term and secret scan passes.
 - Real `~/.togi` approver files are never created.
 - No live sandbox, no `claude -p`, no broad pkill, no commit.

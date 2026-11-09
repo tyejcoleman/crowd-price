@@ -41,7 +41,7 @@ def main(argv=None) -> int:
         print(f"crowdweb: {e}", file=sys.stderr)
         return 2
     base = f"http://{'localhost' if a.host in ('127.0.0.1', '0.0.0.0') else a.host}:{a.port}"
-    mode = "Pretend PayPal: no money moves" if api.mode == "fake" else "PayPal sandbox: test money only"
+    mode = "Test mode: no money moves" if api.mode == "fake" else "PayPal sandbox: test money only"
     print(f"Crowd Price on {base}  ({mode}; store: {api.engine.store.path})")
     for d in api.drops():
         print(f"  {d['state']:<9} {base}/d/{d['drop']}   {d['title']}")

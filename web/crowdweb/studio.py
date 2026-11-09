@@ -377,7 +377,7 @@ def plain(tool: str, args: dict, env: dict, start_price: str | None = None, payp
                     f"{money(t.get('fees'))} in PayPal fees, {money(t.get('net'))} paid to you.")
         return f"Every hold released ({c.get('voided', 0)}). Nobody paid."
     if tool == "crowd_drop_verify":
-        where = "the Pretend PayPal" if paypal == "fake" else "PayPal"
+        where = "the test-mode payments" if paypal == "fake" else "PayPal"
         checks = [c for c in d.get("checks") or [] if isinstance(c, dict)]
         if d.get("ok"):
             return f"All {len(checks)} checks agree with {where}."
@@ -454,9 +454,8 @@ class Studio:
         self._tmp = Path(tempfile.mkdtemp(prefix="crowd-studio-"))
         self._bin = self._tmp / "bin"
         self._cwd = self._tmp / "work"
-        self._cwd.mkdir(mode=0o700)
-        self._bin.mkdir(mode=0o700)
-        self._mcp = write_mcp_config(write_gate(self.togi, self._bin), self._bin) if self.togi else None
+        self._mcp = None
+        self._ensure_files()
         self._stream: dict = {}
         self._calls: dict[str, dict] = {}          # tool_use id -> the call, as the studio checked it
         self._waiting: dict[str, list[dict]] = {}  # drop -> the steps waiting for the person's approval of its settlement
@@ -529,15 +528,32 @@ class Studio:
         self.proc.stdin.write(line)
         self.proc.stdin.flush()
 
+    def _ensure_files(self) -> None:
+        """The assistant's working folder, gate and MCP config live in a temporary folder, which macOS clears of old files
+        after a few days: a studio left running would start its next assistant without them (it exits at once). Write
+        whatever is missing again before each start."""
+        self._cwd.mkdir(parents=True, exist_ok=True, mode=0o700)
+        self._bin.mkdir(parents=True, exist_ok=True, mode=0o700)
+        if self.togi and not (self._mcp and self._mcp.exists() and (self._bin / "togi-gate.py").exists()):
+            self._mcp = write_mcp_config(write_gate(self.togi, self._bin), self._bin)
+
     def _start(self) -> None:
+        self._ensure_files()
         env = agent_env(self.base_env)
         self.proc = subprocess.Popen(session_command(self.model, self.claude, self._mcp, self.api.maker_name),
                                      cwd=str(self._cwd), env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                      stderr=subprocess.PIPE, text=True, bufsize=1, start_new_session=True)
         self._stream = {"msg": None, "open": {}, "unfinished": [], "n": 0}
         proc = self.proc
+        proc.tail = []                  # its last stderr lines, for the terminal if it stops unexpectedly
+
+        def drain():                    # never let stderr fill up
+            for line in proc.stderr:
+                proc.tail.append(line.rstrip()[:300])
+                del proc.tail[:-10]
+        proc.drain = threading.Thread(target=drain, daemon=True)
+        proc.drain.start()
         threading.Thread(target=self._read, args=(proc,), daemon=True).start()
-        threading.Thread(target=lambda: proc.stderr.read(), daemon=True).start()     # never let stderr fill up
 
     def _read(self, proc) -> None:
         for raw in proc.stdout:
@@ -554,6 +570,9 @@ class Studio:
                 continue
         code = proc.wait()
         if proc is self.proc and self.busy:
+            proc.drain.join(2)          # the page gets plain words; whoever started the studio gets the reason, in its terminal
+            sys.stderr.write(f"studio: the assistant stopped unexpectedly (exit {code})" +
+                             "".join(f"\n  {ln}" for ln in proc.tail) + "\n")
             self._end_turn(error=f"Your assistant stopped unexpectedly (exit {code}). Send your message again.")
 
     def _end_turn(self, error: str | None = None) -> None:

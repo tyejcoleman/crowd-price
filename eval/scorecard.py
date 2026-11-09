@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Scorecard (PLAN.md): the same questions to the certified system and to the baseline, scored
+"""Scorecard: the same questions to the certified system and to the baseline, scored
 against an answer key that never comes from Transaction Search.
 
   answer key   data/seeder-log.jsonl: the amounts WE sent and PayPal's capture responses
@@ -215,7 +215,7 @@ def main():
 
     if a.lock:
         if os.path.exists(LOCK):
-            sys.exit(f"already locked: {open(LOCK).read().strip()} (delete the lock file only with Tye's OK)")
+            sys.exit(f"already locked: {open(LOCK).read().strip()} (delete the lock file only with the owner's OK)")
         with open(LOCK, "w") as f:
             f.write(f"{sha(LOCKED)} locked {datetime.now(timezone.utc):%Y-%m-%dT%H:%M:%SZ}\n")
         print(open(LOCK).read().strip())

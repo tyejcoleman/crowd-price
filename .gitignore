@@ -6,6 +6,7 @@
 data/
 node_modules/
 __pycache__/
+.pytest_cache/
 .venv/
 *.log
 .DS_Store

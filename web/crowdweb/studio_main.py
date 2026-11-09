@@ -71,12 +71,12 @@ def main(argv=None) -> int:
         studio.close()
         return 2
     base = f"http://localhost:{httpd.server_address[1]}"
-    mode = "Pretend PayPal: no money moves" if api.mode == "fake" else "PayPal sandbox: test money only"
+    mode = "Test mode: no money moves" if api.mode == "fake" else "PayPal sandbox: test money only"
     print(f"Crowd Price Studio on {base}  ({mode}; store: {api.engine.store.path})")
     print(f"  studio:      {base}/studio#key={key}")
     print(f"  maker view:  {base}/maker#key={key}")
     if desk is not None:
-        scope = " (a TEST approver: Crowd honours it only on the Pretend PayPal)" if desk.scope == "test" else ""
+        scope = " (a TEST approver: Crowd honours it only in test mode)" if desk.scope == "test" else ""
         print(f"  approving in the panel: on{scope}")
     else:
         print(f"  approving in the panel: off ({why['message']}); approve in your terminal with togi approve")

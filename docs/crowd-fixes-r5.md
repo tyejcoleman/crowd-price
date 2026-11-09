@@ -1,6 +1,6 @@
 # Crowd fix round 5 (Opus refuter pass 5, 2026-10-27, against 7540330)
 
-Reproductions are in /private/tmp/claude-501/-Users-taikicoleman--claude-spares-spare-3Et1Yw/bab3acdc-abaa-469c-b9d0-c4087670b940/scratchpad/refute-crowd-5/
+Reproductions are in the reviewer's scratch folder (refute-crowd-5, not published)
 (p1–p7, plus the fuzz f5_fuzz_r4_paths.py). Each fix needs a regression test (fake PayPal only) that fails
 at 7540330 and passes after.
 
@@ -59,7 +59,7 @@ at 7540330 and passes after.
 **After the fixes:**
 - `PYTHONDONTWRITEBYTECODE=1 python3 -m pytest -q -p no:cacheprovider tests` green (566 + 5 skipped now, plus
   new tests).
-- `harness/guard.sh --full` passes.
+- The private-term and secret scan passes.
 - `togi stone crowd --driver script` passes.
 - The f5 fuzz over 1000 seeds shows 0 charged timely leavers and 0 open remainders with verify ok.
 - Real `~/.togi` stays free of approver files.

@@ -1,7 +1,7 @@
 # Crowd Price web: what it guards, how to host it, and its known limits
 
-This is the buyer's drop page and the maker's view over the engine (`web/crowdweb/`). It is built for the sandbox: the pretend
-PayPal, or PayPal's sandbox with test cards. No real money moves, and every page says which PayPal it is on. Nothing here is
+This is the buyer's drop page and the maker's view over the engine (`web/crowdweb/`). It is built for the sandbox: test mode (a
+stand-in for PayPal), or PayPal's sandbox with test cards. No real money moves, and every page says which PayPal it is on. Nothing here is
 reviewed for real money.
 
 ## What the web layer promises
@@ -30,7 +30,7 @@ reviewed for real money.
 Togi tells your own approver from a test one by where its files are: the same directory by another path, a link to it, or its files
 linked in. **A plain copy of your approver's files (not a link), used as a test approver (`TOGI_APPROVER_HOME`), is not detected.** The
 desk then opens for it without a terminal, as it does for any test approver. What it signs is test scope, and Crowd honours test-scope
-grants only on the Pretend PayPal, where no money moves; on the PayPal sandbox only your own approver's yes counts. Anything that
+grants only in test mode, where no money moves; on the PayPal sandbox only your own approver's yes counts. Anything that
 can read your files can already make a test approver of its own, so the copy adds nothing to that. It does mean "the desk opened
 without a terminal" does not prove the approver is not yours.
 

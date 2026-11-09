@@ -1,6 +1,6 @@
 # Crowd fix round 4 (Opus refuter pass 4, 2026-10-27, against 1f939a5)
 
-Reproductions are in /private/tmp/claude-501/-Users-taikicoleman--claude-spares-spare-3Et1Yw/bab3acdc-abaa-469c-b9d0-c4087670b940/scratchpad/refute-crowd-4/
+Reproductions are in the reviewer's scratch folder (refute-crowd-4, not published)
 (s1–s8, plus the fuzz s9b_fuzz_r3.py). Each fix needs a regression test (fake PayPal only) that fails at
 1f939a5 (use `git stash` or a worktree) and passes after.
 
@@ -39,7 +39,7 @@ Reproductions are in /private/tmp/claude-501/-Users-taikicoleman--claude-spares-
 
 **After the fixes:**
 - `python3 -m pytest -q tests` green (508 + 5 skipped now, plus new tests).
-- `harness/guard.sh --full` passes.
+- The private-term and secret scan passes.
 - The fuzz `s9b_fuzz_r3.py` (1500 seeds) shows 0 double charges and 0 charges to timely leavers.
 - `togi stone crowd --driver script` passes. Togi round 5 is being built in parallel; if the stone or Togi
   CLI misbehaves because of it, re-run once and report.

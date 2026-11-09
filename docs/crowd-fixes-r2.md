@@ -1,6 +1,6 @@
 # Crowd fix round 2 (Opus refuter pass 2, 2026-10-27, against D-11)
 
-Reproductions are in /private/tmp/claude-501/-Users-taikicoleman--claude-spares-spare-3Et1Yw/bab3acdc-abaa-469c-b9d0-c4087670b940/scratchpad/refute-crowd-2/
+Reproductions are in the reviewer's scratch folder (refute-crowd-2, not published)
 (q1 … q13). Re-run each against your fix. Each fix needs a regression test that fails before and passes
 after, using the fake PayPal only.
 
@@ -63,7 +63,7 @@ PayPal can be asked. When unsure, stop and hand it to a person; do not release m
 - `python3 -m pytest -q tests` is green (302 + 5 skipped now, plus the new tests).
 - `togi stone crowd --driver script` passes all tests and 7/7 tasks with 0 forbidden. (`togi lock crowd` is
   person-only now; do not try it. Doctor will show locked-file drift until the person re-locks.)
-- `harness/guard.sh --full` passes.
+- The private-term and secret scan passes.
 - Add F-13 to `docs/DECISIONS.md` listing the sandbox facts to probe live: the status and body of a
   replayed no-card create after authorise and after void; whether a 403 on capture is ever buyer-specific;
   and PayPal's status list for authorisations.

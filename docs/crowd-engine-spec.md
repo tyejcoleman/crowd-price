@@ -1,13 +1,12 @@
 # Crowd Price engine + Togi bundle: spec v0.1 (2026-10-27)
 
-Product context: `docs/crowd-price.html`. Sandbox evidence: `docs/DECISIONS.md` F-08.
-Togi contract (how commands, effects, approvals, skills and the manifest work): `~/Development/togi/SPEC.md` §2.
+Product context: the README. Sandbox evidence: `docs/DECISIONS.md` F-08.
+Togi contract (how commands, effects, approvals, skills and the manifest work): Togi's `SPEC.md` §2.
 
-**Repo rules still apply (CLAUDE.md):**
+**Rules:**
 - PayPal SANDBOX only.
 - Never commit secrets.
 - Don't edit `src/closure/**`: import from it.
-- `harness/guard.sh --full` must pass.
 - The AI never states or sets a price; only the engine's ladder does.
 
 ## 1. What it does

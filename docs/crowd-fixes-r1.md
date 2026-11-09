@@ -1,6 +1,6 @@
 # Crowd fix round 1 (from the Opus refuter, 2026-10-27)
 
-Reproductions: /private/tmp/claude-501/-Users-taikicoleman--claude-spares-spare-3Et1Yw/bab3acdc-abaa-469c-b9d0-c4087670b940/scratchpad/refute-crowd/ (p1, p1b, p2, p3, p5, p5b, p7, p9, p10).
+Reproductions (p1, p1b, p2, p3, p5, p5b, p7, p9, p10) ran in the reviewer's scratch folder and are not published.
 
 Each fix needs a regression test that fails before the fix and passes after. Use the fake PayPal only. If a
 fact about the real sandbox is needed (for example, what capturing an expired hold returns), make the

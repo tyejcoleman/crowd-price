@@ -6,7 +6,7 @@ sets or computes a price, and cannot approve.
 
 ## What you need
 
-- `togi` on your PATH, and this repo registered once: `togi add ~/Development/closure`
+- `togi` on your PATH, and this repo registered once: `togi add ./crowd-price` (from the folder above it)
 - `claude` (Claude Code) on your PATH, signed in. The demo calls `claude -p`.
 - For the live run only: sandbox credentials in `.env` (see `.env.example`). PayPal SANDBOX only.
 
@@ -17,7 +17,7 @@ python3 demo/maker_agent.py --fake --model sonnet            # whole story; wait
 python3 demo/maker_agent.py --fake --scenario open --model haiku   # stops at "needs approval" (cheap smoke run)
 ```
 
-`--fake` sets `CROWD_ENV=test CROWD_PAYPAL=fake`, wipes the throwaway test store, and uses a pretend PayPal
+`--fake` sets `CROWD_ENV=test CROWD_PAYPAL=fake`, wipes the throwaway test store, and uses a stand-in for PayPal
 that behaves like the real sandbox did (partial final capture, double-capture and over-capture refused,
 voids). Nothing leaves your machine except the model call.
 

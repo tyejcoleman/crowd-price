@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Gate 0 kill test (PLAN.md). Read-only checks against the PayPal SANDBOX. Never prints secrets.
+"""Gate 0 kill test. Read-only checks against the PayPal SANDBOX. Never prints secrets.
 
 Checks:
   scope    token carries the Transaction Search scope
