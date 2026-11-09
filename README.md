@@ -12,7 +12,7 @@ Transaction Search. It runs in test mode with no PayPal account, or against your
 
 ![The studio: the maker's chat with the assistant on the left, the live drop on the right](docs/images/studio.jpg)
 
-<!-- Demo video (under 3 minutes): add the YouTube link here before the public push. -->
+**[Watch the demo (2 minutes)](https://youtu.be/DuKyrlzw0Sc)**: the maker runs a drop from a chat while the drop page fills, then approves the charge.
 
 ## Juniper's drop
 
